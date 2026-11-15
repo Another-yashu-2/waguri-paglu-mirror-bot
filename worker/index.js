@@ -651,6 +651,12 @@ function buildTaskMenuMessage(task) {
     if (task.mediaAuthor) {
       extras += `\n✓ <b>Channel:</b> ${escapeHtml(task.mediaAuthor)}`;
     }
+  } else if (task.isTgMedia) {
+    extras += `\n✓ <b>File:</b> <code>${escapeHtml(truncate(task.detectedName || 'Telegram Media', 56))}</code>`;
+    if (task.fileSize > 0) {
+      extras += `\n✓ <b>Size:</b> <code>${fmtBytes(task.fileSize)}</code>`;
+    }
+    extras += `\n✓ <b>Source:</b> Telegram MTProto (Kurigram)`;
   } else if (task.isDrive) {
     extras += `\n✓ <b>Source:</b> ${task.isFolder ? 'Google Drive Folder' : (isGofile ? 'Google Drive' : 'Google Drive (Server-Side)')}`;
   } else if (task.resolvedVia) {
@@ -905,17 +911,12 @@ async function handleTelegramUpdate(update, env) {
   const userId = msg.from.id;
   const username = msg.from.username || msg.from.first_name || 'User';
 
-  if (msg.document && !msg.text && !msg.caption) {
-    await handleDocumentMessage(msg, env);
-    return;
-  }
-
   const rawText = msg.text || msg.caption || '';
-  if (!rawText) return;
   const text = rawText.trim();
+  const directMedia = extractTelegramMedia(msg);
 
   const promptRaw = await getStore(env).get(`prompt:${userId}`);
-  if (promptRaw) {
+  if (promptRaw && !directMedia && text) {
     if (text === '/cancel') {
       await getStore(env).delete(`prompt:${userId}`);
       await sendMessage(chatId, `<i>Input cancelled.</i>`, env);
@@ -926,6 +927,23 @@ async function handleTelegramUpdate(update, env) {
     await handleUserPromptInput(chatId, userId, text, promptState, msg.message_id, env);
     return;
   }
+
+  if (directMedia) {
+    const isSmallTxt =
+      msg.document &&
+      ((msg.document.file_name || '').toLowerCase().endsWith('.txt') ||
+        (msg.document.mime_type || '').toLowerCase() === 'text/plain') &&
+      (!msg.document.file_size || msg.document.file_size <= 512 * 1024) &&
+      !/^\/m(?:@\S+)?$/i.test(text);
+    if (isSmallTxt) {
+      const handledTxt = await handleDocumentMessage(msg, env);
+      if (handledTxt) return;
+    }
+    await startTaskFromTelegramMedia(msg, directMedia, env);
+    return;
+  }
+
+  if (!text) return;
 
   if (text === '/start' || text.startsWith('/start ') || text === '/help') {
     await sendStartScreen(chatId, userId, username, env);
@@ -999,17 +1017,180 @@ async function handleTelegramUpdate(update, env) {
 
   const isYtCmd = /^\/yt(?:dl)?(?:@\S+)?(?:\s|$)/i.test(text);
   const isMCmd = /^\/m(?:@\S+)?(?:\s|$)/i.test(text);
-  const urls = extractUrls(text);
+  let urls = extractUrls(text);
+
+  if (!urls.length && isMCmd && msg.reply_to_message) {
+    const repliedMedia = extractTelegramMedia(msg.reply_to_message);
+    if (repliedMedia) {
+      await startTaskFromTelegramMedia(msg, repliedMedia, env);
+      return;
+    }
+    const repliedText = msg.reply_to_message.text || msg.reply_to_message.caption || '';
+    urls = extractUrls(repliedText);
+  }
+
   if (!urls.length) {
     if (isYtCmd) {
       await sendMessage(chatId, `Usage  ·  <code>/yt https://youtube.com/watch?v=...</code>\n\n<i>Works with YouTube, Instagram, TikTok, X, Twitch, Vimeo, SoundCloud, and 1000+ media sites.</i>`, env);
     } else if (isMCmd) {
-      await sendMessage(chatId, `Usage  ·  <code>/m https://example.com/file.mkv</code>\n\n<i>You can also send multiple links, a </i><code>.txt</code><i> file of URLs, or </i><code>/yt &lt;url&gt;</code><i> for media sites.</i>`, env);
+      await sendMessage(chatId, `Usage  ·  <code>/m https://example.com/file.mkv</code>\n\n<i>You can also forward/send any Telegram file (up to 4 GB), send a </i><code>https://t.me/...</code><i> post link, a </i><code>.txt</code><i> file of URLs, or </i><code>/yt &lt;url&gt;</code><i> for media sites.</i>`, env);
     }
     return;
   }
 
   await startTaskFromUrls(chatId, userId, username, msg.message_id, urls, env, { forceYtdl: isYtCmd });
+}
+
+function extractTelegramMedia(msg) {
+  if (!msg) return null;
+  const media =
+    msg.document ||
+    msg.video ||
+    msg.audio ||
+    msg.animation ||
+    msg.voice ||
+    msg.video_note ||
+    null;
+  if (!media || !media.file_id) return null;
+
+  let kind = 'document';
+  let defaultExt = '.bin';
+  if (msg.video) {
+    kind = 'video';
+    defaultExt = '.mp4';
+  } else if (msg.audio) {
+    kind = 'audio';
+    defaultExt = '.mp3';
+  } else if (msg.animation) {
+    kind = 'animation';
+    defaultExt = '.mp4';
+  } else if (msg.voice) {
+    kind = 'voice';
+    defaultExt = '.ogg';
+  } else if (msg.video_note) {
+    kind = 'video_note';
+    defaultExt = '.mp4';
+  }
+
+  const mime =
+    media.mime_type ||
+    (kind === 'video' || kind === 'animation' || kind === 'video_note'
+      ? 'video/mp4'
+      : kind === 'audio'
+        ? 'audio/mpeg'
+        : kind === 'voice'
+          ? 'audio/ogg'
+          : 'application/octet-stream');
+
+  if (defaultExt === '.bin' && mime) {
+    const lowMime = mime.toLowerCase();
+    if (lowMime.includes('mp4')) defaultExt = '.mp4';
+    else if (lowMime.includes('matroska') || lowMime.includes('mkv')) defaultExt = '.mkv';
+    else if (lowMime.includes('webm')) defaultExt = '.webm';
+    else if (lowMime.includes('zip')) defaultExt = '.zip';
+    else if (lowMime.includes('rar')) defaultExt = '.rar';
+    else if (lowMime.includes('7z')) defaultExt = '.7z';
+    else if (lowMime.includes('pdf')) defaultExt = '.pdf';
+    else if (lowMime.includes('mpeg') || lowMime.includes('mp3')) defaultExt = '.mp3';
+  }
+
+  let fileName = media.file_name || '';
+  if (!fileName && msg.audio && msg.audio.title) {
+    const perf = msg.audio.performer ? `${msg.audio.performer} - ` : '';
+    fileName = `${perf}${msg.audio.title}${defaultExt}`;
+  }
+  if (!fileName) {
+    fileName = `telegram_${kind}_${msg.message_id || Date.now()}${defaultExt}`;
+  }
+  fileName = fileName.replace(/[/\\?%*:|"<>]/g, '_').trim();
+
+  return {
+    type: 'tg_media',
+    chatId: msg.chat.id,
+    messageId: msg.message_id,
+    fileId: media.file_id,
+    name: fileName,
+    size: media.file_size || 0,
+    mimeType: mime,
+    mediaKind: kind
+  };
+}
+
+async function startTaskFromTelegramMedia(msg, tgMedia, env) {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const username = msg.from.username || msg.from.first_name || 'User';
+  const replyToMsgId = msg.message_id;
+
+  const storedProfile = await getUserProfile(userId, env);
+  const profile = getEffectiveProfile(userId, storedProfile);
+  const hasDrive = hasDriveAuth(storedProfile);
+  const defaultDest = hasDrive ? (profile.defaultDest === 'gofile' ? 'gofile' : 'gdrive') : 'gofile';
+
+  let duplicateExists = false;
+  try {
+    if (defaultDest === 'gdrive' && hasDrive && tgMedia.name) {
+      const accessToken = await getValidAccessToken(userId, env);
+      if (accessToken) {
+        const existing = await findDriveExisting(accessToken, profile.folderId || 'root', tgMedia.name);
+        duplicateExists = existing.length > 0;
+      }
+    }
+  } catch (_) {}
+
+  const taskId = crypto.randomUUID().replace(/-/g, '').slice(0, 12);
+  const task = {
+    taskId,
+    userId,
+    username,
+    chatId,
+    replyToMsgId,
+    menuMsgId: null,
+    fileUrl: `tg://${tgMedia.chatId}/${tgMedia.messageId}`,
+    items: [tgMedia],
+    batch: false,
+    isDrive: false,
+    isFolder: false,
+    isYtdl: false,
+    isTgMedia: true,
+    resolvedVia: 'Telegram MTProto (Kurigram)',
+    detectedName: tgMedia.name,
+    customName: '',
+    fileSize: tgMedia.size || 0,
+    contentType: tgMedia.mimeType || 'application/octet-stream',
+    acceptRanges: true,
+    dest: defaultDest,
+    hasDrive,
+    driveFolderId: profile.folderId || 'root',
+    driveFolderName: profile.folderName || 'My Drive',
+    folderId: defaultDest === 'gofile' ? '' : (profile.folderId || 'root'),
+    folderName: defaultDest === 'gofile' ? 'Gofile (Guest)' : (profile.folderName || 'My Drive'),
+    mode: 'normal',
+    selectFilter: '',
+    archivePassword: '',
+    share: !!profile.autoShare,
+    conflict: profile.conflict || 'rename',
+    duplicateExists,
+    createdAt: Date.now()
+  };
+
+  if (profile.buttonMode === false) {
+    const prep = await sendMessage(
+      chatId,
+      `<blockquote><b>Preparing Telegram Transfer</b>\n\n<code>${escapeHtml(tgMedia.name)}</code></blockquote>`,
+      env,
+      null,
+      replyToMsgId
+    );
+    task.menuMsgId = prep?.result?.message_id;
+    await getStore(env).put(`task:${taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
+    await launchMirrorTask(task, env);
+    return;
+  }
+
+  const sent = await sendMessage(chatId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task), replyToMsgId);
+  task.menuMsgId = sent?.result?.message_id;
+  await getStore(env).put(`task:${taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
 }
 
 async function handleDocumentMessage(msg, env) {
@@ -1021,26 +1202,23 @@ async function handleDocumentMessage(msg, env) {
   const mime = (doc.mime_type || '').toLowerCase();
 
   if (!fileName.endsWith('.txt') && mime !== 'text/plain') {
-    return;
+    return false;
   }
 
   if (doc.file_size && doc.file_size > 512 * 1024) {
-    await sendMessage(chatId, `<blockquote><b>File Too Large</b>\n\nBatch <code>.txt</code> files must be under <code>512 KiB</code>.</blockquote>`, env);
-    return;
+    return false;
   }
 
   const fileRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(doc.file_id)}`);
   const fileJson = await fileRes.json();
   const filePath = fileJson?.result?.file_path;
   if (!filePath) {
-    await sendMessage(chatId, `Could not read <code>.txt</code> file from Telegram.`, env);
-    return;
+    return false;
   }
 
   const rawRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`);
   if (!rawRes.ok) {
-    await sendMessage(chatId, `Could not download <code>.txt</code> file.`, env);
-    return;
+    return false;
   }
 
   const content = await rawRes.text();
@@ -1052,11 +1230,11 @@ async function handleDocumentMessage(msg, env) {
   const urls = extractUrls(cleanLines);
 
   if (!urls.length) {
-    await sendMessage(chatId, `<blockquote><b>No Links Found</b>\n\nNo <code>http://</code> or <code>https://</code> links found in <code>${escapeHtml(doc.file_name || 'file.txt')}</code>.</blockquote>`, env);
-    return;
+    return false;
   }
 
   await startTaskFromUrls(chatId, userId, username, msg.message_id, urls, env);
+  return true;
 }
 
 async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, env, opts = {}) {
@@ -1172,11 +1350,12 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
     } else {
       const verification = resolved.verification;
       const isDrive = resolved.kind === 'gdrive';
+      const isTgMedia = resolved.kind === 'tg_media';
       const fileUrl = resolved.finalUrl;
 
       let duplicateExists = false;
       try {
-        if (defaultDest === 'gdrive' && accessToken) {
+        if (defaultDest === 'gdrive' && accessToken && verification.fileName) {
           const existing = await findDriveExisting(accessToken, profile.folderId || 'root', verification.fileName);
           duplicateExists = existing.length > 0;
         }
@@ -1192,14 +1371,16 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
             size: verification.sizeBytes || 0,
             isFolder: !!verification.isFolder
           }
-        : {
-            type: 'url',
-            url: fileUrl,
-            sourceUrl: resolved.sourceUrl || '',
-            resolvedVia: resolved.resolvedVia || '',
-            name: verification.fileName,
-            size: verification.sizeBytes || 0
-          };
+        : isTgMedia
+          ? resolved.tgInfo
+          : {
+              type: 'url',
+              url: fileUrl,
+              sourceUrl: resolved.sourceUrl || '',
+              resolvedVia: resolved.resolvedVia || '',
+              name: verification.fileName,
+              size: verification.sizeBytes || 0
+            };
 
       task = {
         taskId,
@@ -1214,6 +1395,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         isDrive,
         isFolder: !!verification.isFolder,
         isYtdl: false,
+        isTgMedia,
         resolvedVia: resolved.resolvedVia || '',
         detectedName: verification.fileName,
         customName: '',
@@ -1239,6 +1421,17 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
     const items = urls.map(u => {
       if (forceYtdl || isMediaSiteUrl(u)) {
         return { type: 'ytdl', url: u, name: guessNameFromUrl(u) };
+      }
+      const tg = parseTelegramPostUrl(u);
+      if (tg) {
+        return {
+          type: 'tg_media',
+          chatId: tg.chat,
+          messageId: tg.messageId,
+          fileId: '',
+          url: u,
+          name: `Telegram_${tg.isPrivate ? 'post' : tg.chat}_${tg.messageId}`
+        };
       }
       const gd = parseDriveUrl(u);
       if (gd) {
@@ -1904,7 +2097,9 @@ async function handleCallbackQuery(cb, env) {
     if (action === 'tm_info') {
       const rangeLine = task.isDrive
         ? `Transfer  ·  Server-Side / Drive API`
-        : `Range I/O  ·  ${task.acceptRanges ? 'Supported (16x parallel)' : 'Single Stream'}`;
+        : task.isTgMedia
+          ? `Transfer  ·  Telegram MTProto (Kurigram)`
+          : `Range I/O  ·  ${task.acceptRanges ? 'Supported (16x parallel)' : 'Single Stream'}`;
       const viaLine = task.resolvedVia ? `\n\nResolved  ·  ${escapeHtml(task.resolvedVia)}` : '';
       const dupLine = task.duplicateExists ? `\n\nDuplicate  ·  Exists in target folder` : '';
       const infoMsg =
@@ -2719,11 +2914,11 @@ async function sendStartScreen(chatId, userId, username, env) {
       `Free On-Demand Mirroring (Gofile + Google Drive)</blockquote>\n\n` +
       `Destination  ·  <b>Gofile (No Login Required)</b> — Fresh guest account per task\n\n` +
       `Bandwidth  ·  Up to <code>1.8 Gbps</code> (16x Aria2c)\n\n` +
-      `Features  ·  Direct URLs · yt-dlp · Batch · <code>.txt</code> Lists · Extract · ZIP\n\n` +
+      `Features  ·  Direct URLs · Telegram Files (&lt;4GB) · yt-dlp · Batch · Extract · ZIP\n\n` +
       `Telemetry  ·  <code>2.5s</code> Live Progress & System Stats\n\n` +
       `<blockquote>${GOFILE_NOTICE_HTML}</blockquote>\n\n` +
       `<b>Commands</b>\n\n` +
-      `<code>/m &lt;link&gt;</code> — Mirror URLs or send any link / <code>.txt</code> list directly\n\n` +
+      `<code>/m &lt;link&gt;</code> — Mirror URLs, forward any Telegram file, or send a <code>t.me</code> link\n\n` +
       `<code>/yt &lt;link&gt;</code> — Download videos / audio / playlists via yt-dlp\n\n` +
       `/tasks — View active transfers    /history — Recent transfers\n\n` +
       `/settings — Preferences    /login — Connect Google Drive (Permanent)`;
@@ -2742,7 +2937,7 @@ async function sendStartScreen(chatId, userId, username, env) {
     `Options Menu  ·  ${profile.buttonMode !== false ? 'Enabled' : 'Disabled'}\n\n` +
     `Auto Share  ·  ${profile.autoShare ? 'Enabled' : 'Disabled'}    Duplicate  ·  ${conflictLabel(profile.conflict || 'rename')}\n\n` +
     `<b>Commands</b>\n\n` +
-    `<code>/m &lt;link&gt;</code> — Mirror URLs, Drive links, or send a <code>.txt</code> list\n\n` +
+    `<code>/m &lt;link&gt;</code> — Mirror URLs, Drive links, Telegram files, or <code>t.me</code> links\n\n` +
     `<code>/yt &lt;link&gt;</code> — Download videos / audio / playlists via yt-dlp\n\n` +
     `/setdldir — Browse & select target folder\n\n` +
     `/tasks — View active transfers\n\n` +
@@ -2829,6 +3024,83 @@ function guessNameFromUrl(url) {
   } catch (_) {
     return 'link';
   }
+}
+
+function parseTelegramPostUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    const host = u.hostname.toLowerCase().replace(/^www\./, '');
+    if (host !== 't.me' && host !== 'telegram.me' && host !== 'telegram.dog') {
+      return null;
+    }
+    const parts = u.pathname.split('/').filter(Boolean);
+    if (parts.length < 2) return null;
+
+    if (parts[0] === 'c' && parts.length >= 3) {
+      const internalId = parts[1];
+      const msgId = parseInt(parts[parts.length - 1], 10);
+      if (/^\d+$/.test(internalId) && Number.isInteger(msgId) && msgId > 0) {
+        return { chat: `-100${internalId}`, messageId: msgId, isPrivate: true, url: rawUrl };
+      }
+      return null;
+    }
+
+    const chIdx = parts[0] === 's' && parts.length >= 3 ? 1 : 0;
+    const channel = parts[chIdx];
+    const msgId = parseInt(parts[parts.length - 1], 10);
+    if (
+      !channel ||
+      channel.startsWith('+') ||
+      /^(?:joinchat|addstickers|addlist|addemoji|proxy|socks|share|iv|login|confirmphone|contact)$/i.test(channel) ||
+      !/^[a-zA-Z0-9_]{4,}$/.test(channel) ||
+      !Number.isInteger(msgId) ||
+      msgId <= 0
+    ) {
+      return null;
+    }
+    return { chat: channel, messageId: msgId, isPrivate: false, url: rawUrl };
+  } catch (_) {
+    return null;
+  }
+}
+
+async function inspectTelegramPostLink(tgPost) {
+  let fileName = `Telegram_${tgPost.isPrivate ? 'post' : tgPost.chat}_${tgPost.messageId}`;
+  let sizeBytes = 0;
+  if (!tgPost.isPrivate) {
+    try {
+      const embedUrl = `https://t.me/${encodeURIComponent(tgPost.chat)}/${tgPost.messageId}?embed=1&mode=tme`;
+      const res = await fetch(embedUrl, { headers: { 'User-Agent': DEFAULT_UA } });
+      if (res.ok) {
+        const html = (await res.text()).slice(0, 65536);
+        const titleM = html.match(/<div[^>]+class=["'][^"']*tgme_widget_message_document_title[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+        if (titleM && titleM[1]) {
+          const clean = decodeHtmlEntities(titleM[1].replace(/<[^>]+>/g, '').trim()).replace(/[/\\?%*:|"<>]/g, '_');
+          if (clean) fileName = clean;
+        }
+        const extraM = html.match(/<div[^>]+class=["'][^"']*tgme_widget_message_document_extra[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+        if (extraM && extraM[1]) {
+          const szM = extraM[1].match(/([\d.]+)\s*(B|KB|KiB|MB|MiB|GB|GiB)/i);
+          if (szM) {
+            const val = parseFloat(szM[1]);
+            const unit = szM[2].toUpperCase();
+            const mult =
+              unit === 'GB' || unit === 'GIB'
+                ? 1024 ** 3
+                : unit === 'MB' || unit === 'MIB'
+                  ? 1024 ** 2
+                  : unit === 'KB' || unit === 'KIB'
+                    ? 1024
+                    : 1;
+            if (!Number.isNaN(val) && val > 0) {
+              sizeBytes = Math.round(val * mult);
+            }
+          }
+        }
+      }
+    } catch (_) {}
+  }
+  return { fileName, sizeBytes };
 }
 
 function parseDriveUrl(rawUrl) {
@@ -3143,6 +3415,34 @@ async function resolveAndInspectInput(rawUrl, accessToken) {
         kind: 'ytdl',
         finalUrl: currentUrl,
         resolvedVia: viaChain.join(' → ')
+      };
+    }
+
+    const tgPost = parseTelegramPostUrl(currentUrl);
+    if (tgPost) {
+      const tgMeta = await inspectTelegramPostLink(tgPost);
+      return {
+        kind: 'tg_media',
+        tgInfo: {
+          type: 'tg_media',
+          chatId: tgPost.chat,
+          messageId: tgPost.messageId,
+          fileId: '',
+          url: currentUrl,
+          name: tgMeta.fileName,
+          size: tgMeta.sizeBytes || 0
+        },
+        verification: {
+          valid: true,
+          fileName: tgMeta.fileName,
+          sizeBytes: tgMeta.sizeBytes || 0,
+          contentType: 'application/octet-stream',
+          acceptRanges: true,
+          isFolder: false
+        },
+        finalUrl: currentUrl,
+        sourceUrl: '',
+        resolvedVia: [...viaChain, 'Telegram MTProto (Kurigram)'].filter(Boolean).join(' → ')
       };
     }
 

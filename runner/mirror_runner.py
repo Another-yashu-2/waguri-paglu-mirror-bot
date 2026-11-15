@@ -522,6 +522,55 @@ def parse_drive_url(raw_url: str):
     return None
 
 
+def parse_telegram_post_url(raw_url: str):
+    try:
+        u = urllib.parse.urlparse(raw_url)
+        host = (u.hostname or "").lower().removeprefix("www.")
+        if host not in ("t.me", "telegram.me", "telegram.dog"):
+            return None
+        parts = [p for p in u.path.split("/") if p]
+        if len(parts) < 2:
+            return None
+        if parts[0] == "c" and len(parts) >= 3:
+            internal_id = parts[1]
+            msg_id_str = parts[-1]
+            if internal_id.isdigit() and msg_id_str.isdigit() and int(msg_id_str) > 0:
+                msg_id = int(msg_id_str)
+                return {
+                    "type": "tg_media",
+                    "chatId": f"-100{internal_id}",
+                    "messageId": msg_id,
+                    "fileId": "",
+                    "url": raw_url,
+                    "name": f"Telegram_post_{msg_id}",
+                }
+            return None
+        ch_idx = 1 if (parts[0] == "s" and len(parts) >= 3) else 0
+        channel = parts[ch_idx]
+        msg_id_str = parts[-1]
+        reserved = {"joinchat", "addstickers", "addlist", "addemoji", "proxy", "socks", "share", "iv", "login", "confirmphone", "contact"}
+        if (
+            not channel
+            or channel.startswith("+")
+            or channel.lower() in reserved
+            or not re.match(r"^[a-zA-Z0-9_]{4,}$", channel)
+            or not msg_id_str.isdigit()
+            or int(msg_id_str) <= 0
+        ):
+            return None
+        msg_id = int(msg_id_str)
+        return {
+            "type": "tg_media",
+            "chatId": channel,
+            "messageId": msg_id,
+            "fileId": "",
+            "url": raw_url,
+            "name": f"Telegram_{channel}_{msg_id}",
+        }
+    except Exception:
+        return None
+
+
 def rewrite_known_direct_url(raw_url: str):
     try:
         u = urllib.parse.urlparse(raw_url)
@@ -672,6 +721,10 @@ def resolve_download_url(raw_url: str) -> dict:
     cur = raw_url
     visited = set()
     for _ in range(10):
+        tg = parse_telegram_post_url(cur)
+        if tg:
+            return tg
+
         gd = parse_drive_url(cur)
         if gd:
             return gd
@@ -1852,6 +1905,8 @@ class Mirror:
             return item["name"]
         if item.get("type") == "gdrive":
             return f"drive:{item.get('id', '')}"
+        if item.get("type") == "tg_media":
+            return f"tg:{item.get('chatId', '')}/{item.get('messageId', '')}"
         try:
             seg = urllib.parse.urlparse(item.get("url", "")).path.rstrip("/").split("/")[-1]
             return urllib.parse.unquote(seg) or "link"
@@ -2142,11 +2197,15 @@ class Mirror:
         return bundle
 
     def resolve_item(self, item: dict) -> dict:
-        if item.get("_resolved") or item.get("type") in ("gdrive", "ytdl"):
+        if item.get("_resolved") or item.get("type") in ("gdrive", "ytdl", "tg_media"):
             return item
         target = item.get("sourceUrl") or item.get("url") or ""
         if not target:
             return item
+        tg = parse_telegram_post_url(target)
+        if tg:
+            tg["_resolved"] = True
+            return tg
         if is_media_site_url(target):
             return {"type": "ytdl", "url": target, "name": item.get("name") or target, "_resolved": True}
         # Only resolve on runner when batch (not pre-resolved) or sourceUrl is present (IP-bound page extractor)
@@ -2154,7 +2213,7 @@ class Mirror:
             return item
         try:
             resolved = resolve_download_url(target)
-            if resolved.get("type") == "gdrive":
+            if resolved.get("type") in ("gdrive", "tg_media"):
                 resolved["_resolved"] = True
                 return resolved
             if resolved.get("url"):
@@ -2168,9 +2227,139 @@ class Mirror:
             raise RuntimeError(str(e))
         return item
 
+    async def _kurigram_download_item(self, item: dict, dest_dir: Path) -> Path:
+        global cancelled
+        from pyrogram import Client
+
+        chat_id = item.get("chatId")
+        msg_id = item.get("messageId")
+        file_id = item.get("fileId") or ""
+        hint_name = item.get("name") or ""
+        hint_size = int(item.get("size") or 0)
+
+        async with Client(
+            f"tgdl_{JOB_ID or 'run'}_{self.idx}",
+            api_id=int(TELEGRAM_API_ID),
+            api_hash=TELEGRAM_API_HASH,
+            bot_token=BOT_TOKEN,
+            in_memory=True,
+            workers=16,
+            no_updates=True,
+        ) as app:
+            msg = None
+            if chat_id is not None and msg_id:
+                s_chat = str(chat_id).strip()
+                target_chat = int(s_chat) if s_chat.lstrip("-").isdigit() else s_chat.lstrip("@")
+                try:
+                    msg = await app.get_messages(target_chat, int(msg_id))
+                except Exception as e:
+                    if not file_id:
+                        raise RuntimeError(f"Could not access Telegram chat/channel ({target_chat}): {e}")
+
+            media_obj = None
+            if msg and not getattr(msg, "empty", False) and getattr(msg, "media", None):
+                for attr in ("document", "video", "audio", "animation", "voice", "video_note", "photo"):
+                    m = getattr(msg, attr, None)
+                    if m is not None:
+                        media_obj = m
+                        break
+
+            if media_obj is not None:
+                real_size = int(getattr(media_obj, "file_size", 0) or hint_size or 0)
+                orig_name = getattr(media_obj, "file_name", None) or ""
+                mime = (getattr(media_obj, "mime_type", None) or "").lower()
+                ext = Path(orig_name).suffix if orig_name else ""
+                if not ext:
+                    if getattr(msg, "video", None) or getattr(msg, "animation", None) or getattr(msg, "video_note", None) or "mp4" in mime:
+                        ext = ".mp4"
+                    elif "matroska" in mime or "mkv" in mime:
+                        ext = ".mkv"
+                    elif "webm" in mime:
+                        ext = ".webm"
+                    elif getattr(msg, "audio", None) or "mpeg" in mime or "mp3" in mime:
+                        ext = ".mp3"
+                    elif getattr(msg, "voice", None) or "ogg" in mime:
+                        ext = ".ogg"
+                    elif getattr(msg, "photo", None) or "jpeg" in mime or "jpg" in mime:
+                        ext = ".jpg"
+                    elif "zip" in mime:
+                        ext = ".zip"
+                    elif "pdf" in mime:
+                        ext = ".pdf"
+                    else:
+                        ext = ".bin"
+                custom = self.single_name()
+                if custom:
+                    has_ext = "." in Path(custom).name and len(Path(custom).suffix) <= 10
+                    target_name = custom if has_ext else f"{custom}{ext}"
+                elif orig_name:
+                    target_name = orig_name
+                elif hint_name and not hint_name.startswith("Telegram_"):
+                    has_ext = "." in Path(hint_name).name and len(Path(hint_name).suffix) <= 10
+                    target_name = hint_name if has_ext else f"{hint_name}{ext}"
+                else:
+                    target_name = f"telegram_{msg_id or 'media'}{ext}"
+                dl_target = msg
+            elif file_id:
+                real_size = hint_size
+                target_name = self.single_name() or hint_name or f"telegram_{JOB_ID or 'file'}.bin"
+                dl_target = file_id
+            else:
+                raise RuntimeError(
+                    "Telegram message contains no downloadable file or media (or the channel is private and the bot is not a member)."
+                )
+
+            safe_name = re.sub(r'[/\\?%*:|"<>]', "_", target_name).strip() or "telegram_file.bin"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            out_path = dest_dir / safe_name
+
+            t_start = time.time()
+            win = [t_start, 0]
+            self.tick(out_path.name, "Downloading (TG)..", 0.0, 0, real_size, 0, None, "Kurigram MTProto", force=True)
+
+            def on_prog(current, total):
+                global cancelled
+                if cancelled:
+                    app.stop_transmission()
+                    return
+                now = time.time()
+                dt = max(0.05, now - win[0])
+                spd = max(0.0, (current - win[1]) / dt) if current >= win[1] else 0.0
+                tot = total or real_size
+                pct = (100.0 * current / tot) if tot > 0 else 0.0
+                eta = ((tot - current) / spd) if spd > 0 and tot > current else None
+                try:
+                    self.tick(out_path.name, "Downloading (TG)..", pct, current, tot, spd, eta, "Kurigram MTProto")
+                except InterruptedError:
+                    cancelled = True
+                    app.stop_transmission()
+                    return
+                if now - win[0] >= TICK_SECONDS:
+                    win[0] = now
+                    win[1] = current
+
+            saved = await app.download_media(dl_target, file_name=str(out_path), progress=on_prog)
+            if cancelled:
+                raise InterruptedError("Cancelled by user")
+            final_p = Path(saved) if saved else out_path
+            if not final_p.exists() or final_p.stat().st_size == 0:
+                raise RuntimeError("Kurigram finished without saving the Telegram file.")
+            return final_p
+
+    def tg_download(self, item: dict, dest_dir: Path) -> Path:
+        if not BOT_TOKEN or not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
+            raise RuntimeError("TELEGRAM_API_ID and TELEGRAM_API_HASH are required to download Telegram files.")
+        label = self.single_name() or item.get("name") or "Telegram File"
+        sz = int(item.get("size") or 0)
+        self.tick(label, "Setting up Kurigram..", 0.0, 0, sz, 0, None, "Kurigram MTProto", force=True)
+        ensure_kurigram_tools()
+        return asyncio.run(self._kurigram_download_item(item, dest_dir))
+
     def acquire_local(self, item: dict, dest_dir: Path) -> Path:
-        """Downloads an item to local disk (used for extract/zip modes, yt-dlp, and URL items)."""
+        """Downloads an item to local disk (used for extract/zip modes, yt-dlp, Telegram media, and URL items)."""
         item = self.resolve_item(item)
+        if item.get("type") == "tg_media":
+            return self.tg_download(item, dest_dir)
         if item.get("type") == "ytdl":
             return self.ytdl_download(item["url"], dest_dir)
         if item.get("type") == "gdrive":
@@ -2471,8 +2660,8 @@ class Mirror:
     def run(self) -> list:
         DL_DIR.mkdir(parents=True, exist_ok=True)
         OUT_DIR.mkdir(parents=True, exist_ok=True)
-        all_ytdl = all(it.get("type") == "ytdl" for it in self.items)
-        if not all_ytdl:
+        all_light_disk = all(it.get("type") in ("ytdl", "tg_media") for it in self.items)
+        if not all_light_disk:
             est = int(self.job.get("fileSize") or 0)
             mult = 2.2 if self.mode in ("extract", "zip") else 1.15
             needed = (int(est * mult) + 4 * 1024**3) if est > 0 else (35 * 1024**3 if self.batch else 0)
