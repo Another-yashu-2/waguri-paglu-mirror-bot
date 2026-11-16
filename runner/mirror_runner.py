@@ -43,7 +43,8 @@ TELEGRAM_API_HASH = (os.environ.get("TELEGRAM_API_HASH") or "").strip()
 GITHUB_RUN_ID = os.environ.get("GITHUB_RUN_ID", "")
 YTDL_COOKIES = os.environ.get("YTDL_COOKIES", "")
 
-REPO_URL = "https://github.com/waguri-paglu/zq8-relay-k4w7x2m9"
+GITHUB_REPOSITORY = (os.environ.get("GITHUB_REPOSITORY") or "").strip()
+REPO_URL = f"https://github.com/{GITHUB_REPOSITORY}" if GITHUB_REPOSITORY else "https://github.com"
 
 WORK_DIR = Path("/tmp/mirror_work")
 DL_DIR = WORK_DIR / "downloads"
@@ -53,12 +54,17 @@ RCLONE_CONF = Path.home() / ".config" / "rclone" / "rclone.conf"
 TICK_SECONDS = 2.5
 TOKEN_REFRESH_SECONDS = 40 * 60  # Google access tokens live ~60 min
 TG_BOT_MAX_BYTES = 2000 * 1024 * 1024  # Telegram Bot MTProto 2,000 MiB upload limit
+PERM_REQ_MAX_BYTES = 50 * 1024 * 1024 * 1024  # 50 GiB limit for permanent gcusrfiles request button
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi"}
 AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".flac", ".aac", ".ogg", ".wav"}
 FOLDER_MIME = "application/vnd.google-apps.folder"
 TAR_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tgz", ".tbz2", ".txz", ".tar")
 COMPOUND_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst")
 ARIA_ENGINE = "Aria2c v1.37.0"
+GC_TEMP_NOTICE_HTML = (
+    "⚠ <b>Temporary Group Storage (5 Days):</b> File(s) will be deleted after <b>5 days</b>. "
+    "Use /login with your personal Google Drive for permanent storage, or contact the Owner."
+)
 GOFILE_NOTICE_HTML = (
     "⚠ <b>Temporary Storage (Gofile):</b> Files are deleted after <b>100 GB download quota</b> "
     "or <b>10 days of inactivity</b>. Re-mirror from the original source to renew, "
@@ -149,7 +155,7 @@ def edit_status(chat_id, message_id, text: str, reply_markup: dict = None):
     tg_call("editMessageText", payload)
 
 
-def send_message(chat_id, text: str, reply_markup: dict = None):
+def send_message(chat_id, text: str, reply_markup: dict = None, thread_id=None):
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -158,6 +164,8 @@ def send_message(chat_id, text: str, reply_markup: dict = None):
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
+    if thread_id:
+        payload["message_thread_id"] = int(thread_id)
     return tg_call("sendMessage", payload)
 
 
@@ -392,7 +400,7 @@ def build_status_card(
     else:
         mode_str = mode_map.get(job.get("mode", "normal"), "Mirror")
     uname = job.get("username") or "User"
-    if not uname.startswith("@") and uname != "User":
+    if not uname.startswith("@") and re.match(r"^[A-Za-z0-9_]{4,}$", uname) and uname != "User":
         uname = "@" + uname
     uid = job.get("userId", "")
     short_id = job.get("jobId", "")
@@ -403,7 +411,8 @@ def build_status_card(
     disk_bar = make_bar(sys_snap["disk_pct"], 10)
 
     total_str = fmt_bytes(total_bytes) if total_bytes and total_bytes > 0 else "Unknown"
-    run_url = f"{REPO_URL}/actions/runs/{GITHUB_RUN_ID}" if GITHUB_RUN_ID else f"{REPO_URL}/actions"
+    base_repo = (job.get("repoUrl") or REPO_URL).rstrip("/")
+    run_url = f"{base_repo}/actions/runs/{GITHUB_RUN_ID}" if GITHUB_RUN_ID else f"{base_repo}/actions"
 
     sys_block = (
         f"┌ SYSTEM\n"
@@ -474,11 +483,11 @@ def sync_worker_state(job_id: str, last_card: str = None):
     return is_cancelled, msg_id
 
 
-def finish_status(chat_id, message_id, text: str, reply_markup: dict = None):
+def finish_status(chat_id, message_id, text: str, reply_markup: dict = None, thread_id=None):
     if message_id:
         edit_status(chat_id, message_id, text, reply_markup)
     elif chat_id:
-        send_message(chat_id, text, reply_markup)
+        send_message(chat_id, text, reply_markup, thread_id=thread_id)
 
 
 # ============================================================================
@@ -1086,10 +1095,12 @@ class Mirror:
     def __init__(self, job: dict, access_token: str, token_expiry_ms=None):
         self.job = job
         self.chat_id = job["chatId"]
+        self.thread_id = job.get("threadId")
+        self.is_shared_gc_temp = bool(job.get("isSharedGcTemp"))
         self.message_id = job.get("messageId")
         self.dest = job.get("dest") or "gdrive"
         self.folder_id = job.get("folderId") or "root"
-        self.folder_name = "Gofile (Guest)" if self.dest == "gofile" else (job.get("folderName") or "My Drive")
+        self.folder_name = "Gofile (Guest)" if self.dest == "gofile" else ("GC Shared (5-Day Temp)" if self.is_shared_gc_temp else (job.get("folderName") or "My Drive"))
         self.custom_name = (job.get("customName") or "").strip()
         self.mode = job.get("mode") or "normal"
         self.select_filter = (job.get("selectFilter") or "").strip()
@@ -2429,6 +2440,8 @@ class Mirror:
                     kw["thumb"] = str(thumb)
                 if reply_id and idx == 1:
                     kw["reply_to_message_id"] = reply_id
+                elif self.thread_id and idx == 1:
+                    kw["message_thread_id"] = int(self.thread_id)
 
                 try:
                     if fpath.suffix.lower() in AUDIO_EXTS:
@@ -2487,7 +2500,7 @@ class Mirror:
                 [{"text": "⏭ Skip Whole TG Upload", "callback_data": f"tg_dec:{JOB_ID}:skip", "style": "danger"}],
             ]
         }
-        sent = send_message(self.chat_id, prompt_text, kb)
+        sent = send_message(self.chat_id, prompt_text, kb, thread_id=self.thread_id)
         prompt_msg_id = (sent.get("result") or {}).get("message_id")
         deadline = time.time() + 180.0
         while time.time() < deadline:
@@ -2548,6 +2561,7 @@ class Mirror:
                 f"<blockquote><b>Telegram Upload Skipped (&gt; 2 GB)</b>\n\n"
                 f"<code>{names}</code> (<code>{sz}</code>){extra}\n\n"
                 f"Exceeds Telegram's <code>2 GB</code> Bot upload limit. Continuing standard upload to <b>{dest_label}</b>...</blockquote>",
+                thread_id=self.thread_id,
             )
             self.tg_skipped += len(over)
             self.tg_note = "Skipped (> 2 GB limit)"
@@ -2576,6 +2590,7 @@ class Mirror:
                 f"<blockquote><b>Telegram Media Notice</b>\n\n"
                 f"Could not upload media to chat: <code>{html.escape(truncate(str(e), 200))}</code>\n"
                 f"Continuing standard upload to <b>{dest_label}</b>...</blockquote>",
+                thread_id=self.thread_id,
             )
 
     def process_and_upload(self, local: Path) -> dict:
@@ -2589,6 +2604,7 @@ class Mirror:
                     f"<blockquote><b>Workspace Notice</b>\n\n"
                     f"Remaining disk (<code>{fmt_bytes(du_free)}</code>) is tight for archive processing. "
                     f"Uploading original directly.</blockquote>",
+                    thread_id=self.thread_id,
                 )
                 mode = "normal"
 
@@ -2696,13 +2712,19 @@ class Mirror:
 
     def uname(self) -> str:
         u = self.job.get("username") or "User"
-        return u if (u.startswith("@") or u == "User") else "@" + u
+        if not u.startswith("@") and re.match(r"^[A-Za-z0-9_]{4,}$", u) and u != "User":
+            return "@" + u
+        return u
 
     def report(self, results: list):
         elapsed = fmt_duration(time.time() - self.task_start)
         ok = [r for r in results if r.get("status") in ("completed", "skipped")]
         overall = "completed" if ok else "failed"
         is_gofile = self.dest == "gofile"
+        is_gc_temp = bool(self.is_shared_gc_temp and not is_gofile)
+        completed_with_id = [r for r in ok if r.get("status") == "completed" and r.get("id")]
+        total_gc_size = sum(int(r.get("size") or 0) for r in completed_with_id)
+        can_req_perm = bool(is_gc_temp and completed_with_id and total_gc_size <= PERM_REQ_MAX_BYTES)
 
         if not self.batch and len(results) == 1:
             r = results[0]
@@ -2718,7 +2740,7 @@ class Mirror:
                 text += "Dest  ·  Gofile (Guest Session)\n\nAccess  ·  Public Link\n\n"
             else:
                 text += f"Folder  ·  {html.escape(self.folder_name)}\n\n"
-                if r.get("shared"):
+                if r.get("shared") or is_gc_temp:
                     text += "Access  ·  Anyone with the link\n\n"
             text += f"Elapsed  ·  <code>{elapsed}</code>\n\nUser  ·  {html.escape(self.uname())}"
             if self.tg_sent > 0 or self.tg_skipped > 0 or self.tg_note:
@@ -2733,12 +2755,16 @@ class Mirror:
                 text += f"\n\n<blockquote>{GOFILE_NOTICE_HTML}</blockquote>"
                 rows = [[{"text": "▸  Open Gofile Folder" if r.get("isDir") else "▸  Open Gofile", "url": r["link"], "style": "success"}]]
             else:
+                if is_gc_temp:
+                    text += f"\n\n<blockquote>{GC_TEMP_NOTICE_HTML}</blockquote>"
                 rows = [[
                     {"text": "▸  Open Folder" if r.get("isDir") else "▸  Open File", "url": r["link"], "style": "success"},
                     {"text": "Open Folder", "url": self.folder_url(), "style": "primary"},
                 ]]
                 if r.get("direct"):
                     rows.append([{"text": "⬇ Direct Download", "url": r["direct"], "style": "primary"}])
+                if can_req_perm:
+                    rows.append([{"text": "📌 Request Permanent Storage", "callback_data": f"perm_req:{JOB_ID}", "style": "primary"}])
             kb = {"inline_keyboard": rows}
         else:
             header = (
@@ -2755,7 +2781,11 @@ class Mirror:
                 else:
                     tg_status = self.tg_note or "Skipped"
                 tg_line = f"\nTelegram  ·  {html.escape(tg_status)}\n"
-            warn_block = f"\n\n<blockquote>{GOFILE_NOTICE_HTML}</blockquote>" if (is_gofile and ok) else ""
+            warn_block = (
+                f"\n\n<blockquote>{GOFILE_NOTICE_HTML}</blockquote>"
+                if (is_gofile and ok)
+                else (f"\n\n<blockquote>{GC_TEMP_NOTICE_HTML}</blockquote>" if (is_gc_temp and ok) else "")
+            )
             footer = (
                 f"\n{dest_line}\n{tg_line}\n"
                 f"Elapsed  ·  <code>{elapsed}</code>\n\nUser  ·  {html.escape(self.uname())}"
@@ -2778,13 +2808,16 @@ class Mirror:
             if is_gofile:
                 kb = {"inline_keyboard": [[{"text": "▸  Open Gofile Folder", "url": self.gofile_link, "style": "success"}]]} if self.gofile_link else None
             else:
-                kb = {"inline_keyboard": [[{"text": "▸  Open Folder", "url": self.folder_url(), "style": "success"}]]}
+                rows = [[{"text": "▸  Open Folder", "url": self.folder_url(), "style": "success"}]]
+                if can_req_perm:
+                    rows.append([{"text": "📌 Request Permanent Storage", "callback_data": f"perm_req:{JOB_ID}", "style": "primary"}])
+                kb = {"inline_keyboard": rows}
 
         _, synced_msg_id = sync_worker_state(JOB_ID)
         if synced_msg_id is not None:
             self.message_id = synced_msg_id
-        finish_status(self.chat_id, self.message_id, text, kb)
         worker_call("/internal/complete", {"job_id": JOB_ID, "status": overall, "items": results})
+        finish_status(self.chat_id, self.message_id, text, kb, thread_id=self.thread_id)
 
 
 def main():
@@ -2822,7 +2855,7 @@ def main():
         _, synced = sync_worker_state(JOB_ID)
         if synced is not None:
             m.message_id = synced
-        finish_status(m.chat_id, m.message_id, text)
+        finish_status(m.chat_id, m.message_id, text, thread_id=m.thread_id)
         worker_call("/internal/complete", {"job_id": JOB_ID, "status": "cancelled"})
     except Exception as e:
         reason = friendly_drive_error(str(e)) or str(e)
@@ -2834,7 +2867,7 @@ def main():
         _, synced = sync_worker_state(JOB_ID)
         if synced is not None:
             m.message_id = synced
-        finish_status(m.chat_id, m.message_id, text)
+        finish_status(m.chat_id, m.message_id, text, thread_id=m.thread_id)
         worker_call("/internal/complete", {
             "job_id": JOB_ID,
             "status": "failed",

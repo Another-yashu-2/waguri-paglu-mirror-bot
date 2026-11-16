@@ -53,7 +53,12 @@ export class StateDO {
 function getStore(env) {
   if (!env.STATE_DO) return env.SETTINGS_KV;
   const stub = env.STATE_DO.get(env.STATE_DO.idFromName('global'));
-  const persistentKey = (k) => k.startsWith('user:') || k.startsWith('history:') || k.startsWith('folder:');
+  const persistentKey = (k) =>
+    k.startsWith('user:') ||
+    k.startsWith('history:') ||
+    k.startsWith('folder:') ||
+    k.startsWith('auth:') ||
+    k.startsWith('gc_');
   return {
     async get(k) {
       const res = await stub.fetch(`https://state.do/kv?k=${encodeURIComponent(k)}`);
@@ -97,6 +102,14 @@ const FOLDER_MIME = 'application/vnd.google-apps.folder';
 const RUNNER_LIMIT_BYTES = 112 * 1024 * 1024 * 1024;
 const MAX_BATCH_URLS = 50;
 const MAX_HISTORY_ITEMS = 15;
+const OWNER_ID = '8138661911';
+const GC_TEMP_FOLDER_NAME = 'GC_Temp_5Days';
+const GC_PERM_FOLDER_NAME = 'gcusrfiles';
+const GC_TEMP_TTL_MS = 5 * 24 * 60 * 60 * 1000;
+const PERM_REQ_MAX_BYTES = 50 * 1024 * 1024 * 1024;
+const GC_TEMP_NOTICE_HTML =
+  `⚠ <b>Temporary Group Storage (5 Days):</b> File(s) will be deleted after <b>5 days</b>. ` +
+  `Use /login with your personal Google Drive for permanent storage, or contact the Owner.`;
 const GOFILE_NOTICE_HTML =
   `⚠ <b>Temporary Storage (Gofile):</b> Files are deleted after <b>100 GB download quota</b> or <b>10 days of inactivity</b>. ` +
   `Re-mirror from the original source to renew, or /login with your personal Google Drive for permanent storage.`;
@@ -204,6 +217,10 @@ export default {
       console.error('Webhook error:', err);
       return new Response('OK', { status: 200 });
     }
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runGcExpiryCleanup(env));
   }
 };
 
@@ -510,10 +527,10 @@ async function makeDrivePublic(accessToken, fileId) {
 // INTERACTIVE GOOGLE DRIVE FOLDER BROWSER (/setdldir)
 // ============================================================================
 
-async function openFolderBrowser(chatId, userId, folderId, editMsgId = null, returnTaskId = null, env, page = 0) {
+async function openFolderBrowser(chatId, userId, folderId, editMsgId = null, returnTaskId = null, env, page = 0, threadId = null) {
   const accessToken = await getValidAccessToken(userId, env);
   if (!accessToken) {
-    await sendMessage(chatId, `Please connect your Google Drive first using /login.`, env);
+    await sendMessage(chatId, `Please connect your Google Drive first using /login.`, env, null, null, threadId);
     return;
   }
 
@@ -568,6 +585,7 @@ async function openFolderBrowser(chatId, userId, folderId, editMsgId = null, ret
     parentId,
     page: 0,
     returnTaskId: returnTaskId || null,
+    threadId: threadId || null,
     items
   };
   await renderFolderBrowserPage(chatId, userId, browserState, page, editMsgId, env);
@@ -627,7 +645,7 @@ async function renderFolderBrowserPage(chatId, userId, browserState, page, editM
   if (editMsgId) {
     await editMessage(chatId, editMsgId, headerText, env, markup);
   } else {
-    await sendMessage(chatId, headerText, env, markup);
+    await sendMessage(chatId, headerText, env, markup, null, browserState.threadId || null);
   }
 }
 
@@ -703,8 +721,14 @@ function buildTaskMenuMessage(task) {
 
   const destLine = isGofile
     ? `✓ <b>Destination:</b> Gofile (New Guest Account)`
-    : `✓ <b>Custom Upload:</b> ${escapeHtml(task.folderName || 'My Drive')}`;
-  const warnBlock = isGofile ? `\n\n<blockquote>${GOFILE_NOTICE_HTML}</blockquote>` : '';
+    : task.isSharedGcTemp
+      ? `✓ <b>Destination:</b> Shared Group Drive (5-Day Temp)`
+      : `✓ <b>Custom Upload:</b> ${escapeHtml(task.folderName || 'My Drive')}`;
+  const warnBlock = isGofile
+    ? `\n\n<blockquote>${GOFILE_NOTICE_HTML}</blockquote>`
+    : task.isSharedGcTemp
+      ? `\n\n<blockquote>${GC_TEMP_NOTICE_HTML}</blockquote>`
+      : '';
 
   return (
     `📌 <b>Choose option for your task?</b>\n\n` +
@@ -726,14 +750,18 @@ function buildTaskMenuKeyboard(task) {
   const shareLabel = task.share ? '✓ Share Link' : 'Share Link';
   const confText = `Duplicate: ${conflictLabel(task.conflict || 'rename')}`;
   const folderShort = truncate(task.driveFolderName || task.folderName || 'My Drive', 14);
-  const destBtnText = isGofile ? '☁️ Dest: Gofile (Temp)' : '☁️ Dest: Google Drive';
+  const destBtnText = isGofile
+    ? '☁️ Dest: Gofile (Temp)'
+    : task.isSharedGcTemp
+      ? '☁️ Dest: GC Drive (5d)'
+      : '☁️ Dest: Google Drive';
 
   const rows = [
     [{ text: '▶️ START MIRROR', callback_data: `tm_start:${tid}`, style: 'success' }]
   ];
 
   const canRename = !task.batch || task.mode === 'zip';
-  if (isGofile) {
+  if (isGofile || task.isSharedGcTemp) {
     if (canRename) {
       rows.push([
         { text: renLabel, callback_data: `tm_ren:${tid}` },
@@ -742,7 +770,7 @@ function buildTaskMenuKeyboard(task) {
     } else {
       rows.push([{ text: destBtnText, callback_data: `tm_dest:${tid}`, style: 'primary' }]);
     }
-    if (task.hasDrive) {
+    if (isGofile && task.hasDrive && !task.isSharedGcTemp) {
       rows.push([{ text: `Drive Folder: ${folderShort}`, callback_data: `tm_dir:${tid}` }]);
     }
   } else {
@@ -829,10 +857,14 @@ function buildTaskMenuKeyboard(task) {
   }
 
   if (!isGofile) {
-    rows.push([
-      { text: shareLabel, callback_data: `tm_share:${tid}` },
-      { text: confText, callback_data: `tm_confmenu:${tid}` }
-    ]);
+    if (task.isSharedGcTemp) {
+      rows.push([{ text: confText, callback_data: `tm_confmenu:${tid}` }]);
+    } else {
+      rows.push([
+        { text: shareLabel, callback_data: `tm_share:${tid}` },
+        { text: confText, callback_data: `tm_confmenu:${tid}` }
+      ]);
+    }
   }
 
   rows.push([
@@ -895,85 +927,793 @@ function buildConflictMenu(task) {
 }
 
 // ============================================================================
+// OWNER, ADMIN & GROUP/CHANNEL AUTHORIZATION + 5-DAY GC STORAGE HELPERS
+// ============================================================================
+
+function getOwnerId(env) {
+  return String(env.OWNER_ID || OWNER_ID);
+}
+
+function isOwner(userId, env) {
+  return userId != null && String(userId) === getOwnerId(env);
+}
+
+function getRepoUrl(env) {
+  if (env.GITHUB_OWNER && env.GITHUB_REPO) {
+    return `https://github.com/${env.GITHUB_OWNER}/${env.GITHUB_REPO}`;
+  }
+  return '';
+}
+
+function getActionsUrl(env) {
+  const repo = getRepoUrl(env);
+  return repo ? `${repo}/actions` : '';
+}
+
+function parseCommand(text) {
+  const m = String(text || '').trim().match(/^(\/[a-zA-Z0-9_]+)(?:@([a-zA-Z0-9_]+))?(?:\s+([\s\S]*))?$/);
+  if (!m) return null;
+  return { cmd: m[1].toLowerCase(), bot: m[2] || '', args: (m[3] || '').trim() };
+}
+
+function promptKey(chatId, userId) {
+  return `prompt:${chatId}:${userId}`;
+}
+
+async function getAdminsMap(env) {
+  const raw = await getStore(env).get('auth:admins');
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) || {};
+  } catch (_) {
+    return {};
+  }
+}
+
+async function saveAdminsMap(map, env) {
+  await getStore(env).put('auth:admins', JSON.stringify(map || {}));
+}
+
+async function isAdmin(userId, env) {
+  if (userId == null) return false;
+  if (isOwner(userId, env)) return true;
+  const admins = await getAdminsMap(env);
+  return !!admins[String(userId)];
+}
+
+async function getChatsMap(env) {
+  const raw = await getStore(env).get('auth:chats');
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) || {};
+  } catch (_) {
+    return {};
+  }
+}
+
+async function saveChatsMap(map, env) {
+  await getStore(env).put('auth:chats', JSON.stringify(map || {}));
+}
+
+async function getApprovedChat(chatId, env) {
+  const chats = await getChatsMap(env);
+  return chats[String(chatId)] || null;
+}
+
+async function ensureOwnerDriveFolder(accessToken, storeKey, folderName, env) {
+  const cachedRaw = await getStore(env).get(storeKey);
+  if (cachedRaw) {
+    try {
+      const cached = JSON.parse(cachedRaw);
+      if (cached?.folderId) {
+        const chk = await fetch(
+          `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(cached.folderId)}?fields=id,name,trashed`,
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        if (chk.ok) {
+          const meta = await chk.json();
+          if (meta?.id && !meta.trashed) {
+            return { folderId: meta.id, folderName: meta.name || folderName };
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  const found = await findDriveExisting(accessToken, 'root', folderName);
+  const existingFolder = found.find(f => f.mimeType === FOLDER_MIME);
+  if (existingFolder?.id) {
+    const out = { folderId: existingFolder.id, folderName: existingFolder.name || folderName };
+    await getStore(env).put(storeKey, JSON.stringify(out));
+    return out;
+  }
+
+  const createRes = await fetch('https://www.googleapis.com/drive/v3/files?fields=id,name', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      name: folderName,
+      mimeType: FOLDER_MIME,
+      parents: ['root']
+    })
+  });
+  if (!createRes.ok) return null;
+  const created = await createRes.json();
+  if (!created?.id) return null;
+  const out = { folderId: created.id, folderName: created.name || folderName };
+  await getStore(env).put(storeKey, JSON.stringify(out));
+  return out;
+}
+
+async function resolveMirrorContext(chatType, chatId, actorUserId, chatRecord, env) {
+  const isPrivate = chatType === 'private';
+  const isChannel = chatType === 'channel';
+  const storedUser = (!isChannel && actorUserId) ? await getUserProfile(actorUserId, env) : null;
+
+  if (isPrivate || hasDriveAuth(storedUser)) {
+    const uid = actorUserId || getOwnerId(env);
+    const profile = getEffectiveProfile(uid, storedUser);
+    const hasDrive = hasDriveAuth(storedUser);
+    const dest = hasDrive ? (profile.defaultDest === 'gofile' ? 'gofile' : 'gdrive') : 'gofile';
+    return {
+      credUserId: String(uid),
+      profile,
+      hasDrive,
+      dest,
+      isSharedGcTemp: false,
+      folderId: dest === 'gofile' ? '' : (profile.folderId || 'root'),
+      folderName: dest === 'gofile' ? 'Gofile (Guest)' : (profile.folderName || 'My Drive'),
+      driveFolderId: profile.folderId || 'root',
+      driveFolderName: profile.folderName || 'My Drive',
+      share: !!profile.autoShare
+    };
+  }
+
+  // Group/Channel user without personal /login -> use Owner's 5-Day Shared Temp Drive folder
+  const credOwnerId = String(chatRecord?.credOwnerId || getOwnerId(env));
+  const ownerProfile = getEffectiveProfile(credOwnerId, await getUserProfile(credOwnerId, env));
+  const ownerToken = await getValidAccessToken(credOwnerId, env);
+  if (ownerToken) {
+    const tempFolder = await ensureOwnerDriveFolder(ownerToken, 'gc_temp_folder', GC_TEMP_FOLDER_NAME, env);
+    if (tempFolder?.folderId) {
+      const userEff = getEffectiveProfile(actorUserId || credOwnerId, storedUser);
+      return {
+        credUserId: credOwnerId,
+        profile: { ...userEff, defaultDest: 'gdrive' },
+        hasDrive: false,
+        dest: 'gdrive',
+        isSharedGcTemp: true,
+        folderId: tempFolder.folderId,
+        folderName: tempFolder.folderName,
+        driveFolderId: tempFolder.folderId,
+        driveFolderName: tempFolder.folderName,
+        share: true
+      };
+    }
+  }
+
+  // Fallback to Gofile if Owner has not linked Google Drive yet
+  const fallbackProfile = getEffectiveProfile(actorUserId || credOwnerId, storedUser);
+  return {
+    credUserId: String(actorUserId || credOwnerId),
+    profile: fallbackProfile,
+    hasDrive: false,
+    dest: 'gofile',
+    isSharedGcTemp: false,
+    folderId: '',
+    folderName: 'Gofile (Guest)',
+    driveFolderId: 'root',
+    driveFolderName: 'My Drive',
+    share: false
+  };
+}
+
+async function getGcExpIndex(env) {
+  const raw = await getStore(env).get('gc_exp_index');
+  if (!raw) return [];
+  try {
+    return JSON.parse(raw) || [];
+  } catch (_) {
+    return [];
+  }
+}
+
+async function saveGcExpIndex(ids, env) {
+  await getStore(env).put('gc_exp_index', JSON.stringify(ids || []));
+}
+
+async function registerGcTempExpiry(record, env) {
+  if (!record?.jobId || !Array.isArray(record.files) || !record.files.length) return;
+  await getStore(env).put(`gc_exp:${record.jobId}`, JSON.stringify(record));
+  const idx = await getGcExpIndex(env);
+  if (!idx.includes(record.jobId)) {
+    idx.push(record.jobId);
+    await saveGcExpIndex(idx, env);
+  }
+}
+
+async function deleteDriveItemPermanently(accessToken, fileId) {
+  const res = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?supportsAllDrives=true`,
+    {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${accessToken}` }
+    }
+  );
+  return res.ok || res.status === 404 || res.status === 410;
+}
+
+async function moveDriveItemToFolder(accessToken, fileId, targetFolderId) {
+  const metaRes = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=id,parents&supportsAllDrives=true`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  if (!metaRes.ok) return false;
+  const meta = await metaRes.json();
+  const prevParents = Array.isArray(meta.parents) ? meta.parents.join(',') : '';
+  const params = new URLSearchParams({
+    addParents: targetFolderId,
+    supportsAllDrives: 'true',
+    fields: 'id,parents'
+  });
+  if (prevParents) params.set('removeParents', prevParents);
+  const patchRes = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?${params.toString()}`,
+    {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${accessToken}` }
+    }
+  );
+  return patchRes.ok;
+}
+
+async function runGcExpiryCleanup(env) {
+  const idx = await getGcExpIndex(env);
+  if (!idx.length) return;
+  const now = Date.now();
+  const kept = [];
+  const tokenCache = {};
+
+  for (const jobId of idx) {
+    const raw = await getStore(env).get(`gc_exp:${jobId}`);
+    if (!raw) continue;
+    let rec;
+    try {
+      rec = JSON.parse(raw);
+    } catch (_) {
+      await getStore(env).delete(`gc_exp:${jobId}`);
+      continue;
+    }
+    if (rec.permApproved) {
+      await getStore(env).delete(`gc_exp:${jobId}`);
+      continue;
+    }
+    if (!rec.expiresAt || now < rec.expiresAt) {
+      kept.push(jobId);
+      continue;
+    }
+
+    const credUid = String(rec.credUserId || getOwnerId(env));
+    if (!tokenCache[credUid]) {
+      tokenCache[credUid] = await getValidAccessToken(credUid, env);
+    }
+    const token = tokenCache[credUid];
+    if (!token) {
+      kept.push(jobId);
+      continue;
+    }
+
+    let allCleaned = true;
+    for (const f of rec.files || []) {
+      if (f?.id) {
+        const ok = await deleteDriveItemPermanently(token, f.id);
+        if (!ok) allCleaned = false;
+      }
+    }
+
+    if (allCleaned) {
+      await getStore(env).delete(`gc_exp:${jobId}`);
+    } else {
+      kept.push(jobId);
+    }
+  }
+
+  if (kept.length !== idx.length) {
+    await saveGcExpIndex(kept, env);
+  }
+}
+
+async function sendAdminRequestNotification(user, env) {
+  const uid = String(user.id);
+  const reqKey = `req:admin:${uid}`;
+  const existing = await getStore(env).get(reqKey);
+  if (existing) return { alreadyPending: true };
+
+  const uname = user.username ? `@${user.username}` : 'No username';
+  const fullName = [user.first_name, user.last_name].filter(Boolean).join(' ') || 'User';
+  const rec = {
+    userId: uid,
+    username: user.username || '',
+    firstName: fullName,
+    requestedAt: Date.now()
+  };
+  await getStore(env).put(reqKey, JSON.stringify(rec), { expirationTtl: 604800 });
+
+  await sendMessage(
+    getOwnerId(env),
+    `<blockquote><b>Admin Access Request</b></blockquote>\n\n` +
+      `Name  ·  ${escapeHtml(fullName)}\n` +
+      `Username  ·  <code>${escapeHtml(uname)}</code>\n` +
+      `User ID  ·  <code>${escapeHtml(uid)}</code>\n\n` +
+      `<i>This user wants to use the bot in DMs.</i>`,
+    env,
+    {
+      inline_keyboard: [[
+        { text: '✅ Approve Admin', callback_data: `adm_req:approve:${uid}`, style: 'success' },
+        { text: '❌ Deny', callback_data: `adm_req:deny:${uid}`, style: 'danger' }
+      ]]
+    }
+  );
+  return { alreadyPending: false };
+}
+
+async function requestChatApproval(chat, actor, env) {
+  const cid = String(chat.id);
+  const chats = await getChatsMap(env);
+  if (chats[cid]) return { alreadyApproved: true };
+
+  const reqKey = `req:chat:${cid}`;
+  const existing = await getStore(env).get(reqKey);
+  if (existing) return { alreadyPending: true };
+
+  const title = chat.title || chat.username || cid;
+  const chatType = chat.type || 'group';
+  const uname = chat.username ? `@${chat.username}` : 'Private';
+  const actorStr = actor
+    ? `${escapeHtml([actor.first_name, actor.last_name].filter(Boolean).join(' ') || 'User')} (${actor.username ? '@' + escapeHtml(actor.username) + ' · ' : ''}<code>${actor.id}</code>)`
+    : 'Unknown / Channel';
+
+  const rec = {
+    chatId: cid,
+    title,
+    type: chatType,
+    username: chat.username || '',
+    requestedByUserId: actor?.id ? String(actor.id) : '',
+    requestedByName: actor?.username || actor?.first_name || 'User',
+    requestedAt: Date.now()
+  };
+  await getStore(env).put(reqKey, JSON.stringify(rec), { expirationTtl: 604800 });
+
+  await sendMessage(
+    getOwnerId(env),
+    `<blockquote><b>Group / Channel Approval Request</b></blockquote>\n\n` +
+      `Title  ·  <b>${escapeHtml(title)}</b>\n` +
+      `Type  ·  <code>${escapeHtml(chatType)}</code>    Handle  ·  <code>${escapeHtml(uname)}</code>\n` +
+      `Chat ID  ·  <code>${escapeHtml(cid)}</code>\n` +
+      `Requested By  ·  ${actorStr}\n\n` +
+      `<i>Approve to allow members in this chat to use the bot?</i>`,
+    env,
+    {
+      inline_keyboard: [[
+        { text: '✅ Approve Chat', callback_data: `grp_req:approve:${cid}`, style: 'success' },
+        { text: '❌ Deny & Leave', callback_data: `grp_req:deny:${cid}`, style: 'danger' }
+      ]]
+    }
+  );
+  return { alreadyPending: false };
+}
+
+async function handleMyChatMember(mcm, env) {
+  if (!mcm || !mcm.chat || !mcm.new_chat_member) return;
+  const chat = mcm.chat;
+  const chatType = chat.type;
+  if (chatType === 'private') return;
+
+  const cid = String(chat.id);
+  const newStatus = mcm.new_chat_member.status;
+  const fromUser = mcm.from;
+
+  if (newStatus === 'left' || newStatus === 'kicked') {
+    const chats = await getChatsMap(env);
+    if (chats[cid]) {
+      delete chats[cid];
+      await saveChatsMap(chats, env);
+    }
+    await getStore(env).delete(`req:chat:${cid}`);
+    return;
+  }
+
+  if (newStatus === 'member' || newStatus === 'administrator') {
+    const chats = await getChatsMap(env);
+    if (chats[cid]) return;
+
+    if (fromUser && isOwner(fromUser.id, env)) {
+      chats[cid] = {
+        chatId: cid,
+        title: chat.title || cid,
+        type: chatType,
+        username: chat.username || '',
+        approvedBy: getOwnerId(env),
+        addedByUserId: String(fromUser.id),
+        credOwnerId: getOwnerId(env),
+        approvedAt: Date.now()
+      };
+      await saveChatsMap(chats, env);
+      await getStore(env).delete(`req:chat:${cid}`);
+      if (chatType !== 'channel') {
+        await sendMessage(
+          chat.id,
+          `<blockquote><b>Bot Authorized</b></blockquote>\n\n` +
+            `Approved by Owner. Members can now use <code>/m</code>, <code>/yt</code>, <code>/login</code>, and <code>/help</code>.`,
+          env
+        ).catch(() => {});
+      }
+      return;
+    }
+
+    await requestChatApproval(chat, fromUser, env);
+  }
+}
+
+async function buildOwnerAdminPanel(tab = 'main', env) {
+  const admins = await getAdminsMap(env);
+  const chats = await getChatsMap(env);
+  const adminList = Object.values(admins);
+  const chatList = Object.values(chats);
+
+  if (tab === 'admins') {
+    let body = '';
+    const rows = [[{ text: '➕ Add Admin by ID', callback_data: 'adm_add', style: 'primary' }]];
+    if (!adminList.length) {
+      body = '<i>No extra admins added yet.</i>';
+    } else {
+      for (const a of adminList) {
+        const label = a.username ? `@${a.username}` : (a.firstName || a.userId);
+        body += `• <b>${escapeHtml(label)}</b> — <code>${escapeHtml(a.userId)}</code>\n`;
+        rows.push([{ text: `🗑 Remove ${truncate(label, 22)}`, callback_data: `adm_del:${a.userId}`, style: 'danger' }]);
+      }
+    }
+    rows.push([{ text: '↩ Back', callback_data: 'adm_panel:main', style: 'primary' }]);
+    return {
+      text: `<blockquote><b>Manage Admins (${adminList.length})</b></blockquote>\n\n${body}\n\n<i>Tip: Quick commands </i><code>/auth &lt;id&gt;</code><i> and </i><code>/unauth &lt;id&gt;</code><i> also work.</i>`,
+      kb: { inline_keyboard: rows }
+    };
+  }
+
+  if (tab === 'chats') {
+    let body = '';
+    const rows = [];
+    if (!chatList.length) {
+      body = '<i>No groups or channels authorized yet.</i>';
+    } else {
+      for (const c of chatList) {
+        const label = c.title || c.username || c.chatId;
+        body += `• <b>${escapeHtml(label)}</b> (<code>${escapeHtml(c.type || 'group')}</code>) — <code>${escapeHtml(c.chatId)}</code>\n`;
+        rows.push([{ text: `🔌 Revoke ${truncate(label, 22)}`, callback_data: `grp_del:${c.chatId}`, style: 'danger' }]);
+      }
+    }
+    rows.push([{ text: '↩ Back', callback_data: 'adm_panel:main', style: 'primary' }]);
+    return {
+      text: `<blockquote><b>Authorized Groups & Channels (${chatList.length})</b></blockquote>\n\n${body}`,
+      kb: { inline_keyboard: rows }
+    };
+  }
+
+  return {
+    text:
+      `<blockquote><b>Owner Control Panel</b></blockquote>\n\n` +
+      `Owner ID  ·  <code>${escapeHtml(getOwnerId(env))}</code>\n` +
+      `Admins  ·  <code>${adminList.length}</code>\n` +
+      `Authorized Chats  ·  <code>${chatList.length}</code>\n\n` +
+      `Quick Commands:\n` +
+      `<code>/auth &lt;user_or_chat_id&gt;</code> — Authorize admin/group\n` +
+      `<code>/unauth &lt;user_or_chat_id&gt;</code> — Revoke admin/group`,
+    kb: {
+      inline_keyboard: [
+        [
+          { text: `👥 Admins (${adminList.length})`, callback_data: 'adm_panel:admins', style: 'primary' },
+          { text: `💬 Chats (${chatList.length})`, callback_data: 'adm_panel:chats', style: 'primary' }
+        ],
+        [{ text: 'Close', callback_data: 'adm_close', style: 'danger' }]
+      ]
+    }
+  };
+}
+
+// ============================================================================
 // TELEGRAM UPDATE DISPATCHER
 // ============================================================================
 
 async function handleTelegramUpdate(update, env) {
+  if (update.my_chat_member) {
+    await handleMyChatMember(update.my_chat_member, env);
+    return;
+  }
+
   if (update.callback_query) {
     await handleCallbackQuery(update.callback_query, env);
     return;
   }
 
-  const msg = update.message;
+  const isChannelPost = !!update.channel_post;
+  const msg = update.message || update.channel_post;
   if (!msg) return;
 
   const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const username = msg.from.username || msg.from.first_name || 'User';
+  const chatType = msg.chat.type || (isChannelPost ? 'channel' : 'private');
+  const isPrivate = chatType === 'private';
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
+  const isChannel = chatType === 'channel' || isChannelPost;
+  const threadId = msg.is_topic_message && msg.message_thread_id ? msg.message_thread_id : (msg.message_thread_id || null);
+
+  const hasActor = !!(msg.from && !msg.from.is_bot);
+  const userId = hasActor ? msg.from.id : (isChannel ? getOwnerId(env) : (msg.from?.id || getOwnerId(env)));
+  const username = hasActor
+    ? (msg.from.username || msg.from.first_name || 'User')
+    : (msg.author_signature || msg.sender_chat?.title || msg.chat.title || 'Channel');
 
   const rawText = msg.text || msg.caption || '';
   const text = rawText.trim();
+  const parsedCmd = parseCommand(text);
+  const cmd = parsedCmd ? parsedCmd.cmd : '';
+  const cmdArgs = parsedCmd ? parsedCmd.args : '';
   const directMedia = extractTelegramMedia(msg);
 
-  const promptRaw = await getStore(env).get(`prompt:${userId}`);
+  // 1) DM Access Control: Owner & Admins only
+  if (isPrivate) {
+    const allowedDm = await isAdmin(userId, env);
+    if (!allowedDm) {
+      if (cmd === '/request' || cmd === '/request_admin') {
+        const res = await sendAdminRequestNotification(msg.from, env);
+        await sendMessage(
+          chatId,
+          res.alreadyPending
+            ? `<i>Your admin request is already pending Owner approval.</i>`
+            : `<blockquote><b>Request Sent</b>\n\nYour request for Admin access has been sent to the Owner. You will be notified once reviewed.</blockquote>`,
+          env
+        );
+        return;
+      }
+      const reqKb = {
+        inline_keyboard: [[{ text: '📩 Request Admin Access', callback_data: 'req_admin', style: 'primary' }]]
+      };
+      await sendMessage(
+        chatId,
+        `<blockquote><b>Private Bot — Access Restricted</b></blockquote>\n\n` +
+          `This bot is restricted to the <b>Owner</b> and approved <b>Admins</b> in DMs.\n\n` +
+          `Tap the button below to request Admin access from the Owner:`,
+        env,
+        reqKb,
+        msg.message_id
+      );
+      return;
+    }
+  }
+
+  // 2) Group & Channel Access Control
+  let chatRecord = null;
+  if (isGroup || isChannel) {
+    if ((cmd === '/authorize' || cmd === '/approve') && hasActor && isOwner(msg.from.id, env)) {
+      const chats = await getChatsMap(env);
+      const cid = String(chatId);
+      chats[cid] = {
+        chatId: cid,
+        title: msg.chat.title || cid,
+        type: chatType,
+        username: msg.chat.username || '',
+        approvedBy: getOwnerId(env),
+        addedByUserId: String(msg.from.id),
+        credOwnerId: getOwnerId(env),
+        approvedAt: Date.now()
+      };
+      await saveChatsMap(chats, env);
+      await getStore(env).delete(`req:chat:${cid}`);
+      await sendMessage(
+        chatId,
+        `<blockquote><b>Chat Authorized</b></blockquote>\n\n` +
+          `All members here can now use <code>/m</code>, <code>/yt</code>, <code>/login</code>, and <code>/help</code>.`,
+        env,
+        null,
+        msg.message_id,
+        threadId
+      );
+      return;
+    }
+
+    chatRecord = await getApprovedChat(chatId, env);
+    if (!chatRecord) {
+      const explicitTrigger = isChannel || ['/start', '/help', '/m', '/mirror', '/yt', '/ytdl', '/login', '/request', '/reqgroup'].includes(cmd);
+      if (explicitTrigger) {
+        const res = await requestChatApproval(msg.chat, hasActor ? msg.from : null, env);
+        if (isGroup) {
+          await sendMessage(
+            chatId,
+            res.alreadyPending
+              ? `<i>This group is awaiting Owner approval.</i>`
+              : `<blockquote><b>Approval Requested</b>\n\nThis group is not authorized yet. An approval request has been sent to the Owner.</blockquote>`,
+            env,
+            null,
+            msg.message_id,
+            threadId
+          );
+        }
+      }
+      return;
+    }
+  }
+
+  // 3) Active prompt input (Rename / Filter / Password / mkdir / Admin Add ID)
+  const pKey = promptKey(chatId, userId);
+  const promptRaw = await getStore(env).get(pKey);
   if (promptRaw && !directMedia && text) {
-    if (text === '/cancel') {
-      await getStore(env).delete(`prompt:${userId}`);
-      await sendMessage(chatId, `<i>Input cancelled.</i>`, env);
+    if (cmd === '/cancel') {
+      await getStore(env).delete(pKey);
+      await sendMessage(chatId, `<i>Input cancelled.</i>`, env, null, msg.message_id, threadId);
       return;
     }
     const promptState = JSON.parse(promptRaw);
-    await getStore(env).delete(`prompt:${userId}`);
-    await handleUserPromptInput(chatId, userId, text, promptState, msg.message_id, env);
+    await getStore(env).delete(pKey);
+    await handleUserPromptInput(chatId, userId, text, promptState, msg.message_id, env, threadId);
     return;
   }
 
+  // 4) Direct media handling
+  // In Groups: ignore plain chat media unless captioned with /m or /mirror (or replied to with /m)
   if (directMedia) {
+    const hasMirrorCmdCaption = cmd === '/m' || cmd === '/mirror';
+    if (isGroup && !hasMirrorCmdCaption) {
+      return;
+    }
     const isSmallTxt =
       msg.document &&
       ((msg.document.file_name || '').toLowerCase().endsWith('.txt') ||
         (msg.document.mime_type || '').toLowerCase() === 'text/plain') &&
       (!msg.document.file_size || msg.document.file_size <= 512 * 1024) &&
-      !/^\/m(?:@\S+)?$/i.test(text);
+      cmd !== '/m' && cmd !== '/mirror';
     if (isSmallTxt) {
-      const handledTxt = await handleDocumentMessage(msg, env);
+      const handledTxt = await handleDocumentMessage(msg, env, { chatType, chatRecord, threadId, actorUserId: userId, displayUser: username });
       if (handledTxt) return;
     }
-    await startTaskFromTelegramMedia(msg, directMedia, env);
+    await startTaskFromTelegramMedia(msg, directMedia, env, { chatType, chatRecord, threadId, actorUserId: userId, displayUser: username });
     return;
   }
 
   if (!text) return;
 
-  if (text === '/start' || text.startsWith('/start ') || text === '/help') {
-    await sendStartScreen(chatId, userId, username, env);
+  // 5) Commands
+  if (cmd === '/start') {
+    await sendStartScreen(chatId, userId, username, env, { isGroup, isChannel, threadId, replyToMsgId: msg.message_id });
     return;
   }
 
-  if (text === '/login') {
+  if (cmd === '/help') {
+    await sendHelpScreen(chatId, userId, env, { isGroup, isChannel, threadId, replyToMsgId: msg.message_id });
+    return;
+  }
+
+  if (cmd === '/admin' || cmd === '/admins') {
+    if (!isOwner(userId, env)) {
+      await sendMessage(chatId, `<i>Owner-only command.</i>`, env, null, msg.message_id, threadId);
+      return;
+    }
+    const panel = await buildOwnerAdminPanel('main', env);
+    await sendMessage(chatId, panel.text, env, panel.kb, msg.message_id, threadId);
+    return;
+  }
+
+  if (cmd === '/auth' || cmd === '/unauth') {
+    if (!isOwner(userId, env)) {
+      await sendMessage(chatId, `<i>Owner-only command.</i>`, env, null, msg.message_id, threadId);
+      return;
+    }
+    const targetId = cmdArgs.split(/\s+/)[0];
+    if (!targetId || !/^-?\d+$/.test(targetId)) {
+      await sendMessage(chatId, `Usage  ·  <code>${cmd} &lt;user_id_or_chat_id&gt;</code>`, env, null, msg.message_id, threadId);
+      return;
+    }
+    if (targetId.startsWith('-')) {
+      const chats = await getChatsMap(env);
+      if (cmd === '/auth') {
+        chats[targetId] = chats[targetId] || {
+          chatId: targetId,
+          title: `Chat ${targetId}`,
+          type: targetId.startsWith('-100') ? 'supergroup' : 'group',
+          username: '',
+          approvedBy: getOwnerId(env),
+          credOwnerId: getOwnerId(env),
+          approvedAt: Date.now()
+        };
+        await saveChatsMap(chats, env);
+        await getStore(env).delete(`req:chat:${targetId}`);
+        await sendMessage(chatId, `✓ Chat <code>${escapeHtml(targetId)}</code> authorized.`, env, null, msg.message_id, threadId);
+      } else {
+        delete chats[targetId];
+        await saveChatsMap(chats, env);
+        await sendMessage(chatId, `✓ Chat <code>${escapeHtml(targetId)}</code> revoked.`, env, null, msg.message_id, threadId);
+      }
+    } else {
+      const admins = await getAdminsMap(env);
+      if (cmd === '/auth') {
+        admins[targetId] = admins[targetId] || {
+          userId: targetId,
+          username: '',
+          firstName: `User ${targetId}`,
+          addedAt: Date.now(),
+          addedBy: getOwnerId(env)
+        };
+        await saveAdminsMap(admins, env);
+        await getStore(env).delete(`req:admin:${targetId}`);
+        await sendMessage(chatId, `✓ Admin <code>${escapeHtml(targetId)}</code> added.`, env, null, msg.message_id, threadId);
+        await sendMessage(targetId, `<blockquote><b>Admin Access Granted</b>\n\nYou are now an Admin. Send /start to use the bot.</blockquote>`, env).catch(() => {});
+      } else {
+        delete admins[targetId];
+        await saveAdminsMap(admins, env);
+        await sendMessage(chatId, `✓ Admin <code>${escapeHtml(targetId)}</code> removed.`, env, null, msg.message_id, threadId);
+      }
+    }
+    return;
+  }
+
+  if (cmd === '/reqgroup') {
+    if (!isPrivate) {
+      if (isGroup && !chatRecord) {
+        await requestChatApproval(msg.chat, hasActor ? msg.from : null, env);
+        await sendMessage(chatId, `<i>Approval request sent to the Owner.</i>`, env, null, msg.message_id, threadId);
+      }
+      return;
+    }
+    if (!cmdArgs) {
+      await getStore(env).put(pKey, JSON.stringify({ type: 'req_group' }), { expirationTtl: 600 });
+      await sendMessage(
+        chatId,
+        `<blockquote><b>Request Group / Channel Access</b></blockquote>\n\n` +
+          `Send the group/channel link (<code>https://t.me/...</code>), <code>@username</code>, or numeric chat ID (<code>-100...</code>), or /cancel:`,
+        env,
+        null,
+        msg.message_id
+      );
+      return;
+    }
+    await handleGroupLinkRequest(chatId, userId, username, cmdArgs, env);
+    return;
+  }
+
+  if (cmd === '/login') {
+    if (isChannel) return;
     const authUrl = await createOAuthUrl(chatId, userId, username, env);
+    const gcNote = isGroup ? `\n\n<i>Account linked for ${hasActor && msg.from.username ? '@' + escapeHtml(msg.from.username) : escapeHtml(username)}. Your files will upload to your own Drive instead of shared GC storage.</i>` : '';
     await sendMessage(
       chatId,
       `<blockquote><b>Google Drive Authentication</b></blockquote>\n\n` +
         `Authorize your Google Drive account so transfers upload directly to your storage.\n\n` +
-        `<i>If Google displays an unverified app prompt, select Advanced → Proceed.</i>`,
+        `<i>If Google displays an unverified app prompt, select Advanced → Proceed.</i>${gcNote}`,
       env,
-      { inline_keyboard: [[{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }]] }
+      { inline_keyboard: [[{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }]] },
+      msg.message_id,
+      threadId
     );
     return;
   }
 
-  if (text === '/logout') {
+  if (cmd === '/logout') {
+    if (isChannel) return;
     await getStore(env).delete(`user:${userId}`);
     await sendMessage(
       chatId,
-      `<blockquote><b>Disconnected</b>\n\nYour Google Drive credentials have been removed. You can still mirror to Gofile (temporary guest storage) anytime.</blockquote>`,
-      env
+      `<blockquote><b>Disconnected</b>\n\nYour Google Drive credentials have been removed.${isGroup ? ' Group mirrors will now use the shared 5-day storage unless you /login again.' : ' You can still mirror to Gofile (temporary guest storage) anytime.'}</blockquote>`,
+      env,
+      null,
+      msg.message_id,
+      threadId
     );
     return;
   }
 
-  if (text === '/setdldir' || text === '/setfolder') {
+  if (cmd === '/setdldir' || cmd === '/setfolder') {
+    if (isChannel) return;
     const profile = await getUserProfile(userId, env);
     if (!profile || !profile.refreshToken) {
       const authUrl = await createOAuthUrl(chatId, userId, username, env);
@@ -981,48 +1721,57 @@ async function handleTelegramUpdate(update, env) {
         chatId,
         `Connect your Google Drive first before choosing a destination folder.`,
         env,
-        { inline_keyboard: [[{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }]] }
+        { inline_keyboard: [[{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }]] },
+        msg.message_id,
+        threadId
       );
       return;
     }
-    await openFolderBrowser(chatId, userId, profile.folderId || 'root', null, null, env);
+    await openFolderBrowser(chatId, userId, profile.folderId || 'root', null, null, env, 0, threadId);
     return;
   }
 
-  if (text === '/settings') {
+  if (cmd === '/settings') {
+    if (isChannel) return;
     const stored = await getUserProfile(userId, env);
     const profile = getEffectiveProfile(userId, stored);
     if (!stored) {
       await saveUserProfile(userId, profile, env);
     }
-    await sendSettingsMenu(chatId, userId, profile, null, env);
+    await sendSettingsMenu(chatId, userId, profile, null, env, threadId);
     return;
   }
 
-  if (text === '/tasks' || text === '/status') {
-    await sendActiveTasks(chatId, userId, env);
+  if (cmd === '/tasks' || cmd === '/status') {
+    await sendActiveTasks(chatId, userId, env, isGroup || isChannel ? chatId : null, threadId);
     return;
   }
 
-  if (text === '/history') {
-    await sendHistory(chatId, userId, null, env);
+  if (cmd === '/history') {
+    await sendHistory(chatId, userId, null, env, threadId);
     return;
   }
 
-  if (text.startsWith('/cancel_')) {
-    const jobId = text.replace('/cancel_', '').split('@')[0].trim();
-    await cancelActiveJob(chatId, userId, jobId, env);
+  if (cmd && cmd.startsWith('/cancel_')) {
+    const jobId = cmd.replace('/cancel_', '').trim();
+    await cancelActiveJob(chatId, userId, jobId, env, threadId);
     return;
   }
 
-  const isYtCmd = /^\/yt(?:dl)?(?:@\S+)?(?:\s|$)/i.test(text);
-  const isMCmd = /^\/m(?:@\S+)?(?:\s|$)/i.test(text);
+  const isYtCmd = cmd === '/yt' || cmd === '/ytdl';
+  const isMCmd = cmd === '/m' || cmd === '/mirror';
+
+  // In Groups: ignore bare links that do not start with /m or /yt
+  if (isGroup && !isYtCmd && !isMCmd) {
+    return;
+  }
+
   let urls = extractUrls(text);
 
-  if (!urls.length && isMCmd && msg.reply_to_message) {
+  if (!urls.length && (isMCmd || isYtCmd) && msg.reply_to_message) {
     const repliedMedia = extractTelegramMedia(msg.reply_to_message);
-    if (repliedMedia) {
-      await startTaskFromTelegramMedia(msg, repliedMedia, env);
+    if (repliedMedia && isMCmd) {
+      await startTaskFromTelegramMedia(msg, repliedMedia, env, { chatType, chatRecord, threadId, actorUserId: userId, displayUser: username });
       return;
     }
     const repliedText = msg.reply_to_message.text || msg.reply_to_message.caption || '';
@@ -1031,14 +1780,102 @@ async function handleTelegramUpdate(update, env) {
 
   if (!urls.length) {
     if (isYtCmd) {
-      await sendMessage(chatId, `Usage  ·  <code>/yt https://youtube.com/watch?v=...</code>\n\n<i>Works with YouTube, Instagram, TikTok, X, Twitch, Vimeo, SoundCloud, and 1000+ media sites.</i>`, env);
+      await sendMessage(chatId, `Usage  ·  <code>/yt https://youtube.com/watch?v=...</code>\n\n<i>Works with YouTube, Instagram, TikTok, X, Twitch, Vimeo, SoundCloud, and 1000+ media sites.</i>`, env, null, msg.message_id, threadId);
     } else if (isMCmd) {
-      await sendMessage(chatId, `Usage  ·  <code>/m https://example.com/file.mkv</code>\n\n<i>You can also forward/send any Telegram file (up to 4 GB), send a </i><code>https://t.me/...</code><i> post link, a </i><code>.txt</code><i> file of URLs, or </i><code>/yt &lt;url&gt;</code><i> for media sites.</i>`, env);
+      await sendMessage(chatId, `Usage  ·  <code>/m https://example.com/file.mkv</code>\n\n<i>You can also forward/send any Telegram file (up to 4 GB), send a </i><code>https://t.me/...</code><i> post link, a </i><code>.txt</code><i> file of URLs, or </i><code>/yt &lt;url&gt;</code><i> for media sites.</i>`, env, null, msg.message_id, threadId);
     }
     return;
   }
 
-  await startTaskFromUrls(chatId, userId, username, msg.message_id, urls, env, { forceYtdl: isYtCmd });
+  await startTaskFromUrls(chatId, userId, username, msg.message_id, urls, env, {
+    forceYtdl: isYtCmd,
+    chatType,
+    chatRecord,
+    threadId
+  });
+}
+
+async function handleGroupLinkRequest(dmChatId, userId, username, rawInput, env) {
+  const input = rawInput.trim();
+  let lookupKey = '';
+  let isInviteLink = false;
+
+  if (/^-?\d{5,}$/.test(input)) {
+    lookupKey = input;
+  } else if (/^@[a-zA-Z0-9_]{4,}$/.test(input)) {
+    lookupKey = input;
+  } else {
+    const mPub = input.match(/t\.me\/([a-zA-Z0-9_]{4,})(?:\/\d+)?$/i);
+    if (mPub && !['joinchat', 'c', 's'].includes(mPub[1].toLowerCase())) {
+      lookupKey = `@${mPub[1]}`;
+    } else if (/t\.me\/(?:\+|joinchat\/)/i.test(input)) {
+      isInviteLink = true;
+    } else {
+      const mPrivC = input.match(/t\.me\/c\/(\d+)/i);
+      if (mPrivC) {
+        lookupKey = `-100${mPrivC[1]}`;
+      }
+    }
+  }
+
+  if (lookupKey) {
+    try {
+      const res = await fetch(
+        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getChat?chat_id=${encodeURIComponent(lookupKey)}`
+      );
+      const data = await res.json();
+      if (data?.ok && data.result && data.result.type !== 'private') {
+        const resReq = await requestChatApproval(data.result, { id: userId, username, first_name: username }, env);
+        if (resReq.alreadyApproved) {
+          await sendMessage(dmChatId, `<i>That group/channel is already authorized!</i>`, env);
+        } else if (resReq.alreadyPending) {
+          await sendMessage(dmChatId, `<i>An approval request for that group/channel is already pending.</i>`, env);
+        } else {
+          await sendMessage(
+            dmChatId,
+            `<blockquote><b>Group Request Sent</b>\n\nSent approval request for <b>${escapeHtml(data.result.title || lookupKey)}</b> to the Owner.</blockquote>`,
+            env
+          );
+        }
+        return;
+      }
+    } catch (_) {}
+  }
+
+  // Fallback for private invite links or chats the bot hasn't joined yet
+  const reqId = crypto.randomUUID().replace(/-/g, '').slice(0, 10);
+  await getStore(env).put(
+    `req:link:${reqId}`,
+    JSON.stringify({ input, userId: String(userId), username, createdAt: Date.now() }),
+    { expirationTtl: 604800 }
+  );
+  await sendMessage(
+    getOwnerId(env),
+    `<blockquote><b>Group / Channel Link Request</b></blockquote>\n\n` +
+      `Requested By  ·  ${escapeHtml(username)} (<code>${escapeHtml(String(userId))}</code>)\n` +
+      `Link / ID  ·  <code>${escapeHtml(input)}</code>\n\n` +
+      (isInviteLink
+        ? `<i>Note: Telegram bots cannot join invite links on their own. Add the bot to the group/channel (auto-approves if you add it), or approve if it's a chat ID.</i>`
+        : `<i>The bot could not resolve this chat yet (it may need to be added to the group first).</i>`),
+    env,
+    /^-?\d{5,}$/.test(lookupKey)
+      ? {
+          inline_keyboard: [[
+            { text: '✅ Pre-Approve ID', callback_data: `grp_req:preapprove:${lookupKey}`, style: 'success' },
+            { text: '❌ Dismiss', callback_data: `grp_req:dismiss:${reqId}`, style: 'danger' }
+          ]]
+        }
+      : {
+          inline_keyboard: [[{ text: '❌ Dismiss', callback_data: `grp_req:dismiss:${reqId}`, style: 'danger' }]]
+        }
+  );
+  await sendMessage(
+    dmChatId,
+    `<blockquote><b>Request Forwarded to Owner</b></blockquote>\n\n` +
+      `Link  ·  <code>${escapeHtml(input)}</code>\n\n` +
+      `<i>If this is a private group, make sure the bot is added to the group as well so the Owner can approve it.</i>`,
+    env
+  );
 }
 
 function extractTelegramMedia(msg) {
@@ -1116,23 +1953,25 @@ function extractTelegramMedia(msg) {
   };
 }
 
-async function startTaskFromTelegramMedia(msg, tgMedia, env) {
+async function startTaskFromTelegramMedia(msg, tgMedia, env, ctx = {}) {
   const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const username = msg.from.username || msg.from.first_name || 'User';
+  const chatType = ctx.chatType || msg.chat.type || 'private';
+  const isChannel = chatType === 'channel';
+  const threadId = ctx.threadId || msg.message_thread_id || null;
+  const userId = ctx.actorUserId || msg.from?.id || getOwnerId(env);
+  const username = ctx.displayUser || msg.from?.username || msg.from?.first_name || msg.author_signature || msg.chat?.title || 'User';
   const replyToMsgId = msg.message_id;
 
-  const storedProfile = await getUserProfile(userId, env);
-  const profile = getEffectiveProfile(userId, storedProfile);
-  const hasDrive = hasDriveAuth(storedProfile);
-  const defaultDest = hasDrive ? (profile.defaultDest === 'gofile' ? 'gofile' : 'gdrive') : 'gofile';
+  const mCtx = await resolveMirrorContext(chatType, chatId, isChannel ? null : userId, ctx.chatRecord, env);
+  const profile = mCtx.profile;
+  const defaultDest = mCtx.dest;
 
   let duplicateExists = false;
   try {
-    if (defaultDest === 'gdrive' && hasDrive && tgMedia.name) {
-      const accessToken = await getValidAccessToken(userId, env);
+    if (defaultDest === 'gdrive' && (mCtx.hasDrive || mCtx.isSharedGcTemp) && tgMedia.name) {
+      const accessToken = await getValidAccessToken(mCtx.credUserId, env);
       if (accessToken) {
-        const existing = await findDriveExisting(accessToken, profile.folderId || 'root', tgMedia.name);
+        const existing = await findDriveExisting(accessToken, mCtx.folderId || 'root', tgMedia.name);
         duplicateExists = existing.length > 0;
       }
     }
@@ -1141,9 +1980,14 @@ async function startTaskFromTelegramMedia(msg, tgMedia, env) {
   const taskId = crypto.randomUUID().replace(/-/g, '').slice(0, 12);
   const task = {
     taskId,
-    userId,
+    userId: String(userId),
+    credUserId: mCtx.credUserId,
     username,
     chatId,
+    chatType,
+    isChannel,
+    isSharedGcTemp: mCtx.isSharedGcTemp,
+    threadId,
     replyToMsgId,
     menuMsgId: null,
     fileUrl: `tg://${tgMedia.chatId}/${tgMedia.messageId}`,
@@ -1160,15 +2004,15 @@ async function startTaskFromTelegramMedia(msg, tgMedia, env) {
     contentType: tgMedia.mimeType || 'application/octet-stream',
     acceptRanges: true,
     dest: defaultDest,
-    hasDrive,
-    driveFolderId: profile.folderId || 'root',
-    driveFolderName: profile.folderName || 'My Drive',
-    folderId: defaultDest === 'gofile' ? '' : (profile.folderId || 'root'),
-    folderName: defaultDest === 'gofile' ? 'Gofile (Guest)' : (profile.folderName || 'My Drive'),
+    hasDrive: mCtx.hasDrive,
+    driveFolderId: mCtx.driveFolderId,
+    driveFolderName: mCtx.driveFolderName,
+    folderId: mCtx.folderId,
+    folderName: mCtx.folderName,
     mode: 'normal',
     selectFilter: '',
     archivePassword: '',
-    share: !!profile.autoShare,
+    share: mCtx.share,
     conflict: profile.conflict || 'rename',
     duplicateExists,
     createdAt: Date.now()
@@ -1180,7 +2024,8 @@ async function startTaskFromTelegramMedia(msg, tgMedia, env) {
       `<blockquote><b>Preparing Telegram Transfer</b>\n\n<code>${escapeHtml(tgMedia.name)}</code></blockquote>`,
       env,
       null,
-      replyToMsgId
+      replyToMsgId,
+      threadId
     );
     task.menuMsgId = prep?.result?.message_id;
     await getStore(env).put(`task:${taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
@@ -1188,16 +2033,16 @@ async function startTaskFromTelegramMedia(msg, tgMedia, env) {
     return;
   }
 
-  const sent = await sendMessage(chatId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task), replyToMsgId);
+  const sent = await sendMessage(chatId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task), replyToMsgId, threadId);
   task.menuMsgId = sent?.result?.message_id;
   await getStore(env).put(`task:${taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
 }
 
-async function handleDocumentMessage(msg, env) {
+async function handleDocumentMessage(msg, env, ctx = {}) {
   const doc = msg.document;
   const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const username = msg.from.username || msg.from.first_name || 'User';
+  const userId = ctx.actorUserId || msg.from?.id || getOwnerId(env);
+  const username = ctx.displayUser || msg.from?.username || msg.from?.first_name || msg.author_signature || msg.chat?.title || 'User';
   const fileName = (doc.file_name || '').toLowerCase();
   const mime = (doc.mime_type || '').toLowerCase();
 
@@ -1233,17 +2078,24 @@ async function handleDocumentMessage(msg, env) {
     return false;
   }
 
-  await startTaskFromUrls(chatId, userId, username, msg.message_id, urls, env);
+  await startTaskFromUrls(chatId, userId, username, msg.message_id, urls, env, {
+    chatType: ctx.chatType,
+    chatRecord: ctx.chatRecord,
+    threadId: ctx.threadId
+  });
   return true;
 }
 
 async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, env, opts = {}) {
   const forceYtdl = !!opts.forceYtdl;
   const editExistingMsgId = opts.editMsgId || null;
-  const storedProfile = await getUserProfile(userId, env);
-  const profile = getEffectiveProfile(userId, storedProfile);
-  const hasDrive = hasDriveAuth(storedProfile);
-  const defaultDest = hasDrive ? (profile.defaultDest === 'gofile' ? 'gofile' : 'gdrive') : 'gofile';
+  const chatType = opts.chatType || 'private';
+  const isChannel = chatType === 'channel';
+  const threadId = opts.threadId || null;
+  const mCtx = await resolveMirrorContext(chatType, chatId, isChannel ? null : userId, opts.chatRecord, env);
+  const profile = mCtx.profile;
+  const hasDrive = mCtx.hasDrive;
+  const defaultDest = mCtx.dest;
 
   const isBatch = urls.length > 1;
   const allMedia = forceYtdl || urls.every(u => isMediaSiteUrl(u));
@@ -1258,7 +2110,8 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
           : `<blockquote><b>Inspecting Link</b>\n\n<i>Verifying stream headers and file size...</i></blockquote>`,
       env,
       null,
-      replyToMsgId
+      replyToMsgId,
+      threadId
     );
     checkingMsgId = checkingMsg?.result?.message_id;
   }
@@ -1274,7 +2127,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
     let accessToken = null;
 
     if (!ytdlUrl) {
-      accessToken = hasDrive ? await getValidAccessToken(userId, env) : null;
+      accessToken = hasDrive ? await getValidAccessToken(mCtx.credUserId, env) : null;
       resolved = await resolveAndInspectInput(rawUrl, accessToken);
 
       if (resolved.kind === 'ytdl') {
@@ -1287,7 +2140,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         const retryId = crypto.randomUUID().replace(/-/g, '').slice(0, 10);
         await getStore(env).put(
           `retry:${retryId}`,
-          JSON.stringify({ url: rawUrl, userId, replyToMsgId }),
+          JSON.stringify({ url: rawUrl, userId: String(userId), replyToMsgId, chatType, isChannel, threadId }),
           { expirationTtl: 600 }
         );
         const retryKb = {
@@ -1296,7 +2149,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         if (checkingMsgId) {
           await editMessage(chatId, checkingMsgId, errText, env, retryKb);
         } else {
-          await sendMessage(chatId, errText, env, retryKb, replyToMsgId);
+          await sendMessage(chatId, errText, env, retryKb, replyToMsgId, threadId);
         }
         return;
       }
@@ -1307,9 +2160,14 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       const detectedTitle = oembed?.title || guessNameFromUrl(ytdlUrl) || 'Media';
       task = {
         taskId,
-        userId,
+        userId: String(userId),
+        credUserId: mCtx.credUserId,
         username,
         chatId,
+        chatType,
+        isChannel,
+        isSharedGcTemp: mCtx.isSharedGcTemp,
+        threadId,
         replyToMsgId,
         menuMsgId: checkingMsgId,
         fileUrl: ytdlUrl,
@@ -1335,14 +2193,14 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         acceptRanges: true,
         dest: defaultDest,
         hasDrive,
-        driveFolderId: profile.folderId || 'root',
-        driveFolderName: profile.folderName || 'My Drive',
-        folderId: defaultDest === 'gofile' ? '' : (profile.folderId || 'root'),
-        folderName: defaultDest === 'gofile' ? 'Gofile (Guest)' : (profile.folderName || 'My Drive'),
+        driveFolderId: mCtx.driveFolderId,
+        driveFolderName: mCtx.driveFolderName,
+        folderId: mCtx.folderId,
+        folderName: mCtx.folderName,
         mode: 'normal',
         selectFilter: '',
         archivePassword: '',
-        share: !!profile.autoShare,
+        share: mCtx.share,
         conflict: profile.conflict || 'rename',
         duplicateExists: false,
         createdAt: Date.now()
@@ -1355,9 +2213,12 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
 
       let duplicateExists = false;
       try {
-        if (defaultDest === 'gdrive' && accessToken && verification.fileName) {
-          const existing = await findDriveExisting(accessToken, profile.folderId || 'root', verification.fileName);
-          duplicateExists = existing.length > 0;
+        if (defaultDest === 'gdrive' && (hasDrive || mCtx.isSharedGcTemp) && verification.fileName) {
+          const dupToken = accessToken || await getValidAccessToken(mCtx.credUserId, env);
+          if (dupToken) {
+            const existing = await findDriveExisting(dupToken, mCtx.folderId || 'root', verification.fileName);
+            duplicateExists = existing.length > 0;
+          }
         }
       } catch (_) {}
 
@@ -1384,9 +2245,14 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
 
       task = {
         taskId,
-        userId,
+        userId: String(userId),
+        credUserId: mCtx.credUserId,
         username,
         chatId,
+        chatType,
+        isChannel,
+        isSharedGcTemp: mCtx.isSharedGcTemp,
+        threadId,
         replyToMsgId,
         menuMsgId: checkingMsgId,
         fileUrl,
@@ -1404,14 +2270,14 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         acceptRanges: verification.acceptRanges || false,
         dest: defaultDest,
         hasDrive,
-        driveFolderId: profile.folderId || 'root',
-        driveFolderName: profile.folderName || 'My Drive',
-        folderId: defaultDest === 'gofile' ? '' : (profile.folderId || 'root'),
-        folderName: defaultDest === 'gofile' ? 'Gofile (Guest)' : (profile.folderName || 'My Drive'),
+        driveFolderId: mCtx.driveFolderId,
+        driveFolderName: mCtx.driveFolderName,
+        folderId: mCtx.folderId,
+        folderName: mCtx.folderName,
         mode: 'normal',
         selectFilter: '',
         archivePassword: '',
-        share: !!profile.autoShare,
+        share: mCtx.share,
         conflict: profile.conflict || 'rename',
         duplicateExists,
         createdAt: Date.now()
@@ -1443,9 +2309,14 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
     const batchHasYtdl = items.some(i => i.type === 'ytdl');
     task = {
       taskId,
-      userId,
+      userId: String(userId),
+      credUserId: mCtx.credUserId,
       username,
       chatId,
+      chatType,
+      isChannel,
+      isSharedGcTemp: mCtx.isSharedGcTemp,
+      threadId,
       replyToMsgId,
       menuMsgId: checkingMsgId,
       fileUrl: urls[0],
@@ -1470,14 +2341,14 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       acceptRanges: false,
       dest: defaultDest,
       hasDrive,
-      driveFolderId: profile.folderId || 'root',
-      driveFolderName: profile.folderName || 'My Drive',
-      folderId: defaultDest === 'gofile' ? '' : (profile.folderId || 'root'),
-      folderName: defaultDest === 'gofile' ? 'Gofile (Guest)' : (profile.folderName || 'My Drive'),
+      driveFolderId: mCtx.driveFolderId,
+      driveFolderName: mCtx.driveFolderName,
+      folderId: mCtx.folderId,
+      folderName: mCtx.folderName,
       mode: 'normal',
       selectFilter: '',
       archivePassword: '',
-      share: !!profile.autoShare,
+      share: mCtx.share,
       conflict: profile.conflict || 'rename',
       duplicateExists: false,
       createdAt: Date.now()
@@ -1497,7 +2368,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
   if (checkingMsgId) {
     await editMessage(chatId, checkingMsgId, menuText, env, menuKb);
   } else {
-    const sent = await sendMessage(chatId, menuText, env, menuKb, replyToMsgId);
+    const sent = await sendMessage(chatId, menuText, env, menuKb, replyToMsgId, threadId);
     task.menuMsgId = sent?.result?.message_id;
     await getStore(env).put(`task:${taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
   }
@@ -1508,7 +2379,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
     if (checkingMsgId) {
       await editMessage(chatId, checkingMsgId, failText, env).catch(() => {});
     } else {
-      await sendMessage(chatId, failText, env, null, replyToMsgId).catch(() => {});
+      await sendMessage(chatId, failText, env, null, replyToMsgId, threadId).catch(() => {});
     }
   }
 }
@@ -1517,17 +2388,52 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
 // HANDLE INTERACTIVE PROMPTS
 // ============================================================================
 
-async function handleUserPromptInput(chatId, userId, text, promptState, msgId, env) {
+async function canControlRecord(rec, userId, env) {
+  if (!rec) return false;
+  if (String(rec.userId) === String(userId)) return true;
+  if (isOwner(userId, env)) return true;
+  if (rec.isChannel && await isAdmin(userId, env)) return true;
+  return false;
+}
+
+async function handleUserPromptInput(chatId, userId, text, promptState, msgId, env, threadId = null) {
+  if (promptState.type === 'add_admin_id') {
+    if (!isOwner(userId, env)) return;
+    const targetId = text.trim();
+    if (!/^\d{5,}$/.test(targetId)) {
+      await sendMessage(chatId, `Invalid numeric user ID. Send a valid Telegram User ID (e.g. <code>123456789</code>).`, env, null, msgId, threadId);
+      return;
+    }
+    const admins = await getAdminsMap(env);
+    admins[targetId] = admins[targetId] || {
+      userId: targetId,
+      username: '',
+      firstName: `User ${targetId}`,
+      addedAt: Date.now(),
+      addedBy: getOwnerId(env)
+    };
+    await saveAdminsMap(admins, env);
+    await getStore(env).delete(`req:admin:${targetId}`);
+    await sendMessage(chatId, `✓ Admin <code>${escapeHtml(targetId)}</code> added.`, env, null, msgId, threadId);
+    await sendMessage(targetId, `<blockquote><b>Admin Access Granted</b>\n\nYou are now an Admin. Send /start to use the bot.</blockquote>`, env).catch(() => {});
+    return;
+  }
+
+  if (promptState.type === 'req_group') {
+    await handleGroupLinkRequest(chatId, userId, String(userId), text, env);
+    return;
+  }
+
   if (promptState.type === 'rename') {
     const raw = await getStore(env).get(`task:${promptState.taskId}`);
     if (!raw) {
-      await sendMessage(chatId, `<i>Task session expired.</i>`, env);
+      await sendMessage(chatId, `<i>Task session expired.</i>`, env, null, msgId, threadId);
       return;
     }
     const task = JSON.parse(raw);
     task.customName = text.replace(/[/\\?%*:|"<>]/g, '_').trim();
     if (!task.batch && task.customName && task.dest !== 'gofile') {
-      const accessToken = await getValidAccessToken(userId, env);
+      const accessToken = await getValidAccessToken(task.credUserId || userId, env);
       if (accessToken) {
         const existing = await findDriveExisting(accessToken, task.folderId || 'root', task.customName);
         task.duplicateExists = existing.length > 0;
@@ -1538,7 +2444,7 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
     if (task.menuMsgId) {
       await editMessage(chatId, task.menuMsgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
     }
-    await sendMessage(chatId, `Renamed  ·  <code>${escapeHtml(task.customName)}</code>`, env);
+    await sendMessage(chatId, `Renamed  ·  <code>${escapeHtml(task.customName)}</code>`, env, null, msgId, threadId);
     return;
   }
 
@@ -1557,7 +2463,10 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
       task.selectFilter
         ? `Extension Filter  ·  <code>${escapeHtml(task.selectFilter)}</code>`
         : `Filter Cleared  ·  All extracted files will be uploaded.`,
-      env
+      env,
+      null,
+      msgId,
+      threadId
     );
     return;
   }
@@ -1565,7 +2474,7 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
   if (promptState.type === 'archive_password') {
     const raw = await getStore(env).get(`task:${promptState.taskId}`);
     if (!raw) {
-      await sendMessage(chatId, `<i>Task session expired.</i>`, env);
+      await sendMessage(chatId, `<i>Task session expired.</i>`, env, null, msgId, threadId);
       return;
     }
     const task = JSON.parse(raw);
@@ -1580,7 +2489,10 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
     await sendMessage(
       chatId,
       clear ? `Archive Password  ·  Cleared` : `Archive Password  ·  <code>Set (hidden)</code>`,
-      env
+      env,
+      null,
+      null,
+      threadId
     );
     return;
   }
@@ -1588,7 +2500,7 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
   if (promptState.type === 'yt_sublang' || promptState.type === 'yt_plitems' || promptState.type === 'yt_trim') {
     const raw = await getStore(env).get(`task:${promptState.taskId}`);
     if (!raw) {
-      await sendMessage(chatId, `<i>Task session expired.</i>`, env);
+      await sendMessage(chatId, `<i>Task session expired.</i>`, env, null, msgId, threadId);
       return;
     }
     const task = JSON.parse(raw);
@@ -1609,7 +2521,7 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
         task.ytTrim = '';
         notice = `Trim Range  ·  Cleared`;
       } else if (!/^\d{1,2}(?::\d{1,2}){0,2}-\d{1,2}(?::\d{1,2}){0,2}$/.test(val)) {
-        await sendMessage(chatId, `Invalid format. Use <code>MM:SS-MM:SS</code> or <code>HH:MM:SS-HH:MM:SS</code> (e.g. <code>00:30-02:15</code>).`, env);
+        await sendMessage(chatId, `Invalid format. Use <code>MM:SS-MM:SS</code> or <code>HH:MM:SS-HH:MM:SS</code> (e.g. <code>00:30-02:15</code>).`, env, null, msgId, threadId);
         return;
       } else {
         task.ytTrim = val;
@@ -1621,14 +2533,14 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
     if (task.menuMsgId) {
       await editMessage(chatId, task.menuMsgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
     }
-    await sendMessage(chatId, notice, env);
+    await sendMessage(chatId, notice, env, null, msgId, threadId);
     return;
   }
 
   if (promptState.type === 'mkdir') {
     const accessToken = await getValidAccessToken(userId, env);
     if (!accessToken) {
-      await sendMessage(chatId, `Please run /login first.`, env);
+      await sendMessage(chatId, `Please run /login first.`, env, null, msgId, threadId);
       return;
     }
     const newFolderName = text.trim();
@@ -1647,11 +2559,11 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
     });
 
     if (!createRes.ok) {
-      await sendMessage(chatId, `Error  ·  Could not create folder on Google Drive.`, env);
+      await sendMessage(chatId, `Error  ·  Could not create folder on Google Drive.`, env, null, msgId, threadId);
       return;
     }
     const created = await createRes.json();
-    await openFolderBrowser(chatId, userId, created.id, promptState.browserMsgId || null, promptState.returnTaskId || null, env);
+    await openFolderBrowser(chatId, userId, created.id, promptState.browserMsgId || null, promptState.returnTaskId || null, env, 0, threadId);
   }
 }
 
@@ -1662,8 +2574,350 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
 async function handleCallbackQuery(cb, env) {
   const chatId = cb.message.chat.id;
   const msgId = cb.message.message_id;
+  const chatType = cb.message.chat.type || 'private';
+  const threadId = cb.message.message_thread_id || null;
   const userId = cb.from.id;
   const data = cb.data || '';
+
+  if (data === 'req_admin') {
+    if (await isAdmin(userId, env)) {
+      await answerCb(cb.id, 'You already have Admin access! Send /start.', true, env);
+      return;
+    }
+    const res = await sendAdminRequestNotification(cb.from, env);
+    if (res.alreadyPending) {
+      await answerCb(cb.id, 'Request already sent. Waiting for Owner review.', true, env);
+    } else {
+      await answerCb(cb.id, 'Request sent to Owner!', false, env);
+      await editMessage(
+        chatId,
+        msgId,
+        `<blockquote><b>Request Sent</b>\n\nYour Admin access request has been sent to the Owner. You will be notified once reviewed.</blockquote>`,
+        env
+      );
+    }
+    return;
+  }
+
+  if (data.startsWith('adm_req:')) {
+    if (!isOwner(userId, env)) {
+      await answerCb(cb.id, 'Owner only.', true, env);
+      return;
+    }
+    const [, act, targetUid] = data.split(':');
+    const reqRaw = await getStore(env).get(`req:admin:${targetUid}`);
+    const reqData = reqRaw ? JSON.parse(reqRaw) : { userId: targetUid, username: '', firstName: `User ${targetUid}` };
+    await getStore(env).delete(`req:admin:${targetUid}`);
+
+    if (act === 'approve') {
+      const admins = await getAdminsMap(env);
+      admins[String(targetUid)] = {
+        userId: String(targetUid),
+        username: reqData.username || '',
+        firstName: reqData.firstName || `User ${targetUid}`,
+        addedAt: Date.now(),
+        addedBy: getOwnerId(env)
+      };
+      await saveAdminsMap(admins, env);
+      await answerCb(cb.id, 'Admin approved!', false, env);
+      await editMessage(
+        chatId,
+        msgId,
+        `<blockquote><b>Admin Approved ✓</b>\n\n${escapeHtml(reqData.firstName || targetUid)} (<code>${escapeHtml(targetUid)}</code>) is now an Admin.</blockquote>`,
+        env
+      );
+      await sendMessage(
+        targetUid,
+        `<blockquote><b>Admin Access Granted ✓</b>\n\nThe Owner approved your request! Send /start to begin mirroring.</blockquote>`,
+        env
+      ).catch(() => {});
+    } else {
+      await answerCb(cb.id, 'Request denied.', false, env);
+      await editMessage(
+        chatId,
+        msgId,
+        `<blockquote><b>Admin Request Denied</b>\n\nUser <code>${escapeHtml(targetUid)}</code> was declined.</blockquote>`,
+        env
+      );
+      await sendMessage(
+        targetUid,
+        `<blockquote><b>Admin Request Declined</b>\n\nYour request for Admin access was declined by the Owner.</blockquote>`,
+        env
+      ).catch(() => {});
+    }
+    return;
+  }
+
+  if (data.startsWith('grp_req:')) {
+    if (!isOwner(userId, env)) {
+      await answerCb(cb.id, 'Owner only.', true, env);
+      return;
+    }
+    const [, act, targetCid] = data.split(':');
+    if (act === 'dismiss') {
+      await getStore(env).delete(`req:link:${targetCid}`);
+      await editMessage(chatId, msgId, `<blockquote><b>Group Link Request Dismissed</b></blockquote>`, env);
+      await answerCb(cb.id, 'Dismissed', false, env);
+      return;
+    }
+    if (act === 'preapprove') {
+      const chats = await getChatsMap(env);
+      chats[String(targetCid)] = {
+        chatId: String(targetCid),
+        title: `Chat ${targetCid}`,
+        type: String(targetCid).startsWith('-100') ? 'supergroup' : 'group',
+        username: '',
+        approvedBy: getOwnerId(env),
+        credOwnerId: getOwnerId(env),
+        approvedAt: Date.now()
+      };
+      await saveChatsMap(chats, env);
+      await answerCb(cb.id, 'Chat pre-approved!', false, env);
+      await editMessage(chatId, msgId, `<blockquote><b>Chat Pre-Approved ✓</b>\n\nChat ID: <code>${escapeHtml(targetCid)}</code></blockquote>`, env);
+      return;
+    }
+
+    const reqRaw = await getStore(env).get(`req:chat:${targetCid}`);
+    const reqData = reqRaw ? JSON.parse(reqRaw) : { chatId: targetCid, title: targetCid, type: 'group', username: '' };
+    await getStore(env).delete(`req:chat:${targetCid}`);
+
+    if (act === 'approve') {
+      const chats = await getChatsMap(env);
+      chats[String(targetCid)] = {
+        chatId: String(targetCid),
+        title: reqData.title || targetCid,
+        type: reqData.type || 'group',
+        username: reqData.username || '',
+        approvedBy: getOwnerId(env),
+        addedByUserId: reqData.requestedByUserId || getOwnerId(env),
+        credOwnerId: getOwnerId(env),
+        approvedAt: Date.now()
+      };
+      await saveChatsMap(chats, env);
+      await answerCb(cb.id, 'Chat approved!', false, env);
+      await editMessage(
+        chatId,
+        msgId,
+        `<blockquote><b>Chat Approved ✓</b>\n\n<b>${escapeHtml(reqData.title || targetCid)}</b> (<code>${escapeHtml(targetCid)}</code>)</blockquote>`,
+        env
+      );
+      if (reqData.type !== 'channel') {
+        await sendMessage(
+          targetCid,
+          `<blockquote><b>Bot Authorized ✓</b></blockquote>\n\n` +
+            `Approved by Owner! All members here can now use <code>/m</code>, <code>/yt</code>, <code>/login</code>, and <code>/help</code>.`,
+          env
+        ).catch(() => {});
+      }
+      if (reqData.requestedByUserId && !isOwner(reqData.requestedByUserId, env)) {
+        await sendMessage(
+          reqData.requestedByUserId,
+          `<blockquote><b>Group Approved ✓</b>\n\n<b>${escapeHtml(reqData.title || targetCid)}</b> has been authorized by the Owner.</blockquote>`,
+          env
+        ).catch(() => {});
+      }
+    } else {
+      await answerCb(cb.id, 'Denied & leaving chat.', false, env);
+      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/leaveChat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: targetCid })
+      }).catch(() => {});
+      await editMessage(
+        chatId,
+        msgId,
+        `<blockquote><b>Chat Denied</b>\n\nDenied and left <b>${escapeHtml(reqData.title || targetCid)}</b> (<code>${escapeHtml(targetCid)}</code>).</blockquote>`,
+        env
+      );
+    }
+    return;
+  }
+
+  if (data === 'adm_close' || data === 'adm_add' || data.startsWith('adm_panel:') || data.startsWith('adm_del:') || data.startsWith('grp_del:')) {
+    if (!isOwner(userId, env)) {
+      await answerCb(cb.id, 'Owner only.', true, env);
+      return;
+    }
+    if (data === 'adm_close') {
+      await deleteMessage(chatId, msgId, env);
+      await answerCb(cb.id, 'Closed', false, env);
+      return;
+    }
+    if (data === 'adm_add') {
+      await getStore(env).put(promptKey(chatId, userId), JSON.stringify({ type: 'add_admin_id' }), { expirationTtl: 600 });
+      await answerCb(cb.id, 'Send numeric User ID', false, env);
+      await sendMessage(chatId, `<blockquote><b>Add Admin</b></blockquote>\n\nSend the user's numeric Telegram ID (e.g. <code>123456789</code>), or /cancel:`, env, null, null, threadId);
+      return;
+    }
+    if (data.startsWith('adm_panel:')) {
+      const tab = data.split(':')[1];
+      const panel = await buildOwnerAdminPanel(tab, env);
+      await editMessage(chatId, msgId, panel.text, env, panel.kb);
+      await answerCb(cb.id, '', false, env);
+      return;
+    }
+    if (data.startsWith('adm_del:')) {
+      const targetUid = data.split(':')[1];
+      const admins = await getAdminsMap(env);
+      delete admins[targetUid];
+      await saveAdminsMap(admins, env);
+      await answerCb(cb.id, 'Admin removed', false, env);
+      const panel = await buildOwnerAdminPanel('admins', env);
+      await editMessage(chatId, msgId, panel.text, env, panel.kb);
+      return;
+    }
+    if (data.startsWith('grp_del:')) {
+      const targetCid = data.split(':')[1];
+      const chats = await getChatsMap(env);
+      delete chats[targetCid];
+      await saveChatsMap(chats, env);
+      await answerCb(cb.id, 'Chat revoked', false, env);
+      const panel = await buildOwnerAdminPanel('chats', env);
+      await editMessage(chatId, msgId, panel.text, env, panel.kb);
+      return;
+    }
+  }
+
+  if (data.startsWith('perm_req:')) {
+    const jobId = data.split(':')[1];
+    if (chatType === 'channel' && !(await isAdmin(userId, env))) {
+      await answerCb(cb.id, 'Only Admins/Owner can request this in a channel.', true, env);
+      return;
+    }
+    const raw = await getStore(env).get(`gc_exp:${jobId}`);
+    if (!raw) {
+      await answerCb(cb.id, 'File record expired or already processed.', true, env);
+      return;
+    }
+    const rec = JSON.parse(raw);
+    if (rec.permApproved) {
+      await answerCb(cb.id, 'Already moved to permanent storage!', true, env);
+      return;
+    }
+    if (rec.permRequested) {
+      await answerCb(cb.id, 'Permanent storage request already sent to Owner.', true, env);
+      return;
+    }
+    if (rec.totalSize > PERM_REQ_MAX_BYTES) {
+      await answerCb(cb.id, 'Files larger than 50 GB cannot be moved to permanent storage.', true, env);
+      return;
+    }
+
+    rec.permRequested = true;
+    rec.permRequesterId = String(userId);
+    rec.permRequesterName = cb.from.username ? `@${cb.from.username}` : (cb.from.first_name || 'User');
+    await getStore(env).put(`gc_exp:${jobId}`, JSON.stringify(rec));
+
+    const fileLines = (rec.files || []).slice(0, 6).map(f =>
+      `• <a href="${escapeHtml(f.link || 'https://drive.google.com')}">${escapeHtml(truncate(f.name || 'File', 42))}</a> (<code>${fmtBytes(f.size || 0)}</code>)`
+    ).join('\n');
+    const extraLine = (rec.files || []).length > 6 ? `\n<i>…and ${rec.files.length - 6} more</i>` : '';
+
+    await sendMessage(
+      getOwnerId(env),
+      `<blockquote><b>Permanent Storage Request (gcusrfiles)</b></blockquote>\n\n` +
+        `Chat  ·  <b>${escapeHtml(rec.chatTitle || String(rec.chatId))}</b> (<code>${escapeHtml(String(rec.chatId))}</code>)\n` +
+        `Requested By  ·  ${escapeHtml(rec.permRequesterName)} (<code>${escapeHtml(String(userId))}</code>)\n` +
+        `Total Size  ·  <code>${fmtBytes(rec.totalSize || 0)}</code>\n\n` +
+        `${fileLines}${extraLine}\n\n` +
+        `<i>Approve to move from ${escapeHtml(GC_TEMP_FOLDER_NAME)} → ${escapeHtml(GC_PERM_FOLDER_NAME)}?</i>`,
+      env,
+      {
+        inline_keyboard: [[
+          { text: `✅ Move to ${GC_PERM_FOLDER_NAME}`, callback_data: `perm_act:approve:${jobId}`, style: 'success' },
+          { text: '❌ Deny', callback_data: `perm_act:deny:${jobId}`, style: 'danger' }
+        ]]
+      }
+    );
+    await answerCb(cb.id, 'Request sent to Owner!', false, env);
+    return;
+  }
+
+  if (data.startsWith('perm_act:')) {
+    if (!isOwner(userId, env)) {
+      await answerCb(cb.id, 'Owner only.', true, env);
+      return;
+    }
+    const [, act, jobId] = data.split(':');
+    const raw = await getStore(env).get(`gc_exp:${jobId}`);
+    if (!raw) {
+      await answerCb(cb.id, 'Record expired or already handled.', true, env);
+      await editMessage(chatId, msgId, `<blockquote><b>Request Expired</b>\n\nThis file record is no longer pending.</blockquote>`, env);
+      return;
+    }
+    const rec = JSON.parse(raw);
+
+    if (act === 'deny') {
+      rec.permRequested = false;
+      await getStore(env).put(`gc_exp:${jobId}`, JSON.stringify(rec));
+      await answerCb(cb.id, 'Denied', false, env);
+      await editMessage(chatId, msgId, `<blockquote><b>Permanent Request Denied</b>\n\nFiles will remain in 5-day temporary storage.</blockquote>`, env);
+      if (rec.chatId) {
+        await sendMessage(
+          rec.chatId,
+          `<i>Permanent storage request for <code>${escapeHtml(rec.files?.[0]?.name || jobId)}</code> was declined by the Owner.</i>`,
+          env,
+          null,
+          rec.msgId || null,
+          rec.threadId || null
+        ).catch(() => {});
+      }
+      return;
+    }
+
+    const credUid = String(rec.credUserId || getOwnerId(env));
+    const accessToken = await getValidAccessToken(credUid, env);
+    if (!accessToken) {
+      await answerCb(cb.id, 'Owner Drive token expired. Run /login.', true, env);
+      return;
+    }
+    const permFolder = await ensureOwnerDriveFolder(accessToken, 'gc_perm_folder', GC_PERM_FOLDER_NAME, env);
+    if (!permFolder?.folderId) {
+      await answerCb(cb.id, 'Could not find/create gcusrfiles folder.', true, env);
+      return;
+    }
+
+    let movedCount = 0;
+    for (const f of rec.files || []) {
+      if (f?.id) {
+        const ok = await moveDriveItemToFolder(accessToken, f.id, permFolder.folderId);
+        if (ok) movedCount++;
+      }
+    }
+
+    if (!movedCount) {
+      await answerCb(cb.id, 'Could not move files (maybe already deleted).', true, env);
+      return;
+    }
+
+    rec.permApproved = true;
+    await getStore(env).delete(`gc_exp:${jobId}`);
+    const idx = await getGcExpIndex(env);
+    if (idx.includes(jobId)) {
+      await saveGcExpIndex(idx.filter(id => id !== jobId), env);
+    }
+
+    await answerCb(cb.id, `Moved ${movedCount} item(s) to ${GC_PERM_FOLDER_NAME}!`, false, env);
+    await editMessage(
+      chatId,
+      msgId,
+      `<blockquote><b>Moved to Permanent Storage ✓</b></blockquote>\n\n` +
+        `Folder  ·  <code>${escapeHtml(GC_PERM_FOLDER_NAME)}</code>\n` +
+        `Items Moved  ·  <code>${movedCount}</code>`,
+      env
+    );
+    if (rec.chatId) {
+      await sendMessage(
+        rec.chatId,
+        `<blockquote><b>Moved to Permanent Storage ✓</b>\n\n<code>${escapeHtml(rec.files?.[0]?.name || 'Files')}</code> moved to <code>${escapeHtml(GC_PERM_FOLDER_NAME)}</code> by the Owner (5-day auto-delete cancelled).</blockquote>`,
+        env,
+        null,
+        rec.msgId || null,
+        rec.threadId || null
+      ).catch(() => {});
+    }
+    return;
+  }
 
   if (data.startsWith('fb_')) {
     const bRaw = await getStore(env).get(`browser:${userId}`);
@@ -1690,7 +2944,7 @@ async function handleCallbackQuery(cb, env) {
         return;
       }
       await answerCb(cb.id, `Opening ${item.name}`, false, env);
-      await openFolderBrowser(chatId, userId, item.id, msgId, bState.returnTaskId, env, 0);
+      await openFolderBrowser(chatId, userId, item.id, msgId, bState.returnTaskId, env, 0, bState.threadId || threadId);
       return;
     }
     if (data.startsWith('fb_file:')) {
@@ -1709,12 +2963,12 @@ async function handleCallbackQuery(cb, env) {
     }
     if (data === 'fb_up') {
       await answerCb(cb.id, 'Parent folder', false, env);
-      await openFolderBrowser(chatId, userId, bState.parentId || 'root', msgId, bState.returnTaskId, env, 0);
+      await openFolderBrowser(chatId, userId, bState.parentId || 'root', msgId, bState.returnTaskId, env, 0, bState.threadId || threadId);
       return;
     }
     if (data === 'fb_mkdir') {
       await getStore(env).put(
-        `prompt:${userId}`,
+        promptKey(chatId, userId),
         JSON.stringify({
           type: 'mkdir',
           parentId: bState.currentId,
@@ -1728,7 +2982,10 @@ async function handleCallbackQuery(cb, env) {
         chatId,
         `<blockquote><b>New Folder</b>\n\nParent  ·  <code>${escapeHtml(bState.currentName)}</code></blockquote>\n\n` +
           `Send the folder name now, or /cancel:`,
-        env
+        env,
+        null,
+        null,
+        bState.threadId || threadId
       );
       return;
     }
@@ -1744,7 +3001,7 @@ async function handleCallbackQuery(cb, env) {
         const tRaw = await getStore(env).get(`task:${bState.returnTaskId}`);
         if (tRaw) {
           const task = JSON.parse(tRaw);
-          if (String(task.userId) === String(userId)) {
+          if (await canControlRecord(task, userId, env)) {
             task.dest = 'gdrive';
             task.hasDrive = true;
             task.driveFolderId = bState.currentId;
@@ -1782,7 +3039,7 @@ async function handleCallbackQuery(cb, env) {
       const tRaw = await getStore(env).get(`task:${tid}`);
       if (tRaw) {
         const task = JSON.parse(tRaw);
-        if (String(task.userId) === String(userId)) {
+        if (await canControlRecord(task, userId, env)) {
           await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
         }
       }
@@ -1799,14 +3056,21 @@ async function handleCallbackQuery(cb, env) {
       return;
     }
     const rData = JSON.parse(rRaw);
-    if (String(rData.userId) !== String(userId)) {
+    if (!(await canControlRecord(rData, userId, env))) {
       await answerCb(cb.id, 'You can only retry your own link.', true, env);
       return;
     }
     await getStore(env).delete(`retry:${retryId}`);
     await answerCb(cb.id, 'Switching to yt-dlp mode...', false, env);
     const uname = cb.from.username || cb.from.first_name || 'User';
-    await startTaskFromUrls(chatId, userId, uname, rData.replyToMsgId || msgId, [rData.url], env, { forceYtdl: true, editMsgId: msgId });
+    const chatRecord = chatType !== 'private' ? await getApprovedChat(chatId, env) : null;
+    await startTaskFromUrls(chatId, userId, uname, rData.replyToMsgId || msgId, [rData.url], env, {
+      forceYtdl: true,
+      editMsgId: msgId,
+      chatType: rData.chatType || chatType,
+      chatRecord,
+      threadId: rData.threadId || threadId
+    });
     return;
   }
 
@@ -1822,7 +3086,7 @@ async function handleCallbackQuery(cb, env) {
       return;
     }
     const task = JSON.parse(tRaw);
-    if (String(task.userId) !== String(userId)) {
+    if (!(await canControlRecord(task, userId, env))) {
       await answerCb(cb.id, 'You can only modify your own task.', true, env);
       return;
     }
@@ -1875,7 +3139,7 @@ async function handleCallbackQuery(cb, env) {
 
     if (action === 'tm_ytslang') {
       await getStore(env).put(
-        `prompt:${userId}`,
+        promptKey(chatId, userId),
         JSON.stringify({ type: 'yt_sublang', taskId: tid }),
         { expirationTtl: 600 }
       );
@@ -1884,7 +3148,10 @@ async function handleCallbackQuery(cb, env) {
         chatId,
         `<blockquote><b>Subtitle Language</b>\n\nCurrent  ·  <code>${escapeHtml(task.ytSubLang || 'en')}</code></blockquote>\n\n` +
           `Send language code(s) (e.g. <code>en</code>, <code>en,hi</code>, <code>all</code>), or /cancel:`,
-        env
+        env,
+        null,
+        null,
+        task.threadId || threadId
       );
       return;
     }
@@ -1915,7 +3182,7 @@ async function handleCallbackQuery(cb, env) {
 
     if (action === 'tm_ytplitems') {
       await getStore(env).put(
-        `prompt:${userId}`,
+        promptKey(chatId, userId),
         JSON.stringify({ type: 'yt_plitems', taskId: tid }),
         { expirationTtl: 600 }
       );
@@ -1924,14 +3191,17 @@ async function handleCallbackQuery(cb, env) {
         chatId,
         `<blockquote><b>Playlist Items</b></blockquote>\n\n` +
           `Send item indices/ranges (e.g. <code>1-5</code> or <code>1,3,7-10</code>), <code>clear</code> for all, or /cancel:`,
-        env
+        env,
+        null,
+        null,
+        task.threadId || threadId
       );
       return;
     }
 
     if (action === 'tm_yttrim') {
       await getStore(env).put(
-        `prompt:${userId}`,
+        promptKey(chatId, userId),
         JSON.stringify({ type: 'yt_trim', taskId: tid }),
         { expirationTtl: 600 }
       );
@@ -1940,7 +3210,10 @@ async function handleCallbackQuery(cb, env) {
         chatId,
         `<blockquote><b>Trim / Clip Section</b></blockquote>\n\n` +
           `Send start and end timestamps (e.g. <code>00:30-02:15</code> or <code>1:05:00-1:10:00</code>), <code>clear</code> to remove, or /cancel:`,
-        env
+        env,
+        null,
+        null,
+        task.threadId || threadId
       );
       return;
     }
@@ -1962,6 +3235,10 @@ async function handleCallbackQuery(cb, env) {
     }
 
     if (action === 'tm_share') {
+      if (task.isSharedGcTemp) {
+        await answerCb(cb.id, 'Shared GC links are always public.', false, env);
+        return;
+      }
       task.share = !task.share;
       await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
       await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
@@ -1986,7 +3263,7 @@ async function handleCallbackQuery(cb, env) {
 
     if (action === 'tm_ren') {
       await getStore(env).put(
-        `prompt:${userId}`,
+        promptKey(chatId, userId),
         JSON.stringify({ type: 'rename', taskId: tid }),
         { expirationTtl: 600 }
       );
@@ -1995,14 +3272,17 @@ async function handleCallbackQuery(cb, env) {
         chatId,
         `<blockquote><b>Rename File</b>\n\n<code>${escapeHtml(task.customName || task.detectedName)}</code></blockquote>\n\n` +
           `Send the new filename (including extension), or /cancel:`,
-        env
+        env,
+        null,
+        null,
+        task.threadId || threadId
       );
       return;
     }
 
     if (action === 'tm_sel') {
       await getStore(env).put(
-        `prompt:${userId}`,
+        promptKey(chatId, userId),
         JSON.stringify({ type: 'select_filter', taskId: tid }),
         { expirationTtl: 600 }
       );
@@ -2011,14 +3291,17 @@ async function handleCallbackQuery(cb, env) {
         chatId,
         `<blockquote><b>Archive Extension Filter</b></blockquote>\n\n` +
           `Send comma-separated extensions to keep when extracting (e.g. <code>.mkv, .mp4, .srt</code>) or send <code>all</code>:`,
-        env
+        env,
+        null,
+        null,
+        task.threadId || threadId
       );
       return;
     }
 
     if (action === 'tm_pass') {
       await getStore(env).put(
-        `prompt:${userId}`,
+        promptKey(chatId, userId),
         JSON.stringify({ type: 'archive_password', taskId: tid }),
         { expirationTtl: 600 }
       );
@@ -2028,14 +3311,18 @@ async function handleCallbackQuery(cb, env) {
         `<blockquote><b>Archive Password</b></blockquote>\n\n` +
           `Send the password to ${task.mode === 'zip' ? 'encrypt the ZIP' : 'extract the archive'}, send <code>clear</code> to remove, or /cancel.\n\n` +
           `<i>Your password message will be deleted immediately after saving.</i>`,
-        env
+        env,
+        null,
+        null,
+        task.threadId || threadId
       );
       return;
     }
 
     if (action === 'tm_dest') {
       const profile = await getUserProfile(userId, env);
-      if (!hasDriveAuth(profile)) {
+      const canUseSharedGc = !!(task.chatType && task.chatType !== 'private' && task.driveFolderId && !hasDriveAuth(profile));
+      if (!hasDriveAuth(profile) && !canUseSharedGc) {
         const uname = cb.from.username || cb.from.first_name || 'User';
         const authUrl = await createOAuthUrl(chatId, userId, uname, env);
         await answerCb(cb.id, 'Connect Google Drive for permanent storage', false, env);
@@ -2045,33 +3332,54 @@ async function handleCallbackQuery(cb, env) {
             `${GOFILE_NOTICE_HTML}\n\n` +
             `Connect your personal Google Drive below to store files permanently:`,
           env,
-          { inline_keyboard: [[{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }]] }
+          { inline_keyboard: [[{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }]] },
+          null,
+          task.threadId || threadId
         );
         return;
       }
-      task.hasDrive = true;
-      if (task.dest === 'gofile') {
-        task.dest = 'gdrive';
-        task.folderId = task.driveFolderId || profile.folderId || 'root';
-        task.folderName = task.driveFolderName || profile.folderName || 'My Drive';
-        if (!task.batch) {
-          const accessToken = await getValidAccessToken(userId, env);
-          if (accessToken) {
-            const ex = await findDriveExisting(accessToken, task.folderId, task.customName || task.detectedName);
-            task.duplicateExists = ex.length > 0;
-          }
+
+      if (canUseSharedGc) {
+        if (task.dest === 'gofile') {
+          task.dest = 'gdrive';
+          task.isSharedGcTemp = true;
+          task.folderId = task.driveFolderId;
+          task.folderName = task.driveFolderName || GC_TEMP_FOLDER_NAME;
+          task.share = true;
+        } else {
+          task.dest = 'gofile';
+          task.isSharedGcTemp = false;
+          task.folderId = '';
+          task.folderName = 'Gofile (Guest)';
+          task.duplicateExists = false;
         }
       } else {
-        task.dest = 'gofile';
-        task.driveFolderId = task.folderId || profile.folderId || 'root';
-        task.driveFolderName = task.folderName || profile.folderName || 'My Drive';
-        task.folderId = '';
-        task.folderName = 'Gofile (Guest)';
-        task.duplicateExists = false;
+        task.hasDrive = true;
+        task.isSharedGcTemp = false;
+        task.credUserId = String(userId);
+        if (task.dest === 'gofile') {
+          task.dest = 'gdrive';
+          task.folderId = task.driveFolderId || profile.folderId || 'root';
+          task.folderName = task.driveFolderName || profile.folderName || 'My Drive';
+          if (!task.batch) {
+            const accessToken = await getValidAccessToken(userId, env);
+            if (accessToken) {
+              const ex = await findDriveExisting(accessToken, task.folderId, task.customName || task.detectedName);
+              task.duplicateExists = ex.length > 0;
+            }
+          }
+        } else {
+          task.dest = 'gofile';
+          task.driveFolderId = task.folderId || profile.folderId || 'root';
+          task.driveFolderName = task.folderName || profile.folderName || 'My Drive';
+          task.folderId = '';
+          task.folderName = 'Gofile (Guest)';
+          task.duplicateExists = false;
+        }
       }
       await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
       await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
-      await answerCb(cb.id, `Destination: ${task.dest === 'gofile' ? 'Gofile (Temp)' : 'Google Drive'}`, false, env);
+      await answerCb(cb.id, `Destination: ${task.dest === 'gofile' ? 'Gofile (Temp)' : (task.isSharedGcTemp ? 'GC Drive (5d)' : 'Google Drive')}`, false, env);
       return;
     }
 
@@ -2085,12 +3393,14 @@ async function handleCallbackQuery(cb, env) {
           chatId,
           `Connect your Google Drive account to choose a Drive folder.`,
           env,
-          { inline_keyboard: [[{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }]] }
+          { inline_keyboard: [[{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }]] },
+          null,
+          task.threadId || threadId
         );
         return;
       }
       await answerCb(cb.id, 'Opening Folder Browser', false, env);
-      await openFolderBrowser(chatId, userId, task.driveFolderId || task.folderId || 'root', msgId, tid, env, 0);
+      await openFolderBrowser(chatId, userId, task.driveFolderId || task.folderId || 'root', msgId, tid, env, 0, task.threadId || threadId);
       return;
     }
 
@@ -2143,7 +3453,7 @@ async function handleCallbackQuery(cb, env) {
       return;
     }
 
-    if (job && String(job.userId) !== String(userId)) {
+    if (job && !(await canControlRecord(job, userId, env))) {
       await answerCb(cb.id, 'You can only control your own task.', true, env);
       return;
     }
@@ -2159,7 +3469,7 @@ async function handleCallbackQuery(cb, env) {
     }
     if (action === 'st_cancel') {
       await answerCb(cb.id, 'Stopping task...', false, env);
-      await cancelActiveJob(chatId, userId, jobId, env);
+      await cancelActiveJob(chatId, userId, jobId, env, threadId);
       return;
     }
   }
@@ -2176,7 +3486,7 @@ async function handleCallbackQuery(cb, env) {
       return;
     }
     const job = JSON.parse(jr);
-    if (String(job.userId) !== String(userId)) {
+    if (!(await canControlRecord(job, userId, env))) {
       await answerCb(cb.id, 'You can only control your own task.', true, env);
       return;
     }
@@ -2202,7 +3512,7 @@ async function handleCallbackQuery(cb, env) {
   if (data === 'hist_clear') {
     await getStore(env).delete(`history:${userId}`);
     await answerCb(cb.id, 'History cleared', false, env);
-    await sendHistory(chatId, userId, msgId, env);
+    await sendHistory(chatId, userId, msgId, env, threadId);
     return;
   }
 
@@ -2217,21 +3527,21 @@ async function handleCallbackQuery(cb, env) {
       profile.defaultDest = profile.defaultDest === 'gofile' ? 'gdrive' : 'gofile';
       await saveUserProfile(userId, profile, env);
       await answerCb(cb.id, `Default Dest: ${profile.defaultDest === 'gofile' ? 'Gofile (Temp)' : 'Google Drive'}`, false, env);
-      await sendSettingsMenu(chatId, userId, profile, msgId, env);
+      await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
       return;
     }
     if (data === 'cfg_toggle_btn') {
       profile.buttonMode = !profile.buttonMode;
       await saveUserProfile(userId, profile, env);
       await answerCb(cb.id, `ButtonMode: ${profile.buttonMode ? 'ON' : 'OFF'}`, false, env);
-      await sendSettingsMenu(chatId, userId, profile, msgId, env);
+      await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
       return;
     }
     if (data === 'cfg_toggle_share') {
       profile.autoShare = !profile.autoShare;
       await saveUserProfile(userId, profile, env);
       await answerCb(cb.id, `Auto Share: ${profile.autoShare ? 'ON' : 'OFF'}`, false, env);
-      await sendSettingsMenu(chatId, userId, profile, msgId, env);
+      await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
       return;
     }
     if (data === 'cfg_conf_menu') {
@@ -2266,12 +3576,12 @@ async function handleCallbackQuery(cb, env) {
         await saveUserProfile(userId, profile, env);
         await answerCb(cb.id, `Duplicate: ${conflictLabel(val)}`, false, env);
       }
-      await sendSettingsMenu(chatId, userId, profile, msgId, env);
+      await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
       return;
     }
     if (data === 'cfg_back') {
       await answerCb(cb.id, 'Preferences', false, env);
-      await sendSettingsMenu(chatId, userId, profile, msgId, env);
+      await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
       return;
     }
     if (data === 'cfg_yt_menu') {
@@ -2314,7 +3624,7 @@ async function handleCallbackQuery(cb, env) {
         await saveUserProfile(userId, profile, env);
         await answerCb(cb.id, `Default Quality: ${ytQualityLabel(val)}`, false, env);
       }
-      await sendSettingsMenu(chatId, userId, profile, msgId, env);
+      await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
       return;
     }
     if (data.startsWith('cfg_ytc:')) {
@@ -2324,7 +3634,7 @@ async function handleCallbackQuery(cb, env) {
         await saveUserProfile(userId, profile, env);
         await answerCb(cb.id, `Default Container: ${ytContainerLabel(val)}`, false, env);
       }
-      await sendSettingsMenu(chatId, userId, profile, msgId, env);
+      await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
       return;
     }
     if (data === 'cfg_dir') {
@@ -2336,12 +3646,14 @@ async function handleCallbackQuery(cb, env) {
           chatId,
           `Connect your Google Drive account first to browse Drive folders.`,
           env,
-          { inline_keyboard: [[{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }]] }
+          { inline_keyboard: [[{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }]] },
+          null,
+          threadId
         );
         return;
       }
       await answerCb(cb.id, 'Opening directory browser', false, env);
-      await openFolderBrowser(chatId, userId, profile.folderId || 'root', msgId, null, env, 0);
+      await openFolderBrowser(chatId, userId, profile.folderId || 'root', msgId, null, env, 0, threadId);
       return;
     }
   }
@@ -2353,15 +3665,18 @@ async function handleCallbackQuery(cb, env) {
 
 async function launchMirrorTask(task, env) {
   const { chatId, userId, taskId, menuMsgId } = task;
+  const credUserId = String(task.credUserId || userId);
   const dest = task.dest === 'gofile' ? 'gofile' : 'gdrive';
   const isGofile = dest === 'gofile';
-  const accessToken = await getValidAccessToken(userId, env);
+  const accessToken = await getValidAccessToken(credUserId, env);
 
   if (!isGofile && !accessToken) {
     await editMessage(
       chatId,
       menuMsgId,
-      `<blockquote><b>Session Expired</b>\n\nPlease reconnect your Google Drive with /login.</blockquote>`,
+      task.isSharedGcTemp
+        ? `<blockquote><b>Owner Drive Unavailable</b>\n\nThe bot owner needs to reconnect Google Drive with /login.</blockquote>`
+        : `<blockquote><b>Session Expired</b>\n\nPlease reconnect your Google Drive with /login.</blockquote>`,
       env
     );
     return;
@@ -2376,7 +3691,7 @@ async function launchMirrorTask(task, env) {
       `<code>${escapeHtml(task.customName || task.detectedName)}</code></blockquote>\n\n` +
       `Required  ·  <code>${fmtBytes(fileSize)}</code>\n\n` +
       `Available  ·  <code>${fmtBytes(quota.free)}</code>\n\n` +
-      `<i>Free up space in your Google Drive and try again.</i>`;
+      `<i>Free up space in Google Drive and try again.</i>`;
     await editMessage(chatId, menuMsgId, msg, env);
     return;
   }
@@ -2416,22 +3731,24 @@ async function launchMirrorTask(task, env) {
     ? (YT_AUDIO_QUALITIES.has(task.ytQuality) ? '#Audio' : '#ytdlp')
     : (task.mode === 'extract' ? '#Extract' : task.mode === 'zip' ? '#ArchiveZIP' : '#Mirror');
   const freeDriveStr = quota && quota.free !== Infinity ? fmtBytes(quota.free) : 'Unlimited';
-  const actionsUrl = `https://github.com/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions`;
+  const actionsUrl = getActionsUrl(env) || 'https://github.com';
   const displayTitle = task.batch
     ? `Batch (${task.items.length} links)`
     : (task.customName || task.detectedName);
 
   const destLines = isGofile
     ? `├ Dest : Gofile (Fresh Guest)\n├ Quota : <code>100GB DL / 10d idle</code>\n`
-    : `├ Folder : ${escapeHtml(task.folderName)}\n├ Drive Free : <code>${freeDriveStr}</code>\n`;
+    : `├ Folder : ${escapeHtml(task.isSharedGcTemp ? 'GC Shared (5-Day Temp)' : task.folderName)}\n├ Drive Free : <code>${freeDriveStr}</code>\n`;
+
+  const displayBy = /^[a-zA-Z0-9_]{4,}$/.test(String(task.username || '')) ? `@${task.username}` : (task.username || 'User');
 
   const bootText =
     `${fallbackNotice}` +
     `<blockquote>📄 <b>Name :</b> <code>${escapeHtml(displayTitle)}</code></blockquote>\n\n` +
     `┌ Status : <a href="${actionsUrl}">Booting..</a> (0.00%)\n` +
     `├ [<code>□□□□□□□□□□□□</code>]\n` +
-    `├ By : @${escapeHtml(task.username)}\n` +
-    `├ UserID : <code>[${userId}]</code>\n` +
+    `├ By : ${escapeHtml(displayBy)}\n` +
+    `├ UserID : <code>[${escapeHtml(String(userId))}]</code>\n` +
     `├ Size : <code>${fileSize > 0 ? fmtBytes(fileSize) : 'Unknown'}</code>\n` +
     `${destLines}` +
     `├ Mode : <code>${modeTag}</code>\n` +
@@ -2454,11 +3771,17 @@ async function launchMirrorTask(task, env) {
 
   const jobData = {
     jobId: taskId,
-    userId,
+    userId: String(userId),
+    credUserId,
     username: task.username,
     chatId,
+    chatType: task.chatType || 'private',
+    isChannel: !!task.isChannel,
+    isSharedGcTemp: !!task.isSharedGcTemp,
+    threadId: task.threadId || null,
     replyToMsgId: task.replyToMsgId || null,
     messageId: menuMsgId,
+    repoUrl: getRepoUrl(env),
     tgDecision: '',
     fileUrl: task.fileUrl,
     items: task.items,
@@ -2472,7 +3795,7 @@ async function launchMirrorTask(task, env) {
     mode: task.mode,
     selectFilter: task.selectFilter,
     archivePassword: task.archivePassword || '',
-    share: !!task.share,
+    share: task.isSharedGcTemp ? true : !!task.share,
     conflict: task.conflict || 'rename',
     isYtdl: !!task.isYtdl,
     ytQuality: task.ytQuality || 'best',
@@ -2515,7 +3838,7 @@ async function executeDirectDriveCopy(task, item, accessToken, env) {
     `<blockquote>📄 <b>Name :</b> <code>${escapeHtml(targetName)}</code></blockquote>\n\n` +
       `┌ Status : Server-Side Copy..\n` +
       `├ Engine : <code>Drive API v3</code>\n` +
-      `└ Folder : ${escapeHtml(folderName || 'My Drive')}`,
+      `└ Folder : ${escapeHtml(task.isSharedGcTemp ? 'GC Shared (5-Day Temp)' : (folderName || 'My Drive'))}`,
     env
   );
 
@@ -2581,25 +3904,31 @@ async function executeDirectDriveCopy(task, item, accessToken, env) {
 
     let shared = false;
     let direct = '';
-    if (task.share && status === 'completed') {
+    if ((task.share || task.isSharedGcTemp) && status === 'completed') {
       shared = await makeDrivePublic(accessToken, fid);
       if (shared) {
         direct = `https://drive.google.com/uc?id=${fid}&export=download`;
       }
     }
 
-    const uname = task.username && !task.username.startsWith('@') ? `@${task.username}` : (task.username || 'User');
+    const uname = task.username && !task.username.startsWith('@') && /^[a-zA-Z0-9_]{4,}$/.test(task.username)
+      ? `@${task.username}`
+      : (task.username || 'User');
     const title = status === 'completed' ? 'Transfer Complete' : 'Skipped — Already Exists';
     let text =
       `<blockquote><b>${title}</b>\n\n` +
       `<code>${escapeHtml(copied.name || finalName)}</code></blockquote>\n\n` +
       `Size  ·  <code>${fmtBytes(size)}</code>\n\n` +
-      `Folder  ·  ${escapeHtml(folderName || 'My Drive')}\n\n` +
+      `Folder  ·  ${escapeHtml(task.isSharedGcTemp ? 'GC Shared (5-Day Temp)' : (folderName || 'My Drive'))}\n\n` +
       `Engine  ·  <code>Drive Server-Side</code>\n\n`;
     if (shared) {
       text += `Access  ·  Anyone with the link\n\n`;
     }
     text += `User  ·  ${escapeHtml(uname)}`;
+
+    if (task.isSharedGcTemp) {
+      text += `\n\n<blockquote>${GC_TEMP_NOTICE_HTML}</blockquote>`;
+    }
 
     const rows = [[
       { text: '▸  Open File', url: fileLink, style: 'success' },
@@ -2608,8 +3937,32 @@ async function executeDirectDriveCopy(task, item, accessToken, env) {
     if (direct) {
       rows.push([{ text: '⬇ Direct Download', url: direct, style: 'primary' }]);
     }
+    if (task.isSharedGcTemp && status === 'completed' && fid && size <= PERM_REQ_MAX_BYTES) {
+      rows.push([{ text: '📌 Request Permanent Storage', callback_data: `perm_req:${task.taskId}`, style: 'primary' }]);
+    }
 
     await editMessage(chatId, menuMsgId, text, env, { inline_keyboard: rows });
+
+    if (task.isSharedGcTemp && status === 'completed' && fid) {
+      const chatRec = await getApprovedChat(chatId, env);
+      await registerGcTempExpiry({
+        jobId: task.taskId,
+        credUserId: String(task.credUserId || getOwnerId(env)),
+        chatId: String(chatId),
+        chatTitle: chatRec?.title || String(chatId),
+        threadId: task.threadId || null,
+        msgId: menuMsgId,
+        userId: String(userId),
+        username: task.username || '',
+        files: [{ id: fid, name: copied.name || finalName, size, link: fileLink }],
+        totalSize: size,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + GC_TEMP_TTL_MS,
+        permRequested: false,
+        permApproved: false
+      }, env);
+    }
+
     await appendHistory(userId, [{
       name: copied.name || finalName,
       link: fileLink,
@@ -2667,6 +4020,7 @@ async function handleInternalRunner(request, path, env) {
   const jRaw = await getStore(env).get(`job:${jobId}`);
   if (!jRaw) return jsonResponse({ ok: false, error: 'Job not found' }, 404);
   const job = JSON.parse(jRaw);
+  const credUid = String(job.credUserId || job.userId);
 
   if (path === '/internal/job') {
     if (body.run_id) {
@@ -2674,7 +4028,7 @@ async function handleInternalRunner(request, path, env) {
       job.status = 'running';
       await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 25200 });
     }
-    const tokenInfo = await getValidTokenInfo(job.userId, env, false);
+    const tokenInfo = await getValidTokenInfo(credUid, env, false);
     if (job.dest !== 'gofile' && !tokenInfo) {
       return jsonResponse({ ok: false, error: 'Could not mint Google access token for user' }, 400);
     }
@@ -2689,7 +4043,7 @@ async function handleInternalRunner(request, path, env) {
   }
 
   if (path === '/internal/refresh') {
-    const tokenInfo = await getValidTokenInfo(job.userId, env, !!body.force);
+    const tokenInfo = await getValidTokenInfo(credUid, env, !!body.force);
     return jsonResponse({
       ok: !!tokenInfo,
       accessToken: tokenInfo?.accessToken || null,
@@ -2720,6 +4074,7 @@ async function handleInternalRunner(request, path, env) {
       const doneItems = body.items
         .filter(it => it && (it.status === 'completed' || it.status === 'skipped') && it.link)
         .map(it => ({
+          id: it.id || '',
           name: it.name || 'File',
           link: it.link,
           direct: it.direct || '',
@@ -2731,6 +4086,30 @@ async function handleInternalRunner(request, path, env) {
         }));
       if (doneItems.length) {
         await appendHistory(job.userId, doneItems, env);
+      }
+
+      if (job.isSharedGcTemp && job.dest === 'gdrive') {
+        const expFiles = doneItems.filter(it => it.status === 'completed' && it.id);
+        if (expFiles.length) {
+          const totalSize = expFiles.reduce((acc, it) => acc + (parseInt(it.size || 0, 10) || 0), 0);
+          const chatRec = await getApprovedChat(job.chatId, env);
+          await registerGcTempExpiry({
+            jobId,
+            credUserId: credUid,
+            chatId: String(job.chatId),
+            chatTitle: chatRec?.title || String(job.chatId),
+            threadId: job.threadId || null,
+            msgId: job.messageId || null,
+            userId: String(job.userId),
+            username: job.username || '',
+            files: expFiles.map(it => ({ id: it.id, name: it.name, size: it.size || 0, link: it.link })),
+            totalSize,
+            createdAt: Date.now(),
+            expiresAt: Date.now() + GC_TEMP_TTL_MS,
+            permRequested: false,
+            permApproved: false
+          }, env);
+        }
       }
     }
     return jsonResponse({ ok: true });
@@ -2751,7 +4130,7 @@ async function appendHistory(userId, entries, env) {
   await getStore(env).put(`history:${userId}`, JSON.stringify(merged));
 }
 
-async function sendHistory(chatId, userId, editMsgId, env) {
+async function sendHistory(chatId, userId, editMsgId, env, threadId = null) {
   const raw = await getStore(env).get(`history:${userId}`);
   const list = raw ? JSON.parse(raw) : [];
 
@@ -2760,7 +4139,7 @@ async function sendHistory(chatId, userId, editMsgId, env) {
     if (editMsgId) {
       await editMessage(chatId, editMsgId, emptyText, env);
     } else {
-      await sendMessage(chatId, emptyText, env);
+      await sendMessage(chatId, emptyText, env, null, null, threadId);
     }
     return;
   }
@@ -2789,7 +4168,7 @@ async function sendHistory(chatId, userId, editMsgId, env) {
   if (editMsgId) {
     await editMessage(chatId, editMsgId, text, env, kb);
   } else {
-    await sendMessage(chatId, text, env, kb);
+    await sendMessage(chatId, text, env, kb, null, threadId);
   }
 }
 
@@ -2807,15 +4186,15 @@ async function removeActiveJobForUser(userId, jobId, env) {
   await getStore(env).put(`active:${userId}`, JSON.stringify(list), { expirationTtl: 25200 });
 }
 
-async function cancelActiveJob(chatId, userId, jobId, env) {
+async function cancelActiveJob(chatId, userId, jobId, env, threadId = null) {
   const jRaw = await getStore(env).get(`job:${jobId}`);
   if (!jRaw) {
-    await sendMessage(chatId, `<i>Task <code>${escapeHtml(jobId)}</code> is no longer active.</i>`, env);
+    await sendMessage(chatId, `<i>Task <code>${escapeHtml(jobId)}</code> is no longer active.</i>`, env, null, null, threadId);
     return;
   }
   const job = JSON.parse(jRaw);
-  if (String(job.userId) !== String(userId)) {
-    await sendMessage(chatId, `<i>You can only cancel your own tasks.</i>`, env);
+  if (!(await canControlRecord(job, userId, env))) {
+    await sendMessage(chatId, `<i>You can only cancel your own tasks.</i>`, env, null, null, threadId);
     return;
   }
   job.cancelled = true;
@@ -2837,10 +4216,10 @@ async function cancelActiveJob(chatId, userId, jobId, env) {
     );
   }
 
-  await sendMessage(chatId, `Cancelling  ·  <code>${escapeHtml(jobId)}</code>`, env);
+  await sendMessage(chatId, `Cancelling  ·  <code>${escapeHtml(jobId)}</code>`, env, null, null, threadId);
 }
 
-async function sendActiveTasks(chatId, userId, env) {
+async function sendActiveTasks(chatId, userId, env, _filterChatId = null, threadId = null) {
   const raw = await getStore(env).get(`active:${userId}`);
   const list = raw ? JSON.parse(raw) : [];
   const activeJobs = [];
@@ -2860,7 +4239,7 @@ async function sendActiveTasks(chatId, userId, env) {
   }
 
   if (!activeJobs.length) {
-    await sendMessage(chatId, `<blockquote><b>Active Tasks</b>\n\n<i>No transfers running right now.</i></blockquote>`, env);
+    await sendMessage(chatId, `<blockquote><b>Active Tasks</b>\n\n<i>No transfers running right now.</i></blockquote>`, env, null, null, threadId);
     return;
   }
 
@@ -2872,7 +4251,7 @@ async function sendActiveTasks(chatId, userId, env) {
     const name = escapeHtml(j.customName || j.detectedName || 'Task');
     const state = escapeHtml(j.status || 'starting');
     const userTag = j.username ? `@${escapeHtml(j.username)}` : `<code>${escapeHtml(String(j.userId || userId))}</code>`;
-    const folder = escapeHtml(j.dest === 'gofile' ? 'Gofile (Guest)' : (j.folderName || 'My Drive'));
+    const folder = escapeHtml(j.dest === 'gofile' ? 'Gofile (Guest)' : (j.isSharedGcTemp ? 'GC Shared (5-Day Temp)' : (j.folderName || 'My Drive')));
 
     const cardText = j.lastCardHtml || (
       `<code>${name}</code>\n\n` +
@@ -2892,7 +4271,7 @@ async function sendActiveTasks(chatId, userId, env) {
       ]]
     };
 
-    const sent = await sendMessage(chatId, cardText, env, kb);
+    const sent = await sendMessage(chatId, cardText, env, kb, null, j.threadId || threadId);
     if (sent?.result?.message_id) {
       j.messageId = String(sent.result.message_id);
       await getStore(env).put(`job:${jid}`, JSON.stringify(j), { expirationTtl: 25200 });
@@ -2904,27 +4283,59 @@ async function sendActiveTasks(chatId, userId, env) {
 // MENUS, URL PARSING & LINK VERIFICATION
 // ============================================================================
 
-async function sendStartScreen(chatId, userId, username, env) {
+function buildOpenSourceNoteHtml(env) {
+  const repoUrl = getRepoUrl(env);
+  const actionsUrl = getActionsUrl(env);
+  if (!repoUrl) {
+    return `<blockquote><b>Open-Source &amp; Transparent VM</b>\n\nThis bot is open-source and runs every mirror job on GitHub Actions VMs.</blockquote>`;
+  }
+  return (
+    `<blockquote><b>Open-Source &amp; Transparent VM</b>\n\n` +
+    `This bot is open-source and uses <b>GitHub Actions</b> as its VM. ` +
+    `You can watch every upload &amp; mirror live in <a href="${escapeHtml(actionsUrl)}">GitHub Actions</a> ` +
+    `and inspect the full code &amp; workflow on the <a href="${escapeHtml(repoUrl)}">Repository Page</a>.</blockquote>`
+  );
+}
+
+async function sendStartScreen(chatId, userId, username, env, opts = {}) {
+  const isGroup = !!opts.isGroup;
+  const threadId = opts.threadId || null;
+  const replyToMsgId = opts.replyToMsgId || null;
   const stored = await getUserProfile(userId, env);
   const profile = getEffectiveProfile(userId, stored);
+  const osNote = buildOpenSourceNoteHtml(env);
+
   if (!hasDriveAuth(stored)) {
-    const authUrl = await createOAuthUrl(chatId, userId, username, env);
+    const gcInfo = isGroup
+      ? `Default GC Dest  ·  <b>Shared Group Drive (5-Day Auto-Delete)</b>\n\n<i>Tip: Run /login to connect your own Google Drive for permanent storage.</i>\n\n`
+      : `Destination  ·  <b>Gofile (No Login Required)</b> — Fresh guest account per task\n\n`;
     const text =
       `<blockquote><b>Cloud Mirror Engine</b>\n\n` +
       `Free On-Demand Mirroring (Gofile + Google Drive)</blockquote>\n\n` +
-      `Destination  ·  <b>Gofile (No Login Required)</b> — Fresh guest account per task\n\n` +
+      gcInfo +
       `Bandwidth  ·  Up to <code>1.8 Gbps</code> (16x Aria2c)\n\n` +
       `Features  ·  Direct URLs · Telegram Files (&lt;4GB) · yt-dlp · Batch · Extract · ZIP\n\n` +
-      `Telemetry  ·  <code>2.5s</code> Live Progress & System Stats\n\n` +
-      `<blockquote>${GOFILE_NOTICE_HTML}</blockquote>\n\n` +
+      `Telemetry  ·  <code>2.5s</code> Live Progress &amp; System Stats\n\n` +
+      `${osNote}\n\n` +
       `<b>Commands</b>\n\n` +
-      `<code>/m &lt;link&gt;</code> — Mirror URLs, forward any Telegram file, or send a <code>t.me</code> link\n\n` +
+      `<code>/m &lt;link&gt;</code> — Mirror URLs, reply to any Telegram file, or send a <code>t.me</code> link\n\n` +
       `<code>/yt &lt;link&gt;</code> — Download videos / audio / playlists via yt-dlp\n\n` +
-      `/tasks — View active transfers    /history — Recent transfers\n\n` +
+      `/help — Full guide    /tasks — Active transfers    /history — Recent transfers\n\n` +
       `/settings — Preferences    /login — Connect Google Drive (Permanent)`;
-    await sendMessage(chatId, text, env, {
-      inline_keyboard: [[{ text: '▸  Connect Google Drive (Permanent)', url: authUrl, style: 'primary' }]]
-    });
+
+    if (isGroup) {
+      await sendMessage(chatId, text, env, null, replyToMsgId, threadId);
+      return;
+    }
+    const authUrl = await createOAuthUrl(chatId, userId, username, env);
+    await sendMessage(
+      chatId,
+      text,
+      env,
+      { inline_keyboard: [[{ text: '▸  Connect Google Drive (Permanent)', url: authUrl, style: 'primary' }]] },
+      replyToMsgId,
+      threadId
+    );
     return;
   }
 
@@ -2936,26 +4347,85 @@ async function sendStartScreen(chatId, userId, username, env) {
     `Upload Folder  ·  ${escapeHtml(profile.folderName || 'My Drive')}\n\n` +
     `Options Menu  ·  ${profile.buttonMode !== false ? 'Enabled' : 'Disabled'}\n\n` +
     `Auto Share  ·  ${profile.autoShare ? 'Enabled' : 'Disabled'}    Duplicate  ·  ${conflictLabel(profile.conflict || 'rename')}\n\n` +
+    `${osNote}\n\n` +
     `<b>Commands</b>\n\n` +
     `<code>/m &lt;link&gt;</code> — Mirror URLs, Drive links, Telegram files, or <code>t.me</code> links\n\n` +
     `<code>/yt &lt;link&gt;</code> — Download videos / audio / playlists via yt-dlp\n\n` +
-    `/setdldir — Browse & select target folder\n\n` +
-    `/tasks — View active transfers\n\n` +
-    `/history — Recent completed transfers\n\n` +
-    `/settings — Preferences\n\n` +
-    `/logout — Unlink Google Drive`;
+    `/setdldir — Browse &amp; select target folder\n\n` +
+    `/tasks — Active transfers    /history — Recent transfers\n\n` +
+    `/settings — Preferences    /help — Full guide    /logout — Unlink Drive`;
 
-  await sendMessage(chatId, text, env, {
-    inline_keyboard: [
-      [
-        { text: 'Browse Folder', callback_data: 'cfg_dir', style: 'primary' },
-        { text: `ButtonMode: ${profile.buttonMode !== false ? 'ON' : 'OFF'}`, callback_data: 'cfg_toggle_btn' }
-      ]
-    ]
-  });
+  await sendMessage(
+    chatId,
+    text,
+    env,
+    isGroup
+      ? null
+      : {
+          inline_keyboard: [[
+            { text: 'Browse Folder', callback_data: 'cfg_dir', style: 'primary' },
+            { text: `ButtonMode: ${profile.buttonMode !== false ? 'ON' : 'OFF'}`, callback_data: 'cfg_toggle_btn' }
+          ]]
+        },
+    replyToMsgId,
+    threadId
+  );
 }
 
-async function sendSettingsMenu(chatId, userId, profile, editMsgId, env) {
+async function sendHelpScreen(chatId, userId, env, opts = {}) {
+  const threadId = opts.threadId || null;
+  const replyToMsgId = opts.replyToMsgId || null;
+  const isOwnerUser = isOwner(userId, env);
+  const isAdminUser = await isAdmin(userId, env);
+  const osNote = buildOpenSourceNoteHtml(env);
+
+  let adminLines = '';
+  if (!opts.isGroup && isAdminUser) {
+    adminLines += `\n\n<b>Admin Commands (DM)</b>\n\n` +
+      `<code>/reqgroup &lt;link_or_id&gt;</code> — Request Owner approval for a Group or Channel`;
+  }
+  if (!opts.isGroup && isOwnerUser) {
+    adminLines += `\n\n<b>Owner Commands</b>\n\n` +
+      `/admin — Manage Admins &amp; Authorized Groups/Channels\n\n` +
+      `<code>/auth &lt;id&gt;</code> / <code>/unauth &lt;id&gt;</code> — Quick approve or revoke a user/chat ID\n\n` +
+      `/authorize — Approve the current group/channel`;
+  }
+
+  const text =
+    `<blockquote><b>Cloud Mirror Engine — Help &amp; Guide</b></blockquote>\n\n` +
+    `<b>Mirroring Commands</b>\n\n` +
+    `<code>/m &lt;url&gt;</code> — Mirror direct links, Drive links, <code>t.me</code> posts, or reply <code>/m</code> to any Telegram file\n\n` +
+    `<code>/yt &lt;url&gt;</code> — Download videos, audio, or playlists (YouTube, Instagram, TikTok, X, etc.)\n\n` +
+    `<b>Account &amp; Preferences</b>\n\n` +
+    `/login — Connect your personal Google Drive (works in both DMs &amp; Groups)\n\n` +
+    `/setdldir — Pick your default Drive upload folder\n\n` +
+    `/settings — Configure default destination, ButtonMode, Auto Share, Duplicate policy &amp; yt-dlp presets\n\n` +
+    `/logout — Unlink your Google Drive\n\n` +
+    `<b>Status &amp; History</b>\n\n` +
+    `/tasks — View or reopen running jobs\n\n` +
+    `/history — View recent transfers\n\n` +
+    `<b>Group Storage Rules</b>\n\n` +
+    `• Bare links &amp; casual media in groups are ignored — always use <code>/m</code> or <code>/yt</code>.\n` +
+    `• Without <code>/login</code>, group files upload to shared temporary Drive storage (public link, auto-deleted after <b>5 days</b>; files ≤ 50 GB can be requested for permanent storage).\n` +
+    `• With <code>/login</code>, your group mirrors upload straight to <b>your own Drive</b> privately.` +
+    `${adminLines}\n\n` +
+    `${osNote}`;
+
+  const repoUrl = getRepoUrl(env);
+  const actionsUrl = getActionsUrl(env);
+  const kb = repoUrl
+    ? {
+        inline_keyboard: [[
+          { text: '📂 View Source Repo', url: repoUrl, style: 'primary' },
+          { text: '⚙ GitHub Actions', url: actionsUrl, style: 'primary' }
+        ]]
+      }
+    : null;
+
+  await sendMessage(chatId, text, env, kb, replyToMsgId, threadId);
+}
+
+async function sendSettingsMenu(chatId, userId, profile, editMsgId, env, threadId = null) {
   const hasDrive = hasDriveAuth(profile);
   const eff = getEffectiveProfile(userId, profile);
   const yq = ytQualityLabel(eff.ytQuality || 'best');
@@ -2997,7 +4467,7 @@ async function sendSettingsMenu(chatId, userId, profile, editMsgId, env) {
   if (editMsgId) {
     await editMessage(chatId, editMsgId, text, env, kb);
   } else {
-    await sendMessage(chatId, text, env, kb);
+    await sendMessage(chatId, text, env, kb, null, threadId);
   }
 }
 
@@ -3687,7 +5157,7 @@ async function postTelegramMessage(method, payload, env) {
   return data;
 }
 
-async function sendMessage(chatId, text, env, replyMarkup = null, replyToMsgId = null) {
+async function sendMessage(chatId, text, env, replyMarkup = null, replyToMsgId = null, threadId = null) {
   const payload = {
     chat_id: chatId,
     text,
@@ -3696,6 +5166,7 @@ async function sendMessage(chatId, text, env, replyMarkup = null, replyToMsgId =
   };
   if (replyMarkup) payload.reply_markup = replyMarkup;
   if (replyToMsgId) payload.reply_to_message_id = replyToMsgId;
+  if (threadId && !replyToMsgId) payload.message_thread_id = threadId;
   return await postTelegramMessage('sendMessage', payload, env);
 }
 
