@@ -3145,7 +3145,14 @@ class Mirror:
         _, synced_msg_id = sync_worker_state(JOB_ID)
         if synced_msg_id is not None:
             self.message_id = synced_msg_id
-        worker_call("/internal/complete", {"job_id": JOB_ID, "status": overall, "items": results})
+        worker_call("/internal/complete", {
+            "job_id": JOB_ID,
+            "status": overall,
+            "items": results,
+            "msg_id": self.message_id,
+            "mirror_html": text,
+            "mirror_kb": kb,
+        })
         finish_status(self.chat_id, self.message_id, text, kb, thread_id=self.thread_id)
 
 

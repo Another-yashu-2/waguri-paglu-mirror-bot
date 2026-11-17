@@ -1540,6 +1540,58 @@ async function registerGcTempExpiry(record, env) {
   }
 }
 
+function stripPermReqFromRows(rows, permFolderUrl = '') {
+  if (!Array.isArray(rows) || !rows.length) return null;
+  const cleaned = [];
+  for (const row of rows) {
+    if (!Array.isArray(row)) continue;
+    const nextRow = row
+      .filter(btn => !(btn?.callback_data && String(btn.callback_data).startsWith('perm_req:')))
+      .map(btn => {
+        if (permFolderUrl && btn?.url && /Open Folder/i.test(btn.text || '')) {
+          return { ...btn, url: permFolderUrl };
+        }
+        return btn;
+      });
+    if (nextRow.length) cleaned.push(nextRow);
+  }
+  return { inline_keyboard: cleaned };
+}
+
+async function updateGcMirrorPermMessage(rec, statusNoticeHtml, env, opts = {}) {
+  if (!rec?.chatId || !rec?.msgId) return;
+  const oldNoticeBlock = `<blockquote>${GC_TEMP_NOTICE_HTML}</blockquote>`;
+  const newNoticeBlock = `<blockquote>${statusNoticeHtml}</blockquote>`;
+  let htmlText = rec.mirrorHtml ? String(rec.mirrorHtml) : '';
+  if (htmlText) {
+    if (opts.approved) {
+      htmlText = htmlText.replace(/GC Shared \(5-Day Temp\)/g, `${escapeHtml(GC_PERM_FOLDER_NAME)} (Permanent)`);
+    }
+    if (htmlText.includes(oldNoticeBlock)) {
+      htmlText = htmlText.replace(oldNoticeBlock, newNoticeBlock);
+    } else if (/<blockquote>[\s\S]*Temporary Group Storage[\s\S]*<\/blockquote>/i.test(htmlText)) {
+      htmlText = htmlText.replace(/<blockquote>[\s\S]*Temporary Group Storage[\s\S]*<\/blockquote>/i, newNoticeBlock);
+    } else if (/<blockquote>⏳ <b>Permanent Storage Requested<\/b>[\s\S]*<\/blockquote>/i.test(htmlText)) {
+      htmlText = htmlText.replace(/<blockquote>⏳ <b>Permanent Storage Requested<\/b>[\s\S]*<\/blockquote>/i, newNoticeBlock);
+    } else {
+      htmlText += `\n\n${newNoticeBlock}`;
+    }
+  } else {
+    const fileLines = (rec.files || []).slice(0, 6).map(f =>
+      `• <a href="${escapeHtml(f.link || 'https://drive.google.com')}">${escapeHtml(truncate(f.name || 'File', 48))}</a>  <code>${fmtBytes(f.size || 0)}</code>`
+    ).join('\n');
+    const folderLabel = opts.approved ? `${GC_PERM_FOLDER_NAME} (Permanent)` : 'GC Shared (5-Day Temp)';
+    htmlText =
+      `<blockquote><b>Transfer Complete</b></blockquote>\n\n` +
+      `${fileLines || `<code>${escapeHtml(rec.jobId || 'File')}</code>`}\n\n` +
+      `Folder  ·  ${escapeHtml(folderLabel)}\n\n` +
+      `${newNoticeBlock}`;
+  }
+
+  const kb = stripPermReqFromRows(rec.mirrorKbRows, opts.permFolderUrl || '');
+  await editMessage(rec.chatId, rec.msgId, htmlText, env, kb).catch(() => {});
+}
+
 async function deleteDriveItemPermanently(accessToken, fileId) {
   const res = await fetch(
     `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?supportsAllDrives=true`,
@@ -3329,16 +3381,35 @@ async function handleCallbackQuery(cb, env) {
     }
     const raw = await getStore(env).get(`gc_exp:${jobId}`);
     if (!raw) {
-      await answerCb(cb.id, 'File record expired or already processed.', true, env);
+      const cleanedKb = stripPermReqFromRows(cb.message?.reply_markup?.inline_keyboard);
+      if (cleanedKb) {
+        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, message_id: msgId, reply_markup: cleanedKb })
+        }).catch(() => {});
+      }
+      await answerCb(cb.id, 'Already processed or expired.', true, env);
       return;
     }
     const rec = JSON.parse(raw);
-    if (rec.permApproved) {
-      await answerCb(cb.id, 'Already moved to permanent storage!', true, env);
-      return;
-    }
-    if (rec.permRequested) {
-      await answerCb(cb.id, 'Permanent storage request already sent to Owner.', true, env);
+    if (rec.permApproved || rec.permDenied || rec.permRequested) {
+      if (!rec.msgId && msgId) rec.msgId = msgId;
+      if (!rec.mirrorKbRows && Array.isArray(cb.message?.reply_markup?.inline_keyboard)) {
+        rec.mirrorKbRows = cb.message.reply_markup.inline_keyboard;
+      }
+      const alreadyMsg = rec.permApproved
+        ? 'Already moved to permanent storage!'
+        : rec.permDenied
+          ? 'Permanent storage request was already declined.'
+          : 'Permanent storage request already sent to Owner.';
+      const statusHtml = rec.permApproved
+        ? `✅ <b>Moved to Permanent Storage (<code>${escapeHtml(GC_PERM_FOLDER_NAME)}</code>)</b> — 5-day auto-delete cancelled.`
+        : rec.permDenied
+          ? `❌ <b>Permanent Storage Declined</b> — File(s) remain in 5-day temporary storage and will auto-delete after 5 days.`
+          : `⏳ <b>Permanent Storage Requested</b> by ${escapeHtml(rec.permRequesterName || 'User')} — awaiting Owner review.`;
+      await updateGcMirrorPermMessage(rec, statusHtml, env, { approved: !!rec.permApproved });
+      await answerCb(cb.id, alreadyMsg, true, env);
       return;
     }
     if (rec.totalSize > PERM_REQ_MAX_BYTES) {
@@ -3347,9 +3418,21 @@ async function handleCallbackQuery(cb, env) {
     }
 
     rec.permRequested = true;
+    rec.permDenied = false;
     rec.permRequesterId = String(userId);
     rec.permRequesterName = cb.from.username ? `@${cb.from.username}` : (cb.from.first_name || 'User');
+    if (!rec.chatId) rec.chatId = String(chatId);
+    if (!rec.msgId && msgId) rec.msgId = msgId;
+    if (!rec.mirrorKbRows && Array.isArray(cb.message?.reply_markup?.inline_keyboard)) {
+      rec.mirrorKbRows = cb.message.reply_markup.inline_keyboard;
+    }
     await getStore(env).put(`gc_exp:${jobId}`, JSON.stringify(rec));
+
+    await updateGcMirrorPermMessage(
+      rec,
+      `⏳ <b>Permanent Storage Requested</b> by ${escapeHtml(rec.permRequesterName)} — awaiting Owner review.`,
+      env
+    );
 
     const fileLines = (rec.files || []).slice(0, 6).map(f =>
       `• <a href="${escapeHtml(f.link || 'https://drive.google.com')}">${escapeHtml(truncate(f.name || 'File', 42))}</a> (<code>${fmtBytes(f.size || 0)}</code>)`
@@ -3390,21 +3473,30 @@ async function handleCallbackQuery(cb, env) {
     }
     const rec = JSON.parse(raw);
 
+    if (rec.permApproved || rec.permDenied) {
+      await answerCb(cb.id, 'Already handled.', true, env);
+      await editMessage(
+        chatId,
+        msgId,
+        rec.permApproved
+          ? `<blockquote><b>Already Approved</b>\n\nMoved to <code>${escapeHtml(GC_PERM_FOLDER_NAME)}</code>.</blockquote>`
+          : `<blockquote><b>Already Declined</b>\n\nFiles remain in 5-day temporary storage.</blockquote>`,
+        env
+      );
+      return;
+    }
+
     if (act === 'deny') {
       rec.permRequested = false;
+      rec.permDenied = true;
       await getStore(env).put(`gc_exp:${jobId}`, JSON.stringify(rec));
-      await answerCb(cb.id, 'Denied', false, env);
-      await editMessage(chatId, msgId, `<blockquote><b>Permanent Request Denied</b>\n\nFiles will remain in 5-day temporary storage.</blockquote>`, env);
-      if (rec.chatId) {
-        await sendMessage(
-          rec.chatId,
-          `<i>Permanent storage request for <code>${escapeHtml(rec.files?.[0]?.name || jobId)}</code> was declined by the Owner.</i>`,
-          env,
-          null,
-          rec.msgId || null,
-          rec.threadId || null
-        ).catch(() => {});
-      }
+      await answerCb(cb.id, 'Declined', false, env);
+      await editMessage(chatId, msgId, `<blockquote><b>Permanent Request Declined</b>\n\nFiles will remain in 5-day temporary storage.</blockquote>`, env);
+      await updateGcMirrorPermMessage(
+        rec,
+        `❌ <b>Permanent Storage Declined</b> — File(s) will remain in 5-day temporary storage and auto-delete after <b>5 days</b>. Use /login with your personal Google Drive for permanent storage.`,
+        env
+      );
       return;
     }
 
@@ -3449,16 +3541,12 @@ async function handleCallbackQuery(cb, env) {
         `Items Moved  ·  <code>${movedCount}</code>`,
       env
     );
-    if (rec.chatId) {
-      await sendMessage(
-        rec.chatId,
-        `<blockquote><b>Moved to Permanent Storage ✓</b>\n\n<code>${escapeHtml(rec.files?.[0]?.name || 'Files')}</code> moved to <code>${escapeHtml(GC_PERM_FOLDER_NAME)}</code> by the Owner (5-day auto-delete cancelled).</blockquote>`,
-        env,
-        null,
-        rec.msgId || null,
-        rec.threadId || null
-      ).catch(() => {});
-    }
+    await updateGcMirrorPermMessage(
+      rec,
+      `✅ <b>Moved to Permanent Storage (<code>${escapeHtml(GC_PERM_FOLDER_NAME)}</code>)</b> — 5-day auto-delete cancelled.`,
+      env,
+      { approved: true, permFolderUrl: permFolder.folderUrl || '' }
+    );
     return;
   }
 
@@ -4508,7 +4596,10 @@ async function executeDirectDriveCopy(task, item, accessToken, env) {
         createdAt: Date.now(),
         expiresAt: Date.now() + GC_TEMP_TTL_MS,
         permRequested: false,
-        permApproved: false
+        permDenied: false,
+        permApproved: false,
+        mirrorHtml: text,
+        mirrorKbRows: rows
       }, env);
     }
 
@@ -4659,7 +4750,7 @@ async function handleInternalRunner(request, path, env) {
             chatId: String(job.chatId),
             chatTitle: chatRec?.title || String(job.chatId),
             threadId: job.threadId || null,
-            msgId: job.messageId || null,
+            msgId: body.msg_id || job.messageId || null,
             userId: String(job.userId),
             username: job.username || '',
             files: expFiles.map(it => ({ id: it.id, name: it.name, size: it.size || 0, link: it.link })),
@@ -4667,7 +4758,10 @@ async function handleInternalRunner(request, path, env) {
             createdAt: Date.now(),
             expiresAt: Date.now() + GC_TEMP_TTL_MS,
             permRequested: false,
-            permApproved: false
+            permDenied: false,
+            permApproved: false,
+            mirrorHtml: body.mirror_html || '',
+            mirrorKbRows: Array.isArray(body.mirror_kb?.inline_keyboard) ? body.mirror_kb.inline_keyboard : null
           }, env);
         }
       }
