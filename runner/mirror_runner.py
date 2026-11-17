@@ -18,7 +18,9 @@ import html
 import http.client
 import http.server
 import importlib
+import inspect
 import json
+import math
 import os
 import re
 import shutil
@@ -1462,19 +1464,105 @@ def ensure_ytdl_tools():
         import yt_dlp  # noqa: F401
 
 
+def _kurigram_crypto_ready() -> tuple[bool, str]:
+    """Check whether Kurigram can import Client with an accelerated C/Rust AES backend."""
+    try:
+        from pyrogram import Client  # noqa: F401
+        from pyrogram.crypto import aes as _aes
+        backend = getattr(_aes, "_crypto_backend", None)
+        if backend is not None:
+            return True, getattr(backend, "__name__", str(backend))
+        return False, "pyaes"
+    except ImportError:
+        return False, ""
+
+
+def _kurigram_client_kwargs(client_cls, base_kwargs: dict) -> dict:
+    """Filter Kurigram Client kwargs against installed __init__ signature for safe tuning."""
+    merged = {
+        "in_memory": True,
+        "workers": 16,
+        "max_concurrent_transmissions": 10,
+        "no_updates": True,
+        "sleep_threshold": 60,
+        **base_kwargs,
+    }
+    try:
+        sig = inspect.signature(client_cls.__init__)
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            return merged
+        return {k: v for k, v in merged.items() if k in sig.parameters}
+    except Exception:
+        return merged
+
+
+def _run_async_fast(coro):
+    """Run an asyncio coroutine using uvloop when installed, else standard asyncio."""
+    _prepare_pkg_paths()
+    try:
+        import uvloop
+        if hasattr(uvloop, "run"):
+            return uvloop.run(coro)
+    except Exception:
+        pass
+    return asyncio.run(coro)
+
+
 def ensure_kurigram_tools():
     with _KURIGRAM_LOCK:
         _prepare_pkg_paths()
-        try:
-            from pyrogram import Client  # noqa: F401
+        ready, backend_name = _kurigram_crypto_ready()
+        if ready:
             return
-        except ImportError:
-            pass
-        try:
-            _pip_install_target(["kurigram", "tgcrypto"], _TG_PKG_TARGET)
-        except Exception:
-            _pip_install_target(["kurigram"], _TG_PKG_TARGET)
+
+        # Kurigram 2.x uses `kuricrypt` (from extra `kurigram[fast]`) plus `uvloop`, with prebuilt
+        # manylinux wheels for Python 3.10-3.15; PyPI `tgcrypto` lacks cp312+ wheels on ubuntu-latest.
+        install_plans = [
+            ["kurigram[fast]"],
+            ["kurigram", "kuricrypt"],
+            ["kurigram", "tgcrypto-pyrofork"],
+            ["kurigram", "tgcrypto"],
+            ["kurigram"],
+        ]
+        last_err = None
+        for pkgs in install_plans:
+            try:
+                _pip_install_target(pkgs, _TG_PKG_TARGET)
+                _prepare_pkg_paths()
+                if "pyrogram.crypto.aes" in sys.modules:
+                    importlib.reload(sys.modules["pyrogram.crypto.aes"])
+                ready, backend_name = _kurigram_crypto_ready()
+                if ready:
+                    break
+                # Kurigram installed without native crypto (e.g. kuricrypt missing); try native crypto wheel next
+                if backend_name == "pyaes":
+                    for crypto_pkg in ("kuricrypt", "tgcrypto-pyrofork", "tgcrypto"):
+                        try:
+                            _pip_install_target([crypto_pkg], _TG_PKG_TARGET)
+                            importlib.reload(sys.modules["pyrogram.crypto.aes"])
+                            ready, backend_name = _kurigram_crypto_ready()
+                            if ready:
+                                break
+                        except Exception as ce:
+                            last_err = ce
+                    break
+            except Exception as exc:
+                last_err = exc
+
         from pyrogram import Client  # noqa: F401
+        ready, backend_name = _kurigram_crypto_ready()
+        has_uvloop = False
+        try:
+            import uvloop  # noqa: F401
+            has_uvloop = True
+        except Exception:
+            pass
+        print(
+            f"[Kurigram] Ready (crypto={backend_name or 'unknown'}, uvloop={has_uvloop}"
+            + (f", note={last_err}" if (not ready and last_err) else "")
+            + ")",
+            flush=True,
+        )
 
 
 def prewarm_tools_async(need_ytdl: bool = False, need_kurigram: bool = False):
@@ -3045,12 +3133,11 @@ class Mirror:
 
         async with Client(
             f"tgdl_{JOB_ID or 'run'}_{self.idx}",
-            api_id=int(TELEGRAM_API_ID),
-            api_hash=TELEGRAM_API_HASH,
-            bot_token=BOT_TOKEN,
-            in_memory=True,
-            workers=16,
-            no_updates=True,
+            **_kurigram_client_kwargs(Client, {
+                "api_id": int(TELEGRAM_API_ID),
+                "api_hash": TELEGRAM_API_HASH,
+                "bot_token": BOT_TOKEN,
+            }),
         ) as app:
             msg = None
             if chat_id is not None and msg_id:
@@ -3159,7 +3246,7 @@ class Mirror:
         sz = int(item.get("size") or 0)
         self.tick(label, "Setting up Kurigram..", 0.0, 0, sz, 0, None, "Kurigram MTProto", force=True)
         ensure_kurigram_tools()
-        return asyncio.run(self._kurigram_download_item(item, dest_dir))
+        return _run_async_fast(self._kurigram_download_item(item, dest_dir))
 
     def acquire_local(self, item: dict, dest_dir: Path) -> Path:
         """Downloads an item to local disk (used for extract/zip modes, yt-dlp, Telegram media, and URL items)."""
@@ -3183,6 +3270,152 @@ class Mirror:
             return self.gdrive_download_file(item, meta, dest_dir, name)
         return self.aria_download(item["url"], dest_dir, out_name=self.single_name(), label=self.item_label(item))
 
+    def _make_fast_kurigram_client_cls(self, base_client_cls):
+        """Build a Client subclass with pooled temporary media sessions and fast multi-chunk uploads."""
+        from pyrogram import raw
+
+        class _FastKurigramClient(base_client_cls):
+            def __init__(self_cli, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self_cli._media_pool = []
+                self_cli._media_pool_lock = asyncio.Lock()
+                self_cli._preuploaded = {}
+                self_cli._concurrent_hint = 1
+
+            async def _ensure_media_pool(self_cli, dc_id: int, target_size: int = 6) -> list:
+                async with self_cli._media_pool_lock:
+                    while len(self_cli._media_pool) < target_size:
+                        try:
+                            sess = await self_cli.get_session(dc_id, is_media=True, temporary=True)
+                        except TypeError:
+                            sess = await self_cli.get_session(dc_id, is_media=True)
+                            if sess not in self_cli._media_pool:
+                                self_cli._media_pool.append(sess)
+                            break
+                        except Exception:
+                            break
+                        if sess is not None:
+                            self_cli._media_pool.append(sess)
+                    return list(self_cli._media_pool)
+
+            async def close_media_pool(self_cli):
+                for sess in list(self_cli._media_pool):
+                    try:
+                        if getattr(sess, "is_started", None):
+                            await sess.stop()
+                    except Exception:
+                        pass
+                self_cli._media_pool.clear()
+
+            async def save_file(self_cli, path, file_id=None, file_part=0, progress=None, progress_args=()):
+                if path is None:
+                    return None
+                if file_id is None and file_part == 0 and isinstance(path, (str, os.PathLike)):
+                    cached = self_cli._preuploaded.pop(str(path), None)
+                    if cached is not None:
+                        return cached
+
+                is_eligible = (
+                    file_id is None
+                    and file_part == 0
+                    and isinstance(path, (str, os.PathLike))
+                    and os.path.isfile(path)
+                )
+                if not is_eligible:
+                    return await super().save_file(
+                        path, file_id=file_id, file_part=file_part, progress=progress, progress_args=progress_args
+                    )
+
+                file_size = os.path.getsize(path)
+                if file_size <= 10 * 1024 * 1024:
+                    return await super().save_file(
+                        path, file_id=file_id, file_part=file_part, progress=progress, progress_args=progress_args
+                    )
+
+                max_mib = 4000 if (getattr(self_cli, "me", None) and getattr(self_cli.me, "is_premium", False)) else 2000
+                if file_size > max_mib * 1024 * 1024:
+                    raise ValueError(f"Can't upload files bigger than {max_mib} MiB")
+
+                try:
+                    dc_id = await self_cli.storage.dc_id()
+                    pool = await self_cli._ensure_media_pool(dc_id, target_size=6)
+                except Exception:
+                    pool = []
+
+                if not pool:
+                    return await super().save_file(
+                        path, file_id=file_id, file_part=file_part, progress=progress, progress_args=progress_args
+                    )
+
+                part_size = 512 * 1024
+                total_parts = int(math.ceil(file_size / part_size))
+                gen_id = self_cli.rnd_id()
+                workers_count = min(total_parts, 12 if self_cli._concurrent_hint <= 1 else 4)
+                start_offset = abs(gen_id) % len(pool)
+
+                async with self_cli.save_file_semaphore:
+                    queue: asyncio.Queue = asyncio.Queue(workers_count * 2)
+                    failures: list[Exception] = []
+                    done_bytes = 0
+
+                    async def _chunk_worker(w_idx: int):
+                        nonlocal done_bytes
+                        sess = pool[(start_offset + w_idx) % len(pool)]
+                        while True:
+                            item = await queue.get()
+                            if item is None:
+                                return
+                            if failures or cancelled:
+                                continue
+                            part_no, chunk_bytes = item
+                            try:
+                                rpc = raw.functions.upload.SaveBigFilePart(
+                                    file_id=gen_id,
+                                    file_part=part_no,
+                                    file_total_parts=total_parts,
+                                    bytes=chunk_bytes,
+                                )
+                                await sess.invoke(rpc)
+                                done_bytes += len(chunk_bytes)
+                                if progress:
+                                    res = progress(min(done_bytes, file_size), file_size, *progress_args)
+                                    if inspect.isawaitable(res):
+                                        await res
+                            except Exception as exc:
+                                failures.append(exc)
+
+                    fp = open(path, "rb")
+                    worker_tasks = [asyncio.create_task(_chunk_worker(i)) for i in range(workers_count)]
+                    try:
+                        part_no = 0
+                        while not failures:
+                            if cancelled:
+                                failures.append(InterruptedError("Cancelled by user"))
+                                break
+                            chunk = fp.read(part_size)
+                            if not chunk:
+                                break
+                            await queue.put((part_no, chunk))
+                            part_no += 1
+                    except Exception as exc:
+                        failures.append(exc)
+                    finally:
+                        for _ in worker_tasks:
+                            await queue.put(None)
+                        await asyncio.gather(*worker_tasks, return_exceptions=True)
+                        fp.close()
+
+                    if failures:
+                        raise failures[0]
+
+                    return raw.types.InputFileBig(
+                        id=gen_id,
+                        parts=total_parts,
+                        name=Path(path).name,
+                    )
+
+        return _FastKurigramClient
+
     async def _kurigram_send_files(self, files: list, as_doc: bool = False, base_root: Path = None) -> list:
         from pyrogram import Client
         try:
@@ -3201,21 +3434,77 @@ class Mirror:
         except Exception:
             reply_id = None
 
+        valid_files = []
+        for fpath in files:
+            sz = fpath.stat().st_size
+            if sz > 0:
+                valid_files.append((fpath, sz))
+        if not valid_files:
+            return []
+
+        n_files = len(valid_files)
+        total_all = sum(sz for _, sz in valid_files)
+        per_done = [0] * n_files
+        win = [time.time(), 0]
+        tick_busy = [False]
+        tick_err = [None]
         sent_items = []
-        async with Client(
+        loop = asyncio.get_running_loop()
+
+        FastClient = self._make_fast_kurigram_client_cls(Client)
+        async with FastClient(
             f"mirror_{JOB_ID or 'run'}",
-            api_id=int(TELEGRAM_API_ID),
-            api_hash=TELEGRAM_API_HASH,
-            bot_token=BOT_TOKEN,
-            in_memory=True,
-            workers=8,
+            **_kurigram_client_kwargs(Client, {
+                "api_id": int(TELEGRAM_API_ID),
+                "api_hash": TELEGRAM_API_HASH,
+                "bot_token": BOT_TOKEN,
+            }),
         ) as app:
-            for idx, fpath in enumerate(files, 1):
-                if cancelled:
+            upload_conc = min(n_files, 4) if n_files > 1 else 1
+            app._concurrent_hint = upload_conc
+
+            def report_progress(file_idx: int, current: int, total: int, fname: str):
+                global cancelled
+                if cancelled or tick_err[0] is not None:
                     raise InterruptedError("Cancelled by user")
-                sz = fpath.stat().st_size
-                if sz <= 0:
-                    continue
+                sz_i = valid_files[file_idx][1]
+                cur = min(max(0, int(current)), total or sz_i)
+                if cur > per_done[file_idx]:
+                    per_done[file_idx] = cur
+
+                agg_done = sum(per_done) if n_files > 1 else cur
+                agg_tot = total_all if n_files > 1 else (total or sz_i)
+                now = time.time()
+                dt = max(0.05, now - win[0])
+                spd = max(0.0, (agg_done - win[1]) / dt) if agg_done >= win[1] else 0.0
+                if now - win[0] >= TICK_SECONDS:
+                    win[0] = now
+                    win[1] = agg_done
+
+                pct = (100.0 * agg_done / agg_tot) if agg_tot > 0 else 0.0
+                eta = ((agg_tot - agg_done) / spd) if spd > 0 and agg_tot > agg_done else None
+                if n_files > 1:
+                    label = f"TG {len(sent_items)}/{n_files} ({upload_conc}x).."
+                else:
+                    label = "Uploading (TG).."
+
+                if not tick_busy[0] and (now - self.last_tick >= TICK_SECONDS):
+                    tick_busy[0] = True
+                    def _run_tick():
+                        global cancelled
+                        try:
+                            self.tick(fname, label, pct, agg_done, agg_tot, spd, eta, "Kurigram MTProto")
+                        except InterruptedError as ie:
+                            cancelled = True
+                            tick_err[0] = ie
+                        except Exception:
+                            pass
+                        finally:
+                            tick_busy[0] = False
+                    loop.run_in_executor(None, _run_tick)
+
+            items_meta = []
+            for file_idx, (fpath, sz) in enumerate(valid_files):
                 try:
                     rel_label = str(fpath.relative_to(base_root)) if base_root else fpath.name
                 except Exception:
@@ -3224,113 +3513,184 @@ class Mirror:
                 is_audio = (not as_doc) and (suffix in AUDIO_EXTS)
                 is_video = (not as_doc) and (suffix in VIDEO_EXTS)
                 is_image = (not as_doc) and (suffix in IMAGE_EXTS) and (sz <= 10 * 1024 * 1024)
-                meta = probe_media_meta(fpath) if (is_audio or is_video or (as_doc and suffix in VIDEO_EXTS)) else {"duration": 0, "width": 0, "height": 0}
-                thumb = make_media_thumb(fpath, fpath.parent) if (is_audio or is_video or (as_doc and suffix in VIDEO_EXTS)) else None
-                t_start = time.time()
-                win = [t_start, 0]
+                need_probe = is_audio or is_video or (as_doc and suffix in VIDEO_EXTS)
+                meta = probe_media_meta(fpath) if need_probe else {"duration": 0, "width": 0, "height": 0}
+                thumb = make_media_thumb(fpath, fpath.parent) if need_probe else None
+                items_meta.append({
+                    "idx": file_idx + 1,
+                    "file_idx": file_idx,
+                    "fpath": fpath,
+                    "sz": sz,
+                    "rel_label": rel_label,
+                    "is_audio": is_audio,
+                    "is_video": is_video,
+                    "is_image": is_image,
+                    "meta": meta,
+                    "thumb": thumb,
+                })
 
-                def on_prog(current, total):
-                    global cancelled
-                    if cancelled:
-                        raise InterruptedError("Cancelled by user")
-                    now = time.time()
-                    dt = max(0.05, now - win[0])
-                    spd = max(0.0, (current - win[1]) / dt) if current >= win[1] else 0.0
-                    tot = total or sz
-                    pct = (100.0 * current / tot) if tot > 0 else 0.0
-                    eta = ((tot - current) / spd) if spd > 0 and tot > current else None
-                    label = f"TG {idx}/{len(files)}.." if len(files) > 1 else "Uploading (TG).."
-                    self.tick(fpath.name, label, pct, current, tot, spd, eta, "Kurigram MTProto")
-                    if now - win[0] >= TICK_SECONDS:
-                        win[0] = now
-                        win[1] = current
+            upload_sem = asyncio.Semaphore(upload_conc)
+            pre_tasks: list = [None] * n_files
 
-                caption = f"<code>{html.escape(rel_label)}</code>  ·  <code>{fmt_bytes(sz)}</code>"
-                if len(caption) > 1000:
-                    caption = f"<code>{html.escape(truncate(fpath.name, 180))}</code>  ·  <code>{fmt_bytes(sz)}</code>"
-                kw = {"caption": caption, "progress": on_prog}
-                if pm_html is not None:
-                    kw["parse_mode"] = pm_html
-                if thumb:
-                    kw["thumb"] = str(thumb)
-                if reply_id and idx == 1:
-                    kw["reply_to_message_id"] = reply_id
-                elif self.thread_id and idx == 1:
-                    kw["message_thread_id"] = int(self.thread_id)
+            async def _preupload_one(info: dict):
+                fpath = info["fpath"]
+                sz = info["sz"]
+                file_idx = info["file_idx"]
 
-                async def _send_once():
-                    if is_audio:
-                        akw = dict(kw)
-                        if meta["duration"]:
-                            akw["duration"] = meta["duration"]
-                        akw["title"] = fpath.stem
-                        try:
-                            return await app.send_audio(self.chat_id, audio=str(fpath), **akw)
-                        except Exception:
-                            akw.pop("reply_to_message_id", None)
-                            return await app.send_audio(self.chat_id, audio=str(fpath), **akw)
-                    if is_video:
-                        vkw = dict(kw)
-                        if meta["duration"]:
-                            vkw["duration"] = meta["duration"]
-                        if meta["width"] and meta["height"]:
-                            vkw["width"] = meta["width"]
-                            vkw["height"] = meta["height"]
-                        vkw["supports_streaming"] = True
-                        try:
-                            return await app.send_video(self.chat_id, video=str(fpath), **vkw)
-                        except Exception:
-                            if "reply_to_message_id" in vkw:
-                                vkw.pop("reply_to_message_id", None)
-                                try:
-                                    return await app.send_video(self.chat_id, video=str(fpath), **vkw)
-                                except Exception:
-                                    pass
-                            dkw = {k: v for k, v in vkw.items() if k in ("caption", "progress", "parse_mode", "thumb", "message_thread_id")}
-                            return await app.send_document(self.chat_id, document=str(fpath), **dkw)
-                    if is_image:
-                        pkw = {k: v for k, v in kw.items() if k in ("caption", "progress", "parse_mode", "reply_to_message_id", "message_thread_id")}
-                        try:
-                            return await app.send_photo(self.chat_id, photo=str(fpath), **pkw)
-                        except Exception:
-                            dkw = {k: v for k, v in kw.items() if k in ("caption", "progress", "parse_mode", "thumb", "message_thread_id")}
-                            return await app.send_document(self.chat_id, document=str(fpath), **dkw)
-                    dkw = {k: v for k, v in kw.items() if k in ("caption", "progress", "parse_mode", "thumb", "reply_to_message_id", "message_thread_id")}
-                    try:
-                        return await app.send_document(self.chat_id, document=str(fpath), **dkw)
-                    except Exception:
-                        dkw.pop("reply_to_message_id", None)
-                        return await app.send_document(self.chat_id, document=str(fpath), **dkw)
+                def on_prog_pre(current, total):
+                    report_progress(file_idx, current, total, fpath.name)
 
-                sent_msg = None
-                try:
+                async with upload_sem:
                     for attempt in range(3):
+                        if cancelled:
+                            raise InterruptedError("Cancelled by user")
                         try:
-                            sent_msg = await _send_once()
-                            break
+                            uploaded = await app.save_file(str(fpath), progress=on_prog_pre)
+                            app._preuploaded[str(fpath)] = uploaded
+                            return uploaded
                         except Exception as err:
                             if FloodWait is not None and isinstance(err, FloodWait):
                                 wait_s = min(int(getattr(err, "value", 10)) + 1, 180)
-                                self.tick(fpath.name, f"FloodWait ({wait_s}s)..", 0.0, 0, sz, 0, wait_s, "Kurigram MTProto", force=True)
+                                await loop.run_in_executor(
+                                    None,
+                                    lambda n=fpath.name, w=wait_s, d=sum(per_done): self.tick(
+                                        n, f"FloodWait ({w}s)..", 0.0, d, total_all, 0, w, "Kurigram MTProto", force=True
+                                    ),
+                                )
                                 await asyncio.sleep(wait_s)
                                 continue
                             if attempt < 2 and any(t in str(err).lower() for t in ("timed out", "timeout", "connection", "reset", "eof")):
                                 await asyncio.sleep(2 * (attempt + 1))
                                 continue
                             raise
-                    msg_link = getattr(sent_msg, "link", "") or ""
-                    sent_items.append({
-                        "name": rel_label,
-                        "size": sz,
-                        "status": "completed",
-                        "link": msg_link,
-                        "msgId": getattr(sent_msg, "id", None),
-                        "direct": "",
-                        "shared": False,
-                    })
-                finally:
+
+            try:
+                if n_files > 1:
+                    for i, info in enumerate(items_meta):
+                        if info["sz"] > 10 * 1024 * 1024 and not info["is_image"]:
+                            pre_tasks[i] = asyncio.create_task(_preupload_one(info))
+
+                for i, info in enumerate(items_meta):
+                    if cancelled or tick_err[0] is not None:
+                        raise InterruptedError("Cancelled by user")
+                    idx = info["idx"]
+                    file_idx = info["file_idx"]
+                    fpath = info["fpath"]
+                    sz = info["sz"]
+                    rel_label = info["rel_label"]
+                    is_audio = info["is_audio"]
+                    is_video = info["is_video"]
+                    is_image = info["is_image"]
+                    meta = info["meta"]
+                    thumb = info["thumb"]
+
+                    if pre_tasks[i] is not None:
+                        await pre_tasks[i]
+
+                    def on_prog(current, total):
+                        report_progress(file_idx, current, total, fpath.name)
+
+                    caption = f"<code>{html.escape(rel_label)}</code>  ·  <code>{fmt_bytes(sz)}</code>"
+                    if len(caption) > 1000:
+                        caption = f"<code>{html.escape(truncate(fpath.name, 180))}</code>  ·  <code>{fmt_bytes(sz)}</code>"
+                    kw = {"caption": caption, "progress": on_prog}
+                    if pm_html is not None:
+                        kw["parse_mode"] = pm_html
                     if thumb:
-                        thumb.unlink(missing_ok=True)
+                        kw["thumb"] = str(thumb)
+                    if reply_id and idx == 1:
+                        kw["reply_to_message_id"] = reply_id
+                    elif self.thread_id and idx == 1:
+                        kw["message_thread_id"] = int(self.thread_id)
+
+                    async def _send_once():
+                        if is_audio:
+                            akw = dict(kw)
+                            if meta["duration"]:
+                                akw["duration"] = meta["duration"]
+                            akw["title"] = fpath.stem
+                            try:
+                                return await app.send_audio(self.chat_id, audio=str(fpath), **akw)
+                            except Exception:
+                                akw.pop("reply_to_message_id", None)
+                                return await app.send_audio(self.chat_id, audio=str(fpath), **akw)
+                        if is_video:
+                            vkw = dict(kw)
+                            if meta["duration"]:
+                                vkw["duration"] = meta["duration"]
+                            if meta["width"] and meta["height"]:
+                                vkw["width"] = meta["width"]
+                                vkw["height"] = meta["height"]
+                            vkw["supports_streaming"] = True
+                            try:
+                                return await app.send_video(self.chat_id, video=str(fpath), **vkw)
+                            except Exception:
+                                if "reply_to_message_id" in vkw:
+                                    vkw.pop("reply_to_message_id", None)
+                                    try:
+                                        return await app.send_video(self.chat_id, video=str(fpath), **vkw)
+                                    except Exception:
+                                        pass
+                                dkw = {k: v for k, v in vkw.items() if k in ("caption", "progress", "parse_mode", "thumb", "message_thread_id")}
+                                return await app.send_document(self.chat_id, document=str(fpath), **dkw)
+                        if is_image:
+                            pkw = {k: v for k, v in kw.items() if k in ("caption", "progress", "parse_mode", "reply_to_message_id", "message_thread_id")}
+                            try:
+                                return await app.send_photo(self.chat_id, photo=str(fpath), **pkw)
+                            except Exception:
+                                dkw = {k: v for k, v in kw.items() if k in ("caption", "progress", "parse_mode", "thumb", "message_thread_id")}
+                                return await app.send_document(self.chat_id, document=str(fpath), **dkw)
+                        dkw = {k: v for k, v in kw.items() if k in ("caption", "progress", "parse_mode", "thumb", "reply_to_message_id", "message_thread_id")}
+                        try:
+                            return await app.send_document(self.chat_id, document=str(fpath), **dkw)
+                        except Exception:
+                            dkw.pop("reply_to_message_id", None)
+                            return await app.send_document(self.chat_id, document=str(fpath), **dkw)
+
+                    sent_msg = None
+                    try:
+                        for attempt in range(3):
+                            try:
+                                sent_msg = await _send_once()
+                                break
+                            except Exception as err:
+                                if FloodWait is not None and isinstance(err, FloodWait):
+                                    wait_s = min(int(getattr(err, "value", 10)) + 1, 180)
+                                    await loop.run_in_executor(
+                                        None,
+                                        lambda: self.tick(fpath.name, f"FloodWait ({wait_s}s)..", 0.0, sum(per_done), total_all, 0, wait_s, "Kurigram MTProto", force=True),
+                                    )
+                                    await asyncio.sleep(wait_s)
+                                    continue
+                                if attempt < 2 and any(t in str(err).lower() for t in ("timed out", "timeout", "connection", "reset", "eof")):
+                                    await asyncio.sleep(2 * (attempt + 1))
+                                    continue
+                                raise
+                        per_done[file_idx] = sz
+                        msg_link = getattr(sent_msg, "link", "") or ""
+                        sent_items.append({
+                            "name": rel_label,
+                            "size": sz,
+                            "status": "completed",
+                            "link": msg_link,
+                            "msgId": getattr(sent_msg, "id", None),
+                            "direct": "",
+                            "shared": False,
+                        })
+                    finally:
+                        if thumb:
+                            thumb.unlink(missing_ok=True)
+            finally:
+                for t in pre_tasks:
+                    if t is not None and not t.done():
+                        t.cancel()
+                pending = [t for t in pre_tasks if t is not None]
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                for info in items_meta:
+                    if info.get("thumb"):
+                        info["thumb"].unlink(missing_ok=True)
+                await app.close_media_pool()
         return sent_items
 
     def split_for_telegram(self, fpath: Path) -> list:
@@ -3390,7 +3750,7 @@ class Mirror:
         self.tick(upload_queue[0].name, "Setting up Kurigram..", 0.0, 0, path_size(upload_queue[0]), 0, None, "Kurigram MTProto", force=True)
         ensure_kurigram_tools()
         try:
-            sent_items = asyncio.run(
+            sent_items = _run_async_fast(
                 self._kurigram_send_files(
                     upload_queue,
                     as_doc=self.leech_as_doc,
