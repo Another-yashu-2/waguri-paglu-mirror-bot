@@ -2451,6 +2451,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       const verification = resolved.verification;
       const isDrive = resolved.kind === 'gdrive';
       const isTgMedia = resolved.kind === 'tg_media';
+      const isSfFolder = resolved.kind === 'sf_folder';
       const fileUrl = resolved.finalUrl;
 
       let duplicateExists = false;
@@ -2476,14 +2477,16 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
           }
         : isTgMedia
           ? resolved.tgInfo
-          : {
-              type: 'url',
-              url: fileUrl,
-              sourceUrl: resolved.sourceUrl || '',
-              resolvedVia: resolved.resolvedVia || '',
-              name: verification.fileName,
-              size: verification.sizeBytes || 0
-            };
+          : isSfFolder
+            ? resolved.sfInfo
+            : {
+                type: 'url',
+                url: fileUrl,
+                sourceUrl: resolved.sourceUrl || '',
+                resolvedVia: resolved.resolvedVia || '',
+                name: verification.fileName,
+                size: verification.sizeBytes || 0
+              };
 
       task = {
         taskId,
@@ -4903,12 +4906,7 @@ const WGET_UA = 'Wget/1.21.3';
 
 function isSourceForgeHost(host) {
   const h = String(host || '').toLowerCase().replace(/^www\./, '');
-  return (
-    h === 'sourceforge.net' ||
-    h === 'sf.net' ||
-    h === 'dl.sourceforge.net' ||
-    h.endsWith('.dl.sourceforge.net')
-  );
+  return h === 'sourceforge.net' || h === 'sf.net' || h.endsWith('.sourceforge.net');
 }
 
 function isSourceForgeUrl(rawUrl) {
@@ -4964,28 +4962,32 @@ function parseSourceForgeProjectPath(rawUrl) {
     if (!mFiles) return null;
 
     const project = mFiles[1];
-    const rest = mFiles[2];
-    if (rest === 'latest/download' || rest === 'latest/download/') {
+    const rawRest = mFiles[2];
+    const trimmedRest = rawRest.replace(/\/+$/, '');
+    if (trimmedRest === 'latest/download') {
       return {
         kind: 'file',
         project,
         relPath: 'latest',
+        fileName: `${project}_latest`,
         directUrl: `https://sourceforge.net/projects/${project}/files/latest/download`,
         sourceUrl: `https://sourceforge.net/projects/${project}/files/latest/download`
       };
     }
-    if (rest.endsWith('/download')) {
-      const rel = rest.slice(0, -'/download'.length).replace(/^\/+|\/+$/g, '');
+    if (trimmedRest.endsWith('/download')) {
+      const rel = trimmedRest.slice(0, -'/download'.length).replace(/^\/+|\/+$/g, '');
+      const fName = decodeURIComponent(rel.split('/').filter(Boolean).pop() || `${project}_file`);
       return {
         kind: 'file',
         project,
         relPath: rel,
+        fileName: fName,
         directUrl: `https://downloads.sourceforge.net/project/${project}/${rel}?viasf=1`,
-        sourceUrl: `https://downloads.sourceforge.net/project/${project}/${rel}?viasf=1`
+        sourceUrl: `https://sourceforge.net/projects/${project}/files/${rel}/download`
       };
     }
-    if (rest.endsWith('/')) {
-      const rel = rest.replace(/^\/+|\/+$/g, '');
+    if (rawRest.endsWith('/')) {
+      const rel = trimmedRest.replace(/^\/+|\/+$/g, '');
       return {
         kind: 'folder',
         project,
@@ -4994,18 +4996,96 @@ function parseSourceForgeProjectPath(rawUrl) {
       };
     }
 
-    const rel = rest.replace(/^\/+|\/+$/g, '');
+    const rel = trimmedRest.replace(/^\/+|\/+$/g, '');
+    const fName = decodeURIComponent(rel.split('/').filter(Boolean).pop() || `${project}_file`);
     return {
       kind: 'maybe',
       project,
       relPath: rel,
+      fileName: fName,
       directUrl: `https://downloads.sourceforge.net/project/${project}/${rel}?viasf=1`,
-      sourceUrl: `https://downloads.sourceforge.net/project/${project}/${rel}?viasf=1`,
+      sourceUrl: `https://sourceforge.net/projects/${project}/files/${rel}/download`,
       folderUrl: `https://sourceforge.net/projects/${project}/files/${rel}/`
     };
   } catch (_) {
     return null;
   }
+}
+
+async function fetchSourceForgeRssItems(project, dirRelPath = '') {
+  const cleanDir = String(dirRelPath || '').replace(/^\/+|\/+$/g, '');
+  const rssPath = cleanDir ? `/${cleanDir}` : '/';
+  const rssUrl = `https://sourceforge.net/projects/${encodeURIComponent(project)}/rss?path=${encodeURIComponent(rssPath)}`;
+  try {
+    const res = await fetch(rssUrl, {
+      method: 'GET',
+      headers: { 'User-Agent': WGET_UA, Accept: 'application/rss+xml, application/xml, text/xml' },
+      redirect: 'follow'
+    });
+    if (!res.ok) return [];
+    const xml = await res.text();
+    const items = [];
+    const itemRe = /<item>([\s\S]*?)<\/item>/gi;
+    let m;
+    while ((m = itemRe.exec(xml)) !== null) {
+      const blk = m[1];
+      const linkM = blk.match(/<link>([\s\S]*?)<\/link>/i);
+      const titleM = blk.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i);
+      const szM = blk.match(/\bfilesize=["'](\d+)["']/i);
+      const link = decodeHtmlEntities((linkM?.[1] || '').trim());
+      if (!link || /\/files\/latest\/download$/i.test(link)) continue;
+      items.push({
+        link,
+        relPath: (titleM?.[1] || '').trim().replace(/^\/+/, ''),
+        sizeBytes: szM ? parseInt(szM[1], 10) || 0 : 0
+      });
+    }
+    return items;
+  } catch (_) {
+    return [];
+  }
+}
+
+async function buildSourceForgeRunnerFallback(rawUrl, sfMeta) {
+  let fileName = sfMeta?.fileName || '';
+  let sizeBytes = 0;
+
+  if (!fileName) {
+    try {
+      const u = new URL(rawUrl);
+      const parts = u.pathname.split('/').filter(Boolean);
+      if (parts[parts.length - 1] === 'download' && parts.length >= 2) {
+        fileName = decodeURIComponent(parts[parts.length - 2]);
+      } else if (parts.length) {
+        fileName = decodeURIComponent(parts[parts.length - 1]);
+      }
+    } catch (_) {}
+  }
+
+  if (sfMeta?.project && sfMeta?.relPath && sfMeta.relPath !== 'latest') {
+    const dirParts = sfMeta.relPath.split('/').filter(Boolean);
+    dirParts.pop();
+    const rssItems = await fetchSourceForgeRssItems(sfMeta.project, dirParts.join('/'));
+    const match = rssItems.find(it => it.relPath === sfMeta.relPath || it.link.includes(`/${sfMeta.relPath}/download`));
+    if (match) {
+      if (match.sizeBytes > 0) sizeBytes = match.sizeBytes;
+      if (!fileName && match.relPath) fileName = match.relPath.split('/').pop() || fileName;
+    }
+  }
+
+  return {
+    kind: 'url',
+    verification: {
+      valid: true,
+      fileName: fileName || 'sourceforge_file.bin',
+      sizeBytes,
+      contentType: 'application/octet-stream',
+      acceptRanges: true
+    },
+    finalUrl: sfMeta?.directUrl || rawUrl,
+    sourceUrl: sfMeta?.sourceUrl || rawUrl,
+    resolvedVia: 'SourceForge (Runner)'
+  };
 }
 
 async function expandSourceForgeFolder(folderUrl, maxFiles = MAX_BATCH_URLS) {
@@ -5026,41 +5106,55 @@ async function expandSourceForgeFolder(folderUrl, maxFiles = MAX_BATCH_URLS) {
         headers: { 'User-Agent': WGET_UA, Accept: 'text/html,application/xhtml+xml' },
         redirect: 'follow'
       });
-      if (!res.ok) continue;
-      htmlText = await res.text();
-    } catch (_) {
-      continue;
-    }
-
-    const rowRe = /<tr\b([^>]*)>([\s\S]*?)<\/tr>/gi;
-    let m;
-    while ((m = rowRe.exec(htmlText)) !== null) {
-      const trAttrs = m[1];
-      const trBody = m[2];
-      const cls = extractAttr(trAttrs, 'class').toLowerCase();
-      const hrefMatch = trBody.match(/<a\b[^>]*\bhref=["']([^"']+)["']/i);
-      if (!hrefMatch) continue;
-
-      let absUrl;
-      try {
-        absUrl = new URL(decodeHtmlEntities(hrefMatch[1]), pageUrl).toString();
-      } catch (_) {
-        continue;
+      if (res.ok) {
+        htmlText = await res.text();
       }
+    } catch (_) {}
 
-      if (/\bfile\b/.test(cls) && absUrl.includes('/files/') && absUrl.endsWith('/download')) {
-        if (/\/files\/latest\/download$/i.test(absUrl)) continue;
-        const parsed = parseSourceForgeProjectPath(absUrl);
-        const target = parsed?.directUrl || absUrl;
-        if (!seenFiles.has(target)) {
-          seenFiles.add(target);
-          files.push(target);
-          if (files.length >= maxFiles) break;
+    if (htmlText) {
+      const rowRe = /<tr\b([^>]*)>([\s\S]*?)<\/tr>/gi;
+      let m;
+      while ((m = rowRe.exec(htmlText)) !== null) {
+        const trAttrs = m[1];
+        const trBody = m[2];
+        const cls = extractAttr(trAttrs, 'class').toLowerCase();
+        const hrefMatch = trBody.match(/<a\b[^>]*\bhref=["']([^"']+)["']/i);
+        if (!hrefMatch) continue;
+
+        let absUrl;
+        try {
+          absUrl = new URL(decodeHtmlEntities(hrefMatch[1]), pageUrl).toString();
+        } catch (_) {
+          continue;
         }
-      } else if (/\bfolder\b/.test(cls) && absUrl.includes('/files/') && !absUrl.endsWith('/download')) {
-        const cleanDir = absUrl.split('#')[0].split('?')[0];
-        if (!seenPages.has(cleanDir) && !queue.includes(cleanDir)) {
-          queue.push(cleanDir);
+
+        if (/\bfile\b/.test(cls) && absUrl.includes('/files/') && absUrl.endsWith('/download')) {
+          if (/\/files\/latest\/download$/i.test(absUrl)) continue;
+          if (!seenFiles.has(absUrl)) {
+            seenFiles.add(absUrl);
+            files.push(absUrl);
+            if (files.length >= maxFiles) break;
+          }
+        } else if (/\bfolder\b/.test(cls) && absUrl.includes('/files/') && !absUrl.endsWith('/download')) {
+          const cleanDir = absUrl.split('#')[0].split('?')[0];
+          if (!seenPages.has(cleanDir) && !queue.includes(cleanDir)) {
+            queue.push(cleanDir);
+          }
+        }
+      }
+    }
+  }
+
+  // Fallback to SourceForge RSS feed if HTML folder listing was blocked or empty
+  if (!files.length) {
+    const sf = parseSourceForgeProjectPath(folderUrl);
+    if (sf?.project) {
+      const rssItems = await fetchSourceForgeRssItems(sf.project, sf.relPath || '');
+      for (const it of rssItems) {
+        if (!seenFiles.has(it.link)) {
+          seenFiles.add(it.link);
+          files.push(it.link);
+          if (files.length >= maxFiles) break;
         }
       }
     }
@@ -5100,26 +5194,22 @@ async function expandSourceForgeInputs(urls) {
     }
     if (sf.kind === 'maybe') {
       const v = await verifyDirectLink(sf.directUrl);
-      if (v.valid) {
+      if (v.valid || /\.[a-z0-9]{1,8}$/i.test(sf.relPath)) {
         pushUrl(cur);
         continue;
       }
     }
     const found = await expandSourceForgeFolder(sf.folderUrl, MAX_BATCH_URLS - out.length);
     if (!found.length) {
-      if (urls.length === 1) {
-        return { error: 'No downloadable files found in this SourceForge project/folder.' };
-      }
+      // Worker may be CF-blocked by SourceForge; let runner crawl the folder directly
+      pushUrl(sf.folderUrl);
       continue;
     }
     for (const f of found) pushUrl(f);
     if (out.length >= MAX_BATCH_URLS) break;
   }
 
-  if (!out.length) {
-    return { error: 'Could not extract any downloadable SourceForge files.' };
-  }
-  return { urls: out };
+  return { urls: out.length ? out : urls };
 }
 
 function decodeHtmlEntities(str) {
@@ -5370,10 +5460,43 @@ function parseMetaFromResponse(res, fallbackUrl) {
 
 async function resolveAndInspectInput(rawUrl, accessToken) {
   let currentUrl = normalizeSourceForgeUrl(rawUrl);
+  const sfInit = isSourceForgeUrl(currentUrl) ? parseSourceForgeProjectPath(currentUrl) : null;
+  if (sfInit && sfInit.kind === 'folder') {
+    const folderLabel = decodeURIComponent((sfInit.relPath || sfInit.project || 'SourceForge').split('/').filter(Boolean).pop() || sfInit.project);
+    return {
+      kind: 'sf_folder',
+      sfInfo: {
+        type: 'sf_folder',
+        url: sfInit.folderUrl,
+        project: sfInit.project,
+        relPath: sfInit.relPath || '',
+        name: folderLabel
+      },
+      verification: {
+        valid: true,
+        fileName: folderLabel,
+        sizeBytes: 0,
+        contentType: 'inode/directory',
+        acceptRanges: true,
+        isFolder: true
+      },
+      finalUrl: sfInit.folderUrl,
+      sourceUrl: sfInit.folderUrl,
+      resolvedVia: 'SourceForge Folder (Runner)'
+    };
+  }
+
   const visited = new Set();
   const viaChain = [];
-  let stickySourceUrl = '';
+  let stickySourceUrl = sfInit?.sourceUrl || '';
   let fetches = 0;
+
+  const sfFallbackOrError = async (reason) => {
+    if (isSourceForgeUrl(rawUrl) || isSourceForgeUrl(currentUrl)) {
+      return await buildSourceForgeRunnerFallback(rawUrl, sfInit);
+    }
+    return { kind: 'error', reason };
+  };
 
   for (let hop = 0; hop < 10 && fetches < 14; hop++) {
     if (isMediaSiteUrl(currentUrl)) {
@@ -5505,13 +5628,13 @@ async function resolveAndInspectInput(rawUrl, accessToken) {
         controller.abort();
       }
     } catch (err) {
-      return { kind: 'error', reason: `Connection error: ${err.message}` };
+      return await sfFallbackOrError(`Connection error: ${err.message}`);
     }
 
     const meta = parseMetaFromResponse(res, currentUrl);
     if (!meta.isHtml) {
       if (!res.ok && res.status !== 206) {
-        return { kind: 'error', reason: `Remote server returned HTTP ${res.status}.` };
+        return await sfFallbackOrError(`Remote server returned HTTP ${res.status}.`);
       }
       return {
         kind: 'url',
@@ -5543,7 +5666,7 @@ async function resolveAndInspectInput(rawUrl, accessToken) {
       htmlText = (await pageRes.text()).slice(0, 262144);
       const blocked = detectChallengePage(pageRes.headers, htmlText);
       if (blocked) {
-        return { kind: 'error', reason: blocked };
+        return await sfFallbackOrError(blocked);
       }
       if (!pageRes.ok) {
         let host = '';
@@ -5554,10 +5677,10 @@ async function resolveAndInspectInput(rawUrl, accessToken) {
             reason: `Google download server returned HTTP ${pageRes.status} (signed download URLs are IP/session-bound or expired; share the original Drive/source link instead).`
           };
         }
-        return { kind: 'error', reason: `Remote server returned HTTP ${pageRes.status}.` };
+        return await sfFallbackOrError(`Remote server returned HTTP ${pageRes.status}.`);
       }
     } catch (err) {
-      return { kind: 'error', reason: `Failed to inspect page: ${err.message}` };
+      return await sfFallbackOrError(`Failed to inspect page: ${err.message}`);
     }
 
     const hostRes = extractHostDownloadCandidates(currentUrl, htmlText);
@@ -5588,10 +5711,10 @@ async function resolveAndInspectInput(rawUrl, accessToken) {
       continue;
     }
 
-    return { kind: 'error', reason: 'URL points to an HTML webpage with no extractable direct file link.' };
+    return await sfFallbackOrError('URL points to an HTML webpage with no extractable direct file link.');
   }
 
-  return { kind: 'error', reason: 'Too many redirects while resolving link.' };
+  return await sfFallbackOrError('Too many redirects while resolving link.');
 }
 
 async function verifyDirectLink(url) {

@@ -586,7 +586,7 @@ def parse_telegram_post_url(raw_url: str):
 def is_sourceforge_url(raw_url: str) -> bool:
     try:
         host = (urllib.parse.urlparse(raw_url).hostname or "").lower().removeprefix("www.")
-        return host in ("sourceforge.net", "sf.net", "dl.sourceforge.net") or host.endswith(".dl.sourceforge.net")
+        return host in ("sourceforge.net", "sf.net") or host.endswith(".sourceforge.net")
     except Exception:
         return False
 
@@ -664,7 +664,7 @@ def _curl_probe_single(url: str, method: str = "HEAD", follow: bool = False):
     curl_bin = shutil.which("curl")
     if not curl_bin:
         return None
-    cmd = [curl_bin, "-sS", "--max-time", "15", "-A", ua_for_url(url), "-D", "-", "-o", "/dev/null", "-w", "\n__FINAL_URL__:%{url_effective}"]
+    cmd = [curl_bin, "-sS", "--max-time", "20", "-b", "", "-A", ua_for_url(url), "-D", "-", "-o", "/dev/null", "-w", "\n__FINAL_URL__:%{url_effective}"]
     if follow:
         cmd.append("-L")
     if method == "HEAD":
@@ -796,6 +796,91 @@ def _extract_host_candidates(page_url: str, body: str) -> list:
     return [u for _, u in scored[:3]]
 
 
+def _fetch_text_resilient(url: str, accept: str = "text/html,application/xhtml+xml") -> tuple:
+    """Fetch URL text using curl first, falling back to curl_cffi Chrome impersonation if CF-challenged."""
+    ua = ua_for_url(url)
+    curl_bin = shutil.which("curl")
+    if curl_bin:
+        try:
+            r = subprocess.run(
+                [curl_bin, "-sSL", "--max-time", "20", "-A", ua, "-H", f"Accept: {accept}", "-w", "\n__HTTP_CODE__:%{http_code}__FINAL_URL__:%{url_effective}", url],
+                capture_output=True, text=True, timeout=25,
+            )
+            out = r.stdout or ""
+            if "__HTTP_CODE__:" in out:
+                body, tail = out.rsplit("__HTTP_CODE__:", 1)
+                m_t = re.match(r"(\d{3})__FINAL_URL__:(.*)$", tail.strip(), re.S)
+                if m_t:
+                    code = int(m_t.group(1))
+                    furl = m_t.group(2).strip() or url
+                    if code < 400 and not detect_challenge_page({}, body):
+                        return code, body, furl
+        except Exception:
+            pass
+
+    _prepare_pkg_paths()
+    try:
+        from curl_cffi import requests as cffi_req
+    except ImportError:
+        _pip_install_target(["curl_cffi"], _TG_PKG_TARGET)
+        from curl_cffi import requests as cffi_req
+
+    sess = cffi_req.Session(impersonate="chrome")
+    resp = sess.get(url, headers={"Accept": accept}, timeout=20, allow_redirects=True)
+    return resp.status_code, resp.text or "", str(resp.url or url)
+
+
+def _extract_sf_from_html(page_url: str, body: str):
+    cands = _extract_host_candidates(page_url, body)
+    for c in cands:
+        if "dl.sourceforge.net" in c or "downloads.sourceforge.net" in c:
+            return c
+    m_meta = re.search(r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+content=["\'][^"\']*url\s*=\s*([^"\'\s>]+)', body[:60000], re.I)
+    if m_meta:
+        return urllib.parse.urljoin(page_url, html.unescape(m_meta.group(1).strip()))
+    return None
+
+
+def _resolve_sf_via_cffi(raw_url: str) -> str:
+    _prepare_pkg_paths()
+    try:
+        from curl_cffi import requests as cffi_req
+    except ImportError:
+        _pip_install_target(["curl_cffi"], _TG_PKG_TARGET)
+        from curl_cffi import requests as cffi_req
+
+    cur = raw_url
+    sess = cffi_req.Session(impersonate="chrome")
+    visited = set()
+    for _ in range(10):
+        if cur in visited:
+            break
+        visited.add(cur)
+        r = sess.get(cur, timeout=20, allow_redirects=False, stream=True)
+        try:
+            loc = r.headers.get("location")
+            if 300 <= r.status_code < 400 and loc:
+                cur = urllib.parse.urljoin(cur, loc)
+                continue
+            ct = (r.headers.get("content-type") or "").lower()
+            cd = (r.headers.get("content-disposition") or "").lower()
+            if ("text/html" not in ct or "attachment" in cd) and r.status_code < 400:
+                return cur
+            body = r.text[:262144] if hasattr(r, "text") else ""
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+
+        nxt = _extract_sf_from_html(cur, body)
+        if nxt and nxt not in visited:
+            cur = nxt
+            continue
+        break
+    raise RuntimeError("Could not extract direct download link from SourceForge page (anti-bot blocked).")
+
+
 def resolve_download_url(raw_url: str) -> dict:
     cur = raw_url
     visited = set()
@@ -807,6 +892,19 @@ def resolve_download_url(raw_url: str) -> dict:
         gd = parse_drive_url(cur)
         if gd:
             return gd
+
+        if is_sourceforge_url(cur):
+            for sf_try in (cur, rewrite_known_direct_url(cur)):
+                if not sf_try:
+                    continue
+                for mtd in ("HEAD", "GET"):
+                    st, h_map, f_url = _probe_single(sf_try, mtd, follow=True)
+                    low_h = {k.lower(): v for k, v in h_map.items()}
+                    ct_h = low_h.get("content-type", "").lower()
+                    cd_h = low_h.get("content-disposition", "").lower()
+                    if st < 400 and ("text/html" not in ct_h or "attachment" in cd_h):
+                        return {"type": "url", "url": f_url}
+            return {"type": "url", "url": _resolve_sf_via_cffi(cur)}
 
         rewritten = rewrite_known_direct_url(cur)
         if rewritten and rewritten != cur and rewritten not in visited:
@@ -825,6 +923,8 @@ def resolve_download_url(raw_url: str) -> dict:
             continue
 
         if status in (403, 405, 501) or status >= 400:
+            if is_sourceforge_url(cur) and (status == 403 or low.get("cf-mitigated", "").lower() == "challenge"):
+                return {"type": "url", "url": _resolve_sf_via_cffi(cur)}
             status, hdrs, _ = _probe_single(cur, "GET")
             low = {k.lower(): v for k, v in hdrs.items()}
             if 300 <= status < 400 and low.get("location"):
@@ -835,8 +935,13 @@ def resolve_download_url(raw_url: str) -> dict:
         cd = low.get("content-disposition", "").lower()
         if "text/html" not in ct or "attachment" in cd:
             if status >= 400:
+                if is_sourceforge_url(cur):
+                    return {"type": "url", "url": _resolve_sf_via_cffi(cur)}
                 raise RuntimeError(f"Remote server returned HTTP {status}.")
             return {"type": "url", "url": cur}
+
+        if is_sourceforge_url(cur):
+            return {"type": "url", "url": _resolve_sf_via_cffi(cur)}
 
         if low.get("cf-mitigated", "").lower() == "challenge":
             raise RuntimeError("Protected by anti-bot verification. Open in your browser and send the direct file link.")
@@ -2336,7 +2441,7 @@ class Mirror:
         return bundle
 
     def resolve_item(self, item: dict) -> dict:
-        if item.get("_resolved") or item.get("type") in ("gdrive", "ytdl", "tg_media"):
+        if item.get("_resolved") or item.get("type") in ("gdrive", "ytdl", "tg_media", "sf_folder"):
             return item
         target = item.get("sourceUrl") or item.get("url") or ""
         if not target:
@@ -2361,10 +2466,89 @@ class Mirror:
                 updated["_resolved"] = True
                 return updated
         except Exception as e:
-            if item.get("sourceUrl") and item.get("url"):
+            cur_u = item.get("url") or ""
+            if item.get("sourceUrl") and cur_u and not is_sourceforge_url(cur_u):
                 return item
             raise RuntimeError(str(e))
         return item
+
+    def sf_folder_download(self, item: dict, dest_dir: Path) -> Path:
+        folder_url = item.get("url") or ""
+        project = item.get("project") or ""
+        rel_path = (item.get("relPath") or "").strip("/")
+        folder_name = self.single_name() or item.get("name") or project or f"SourceForge_{JOB_ID}"
+        safe_folder = re.sub(r'[/\\?%*:|"<>]', "_", folder_name).strip() or f"SourceForge_{JOB_ID}"
+        out_root = dest_dir / safe_folder
+        out_root.mkdir(parents=True, exist_ok=True)
+
+        self.tick(safe_folder, "Scanning SF Folder..", 0.0, 0, 0, 0, None, "SourceForge", force=True)
+
+        queue = [folder_url]
+        seen_pages = set()
+        found_files = []
+        seen_links = set()
+
+        while queue and len(seen_pages) < 25 and len(found_files) < 50:
+            page = queue.pop(0)
+            if page in seen_pages:
+                continue
+            seen_pages.add(page)
+            try:
+                code, body, _ = _fetch_text_resilient(page)
+                if code >= 400 or not body:
+                    continue
+            except Exception:
+                continue
+            for m in re.finditer(r"<tr\b([^>]*)>([\s\S]*?)</tr>", body, re.I):
+                tr_cls = _extract_attr(m.group(1), "class").lower()
+                hm = re.search(r'<a\b[^>]*\bhref=["\']([^"\']+)["\']', m.group(2), re.I)
+                if not hm:
+                    continue
+                abs_u = urllib.parse.urljoin(page, html.unescape(hm.group(1)))
+                if re.search(r"\bfile\b", tr_cls) and "/files/" in abs_u and abs_u.endswith("/download"):
+                    if abs_u.lower().endswith("/files/latest/download"):
+                        continue
+                    if abs_u not in seen_links:
+                        seen_links.add(abs_u)
+                        found_files.append(abs_u)
+                        if len(found_files) >= 50:
+                            break
+                elif re.search(r"\bfolder\b", tr_cls) and "/files/" in abs_u and not abs_u.endswith("/download"):
+                    clean_d = abs_u.split("#")[0].split("?")[0]
+                    if clean_d not in seen_pages and clean_d not in queue:
+                        queue.append(clean_d)
+
+        if not found_files and project:
+            rss_path = f"/{rel_path}" if rel_path else "/"
+            rss_url = f"https://sourceforge.net/projects/{urllib.parse.quote(project)}/rss?path={urllib.parse.quote(rss_path)}"
+            try:
+                code, xml_text, _ = _fetch_text_resilient(rss_url, accept="application/rss+xml, application/xml, text/xml")
+                if code < 400 and xml_text:
+                    for lm in re.finditer(r"<link>(https?://sourceforge\.net/projects/[^<]+/download)</link>", xml_text, re.I):
+                        lnk = html.unescape(lm.group(1).strip())
+                        if not lnk.lower().endswith("/files/latest/download") and lnk not in seen_links:
+                            seen_links.add(lnk)
+                            found_files.append(lnk)
+                            if len(found_files) >= 50:
+                                break
+            except Exception:
+                pass
+
+        if not found_files:
+            raise RuntimeError("No downloadable files found in this SourceForge project/folder.")
+
+        for idx_f, f_url in enumerate(found_files, 1):
+            if cancelled:
+                raise InterruptedError("Cancelled by user")
+            resolved = resolve_download_url(f_url)
+            dl_url = resolved.get("url") or f_url
+            fname = urllib.parse.unquote(urllib.parse.urlparse(dl_url).path.rstrip("/").split("/")[-1]) or f"file_{idx_f}"
+            if fname == "download":
+                parts = [p for p in urllib.parse.urlparse(f_url).path.split("/") if p]
+                if len(parts) >= 2 and parts[-1] == "download":
+                    fname = urllib.parse.unquote(parts[-2])
+            self.aria_download(dl_url, out_root, out_name=fname, label=f"[{idx_f}/{len(found_files)}] {fname}")
+        return out_root
 
     async def _kurigram_download_item(self, item: dict, dest_dir: Path) -> Path:
         global cancelled
@@ -2497,6 +2681,8 @@ class Mirror:
     def acquire_local(self, item: dict, dest_dir: Path) -> Path:
         """Downloads an item to local disk (used for extract/zip modes, yt-dlp, Telegram media, and URL items)."""
         item = self.resolve_item(item)
+        if item.get("type") == "sf_folder":
+            return self.sf_folder_download(item, dest_dir)
         if item.get("type") == "tg_media":
             return self.tg_download(item, dest_dir)
         if item.get("type") == "ytdl":
