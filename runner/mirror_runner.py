@@ -3081,11 +3081,16 @@ class Mirror:
             else:
                 if is_gc_temp:
                     text += f"\n\n<blockquote>{GC_TEMP_NOTICE_HTML}</blockquote>"
+                primary_label = (
+                    ("⬇ Download Folder" if r.get("isDir") else "⬇ Download File")
+                    if is_gc_temp
+                    else ("▸  Open Folder" if r.get("isDir") else "▸  Open File")
+                )
                 rows = [[
-                    {"text": "▸  Open Folder" if r.get("isDir") else "▸  Open File", "url": r["link"], "style": "success"},
+                    {"text": primary_label, "url": r["link"], "style": "success"},
                     {"text": "Open Folder", "url": self.folder_url(), "style": "primary"},
                 ]]
-                if r.get("direct"):
+                if r.get("direct") and not is_gc_temp:
                     rows.append([{"text": "⬇ Direct Download", "url": r["direct"], "style": "primary"}])
                 if can_req_perm:
                     rows.append([{"text": "📌 Request Permanent Storage", "callback_data": f"perm_req:{JOB_ID}", "style": "primary"}])

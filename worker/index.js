@@ -58,7 +58,9 @@ function getStore(env) {
     k.startsWith('history:') ||
     k.startsWith('folder:') ||
     k.startsWith('auth:') ||
-    k.startsWith('gc_');
+    k.startsWith('gc_') ||
+    k.startsWith('stats:') ||
+    k.startsWith('user_index:');
   return {
     async get(k) {
       const res = await stub.fetch(`https://state.do/kv?k=${encodeURIComponent(k)}`);
@@ -770,17 +772,18 @@ function buildTaskMenuKeyboard(task) {
     } else {
       rows.push([{ text: destBtnText, callback_data: `tm_dest:${tid}`, style: 'primary' }]);
     }
-    if (isGofile && task.hasDrive && !task.isSharedGcTemp) {
-      rows.push([{ text: `Drive Folder: ${folderShort}`, callback_data: `tm_dir:${tid}` }]);
-    }
   } else {
     rows.push([{ text: destBtnText, callback_data: `tm_dest:${tid}`, style: 'primary' }]);
     if (canRename) {
-      rows.push([
-        { text: renLabel, callback_data: `tm_ren:${tid}` },
-        { text: `Upload: ${folderShort}`, callback_data: `tm_dir:${tid}` }
-      ]);
-    } else {
+      if (task.hasDrive) {
+        rows.push([
+          { text: renLabel, callback_data: `tm_ren:${tid}` },
+          { text: `Upload: ${folderShort}`, callback_data: `tm_dir:${tid}` }
+        ]);
+      } else {
+        rows.push([{ text: renLabel, callback_data: `tm_ren:${tid}` }]);
+      }
+    } else if (task.hasDrive) {
       rows.push([{ text: `Upload: ${folderShort}`, callback_data: `tm_dir:${tid}` }]);
     }
   }
@@ -1191,6 +1194,210 @@ async function getChatsMap(env) {
 
 async function saveChatsMap(map, env) {
   await getStore(env).put('auth:chats', JSON.stringify(map || {}));
+}
+
+async function getUserStats(userId, env) {
+  const uid = String(userId || '').trim();
+  const empty = {
+    userId: uid,
+    username: '',
+    firstName: '',
+    dmStarted: false,
+    firstSeenAt: 0,
+    lastSeenAt: 0,
+    lastDmAt: 0,
+    tried: 0,
+    succeeded: 0,
+    notDirect: 0,
+    cancelled: 0,
+    failed: 0
+  };
+  if (!uid) return empty;
+  const raw = await getStore(env).get(`stats:${uid}`);
+  if (!raw) return empty;
+  try {
+    return { ...empty, ...JSON.parse(raw), userId: uid };
+  } catch (_) {
+    return empty;
+  }
+}
+
+async function bumpUserStats(userId, increments = {}, meta = {}, env) {
+  const uid = String(userId || '').trim();
+  if (!uid || !env) return;
+  const cur = await getUserStats(uid, env);
+  const now = Date.now();
+  if (!cur.firstSeenAt) cur.firstSeenAt = now;
+  cur.lastSeenAt = now;
+  if (meta.dmStarted) {
+    cur.dmStarted = true;
+    cur.lastDmAt = meta.lastDmAt || now;
+  }
+  if (meta.username) cur.username = String(meta.username).replace(/^@/, '');
+  if (meta.firstName) cur.firstName = String(meta.firstName);
+
+  for (const field of ['tried', 'succeeded', 'notDirect', 'cancelled', 'failed']) {
+    const delta = Number(increments[field] || 0);
+    if (delta > 0) {
+      cur[field] = (Number(cur[field]) || 0) + delta;
+    }
+  }
+  await getStore(env).put(`stats:${uid}`, JSON.stringify(cur));
+}
+
+async function fetchTelegramPrivateChat(chatRef, env) {
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getChat?chat_id=${encodeURIComponent(chatRef)}`);
+    const data = await res.json();
+    if (data?.ok && data.result?.id && (!data.result.type || data.result.type === 'private')) {
+      return data.result;
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function buildUserStatusReport(rawInput, actorObj, env) {
+  let userId = '';
+  let username = '';
+  let firstName = '';
+
+  const admins = await getAdminsMap(env);
+  const pending = await getPendingAdminsMap(env);
+
+  if (actorObj && actorObj.id) {
+    userId = String(actorObj.id);
+    username = actorObj.username || '';
+    firstName = [actorObj.first_name, actorObj.last_name].filter(Boolean).join(' ') || username || '';
+  } else {
+    const token = String(rawInput || '').trim().split(/\s+/)[0];
+    if (!token) {
+      return { ok: false, error: 'Send a valid <code>@username</code>, numeric User ID, or forward a message from the user.' };
+    }
+    if (/^\d{5,}$/.test(token)) {
+      userId = token;
+    } else {
+      const cleanUname = token.replace(/^@/, '');
+      if (!/^[a-zA-Z0-9_]{3,64}$/.test(cleanUname)) {
+        return { ok: false, error: 'Invalid input. Send a valid <code>@username</code>, numeric User ID, or forward a message from the user.' };
+      }
+      username = cleanUname;
+      const unameLow = cleanUname.toLowerCase();
+      const idxRaw = await getStore(env).get(`user_index:${unameLow}`);
+      if (idxRaw) {
+        try {
+          const idx = JSON.parse(idxRaw);
+          if (idx?.userId) {
+            userId = String(idx.userId);
+            username = idx.username || username;
+            firstName = idx.firstName || '';
+          }
+        } catch (_) {}
+      }
+      if (!userId) {
+        for (const [uid, a] of Object.entries(admins)) {
+          if ((a.username || '').toLowerCase() === unameLow) {
+            userId = String(uid);
+            username = a.username || username;
+            firstName = a.firstName || '';
+            break;
+          }
+        }
+      }
+      if (!userId) {
+        const tgChat = await fetchTelegramPrivateChat(`@${cleanUname}`, env);
+        if (tgChat) {
+          userId = String(tgChat.id);
+          username = tgChat.username || username;
+          firstName = [tgChat.first_name, tgChat.last_name].filter(Boolean).join(' ') || '';
+        }
+      }
+    }
+  }
+
+  if (userId && (!username || !firstName)) {
+    const admRec = admins[userId];
+    if (admRec) {
+      username = username || admRec.username || '';
+      firstName = firstName || admRec.firstName || '';
+    }
+  }
+
+  const stats = userId ? await getUserStats(userId, env) : await getUserStats('', env);
+  username = username || stats.username || '';
+  firstName = firstName || stats.firstName || '';
+
+  if (userId && !firstName && !username) {
+    const tgChat = await fetchTelegramPrivateChat(userId, env);
+    if (tgChat) {
+      username = tgChat.username || '';
+      firstName = [tgChat.first_name, tgChat.last_name].filter(Boolean).join(' ') || '';
+    }
+  }
+
+  const unameLow = (username || '').toLowerCase();
+  let adminStatus = '❌ Not an Admin';
+  if (userId && isOwner(userId, env)) {
+    adminStatus = '👑 Owner';
+  } else if (userId && admins[userId]) {
+    adminStatus = '✅ Admin';
+  } else if (unameLow && pending[unameLow]) {
+    adminStatus = '⏳ Pending Admin (auto-activates on first bot DM)';
+  }
+
+  let dmStartedText = '❌ No (has not started bot in DM)';
+  if (stats.dmStarted) {
+    const ago = stats.lastDmAt ? ` · Last active ${new Date(stats.lastDmAt).toISOString().slice(0, 10)}` : '';
+    dmStartedText = `✅ Yes${escapeHtml(ago)}`;
+  } else if (!userId) {
+    dmStartedText = '❌ No (never interacted with bot)';
+  }
+
+  const profile = userId ? await getUserProfile(userId, env) : null;
+  const gdriveText = hasDriveAuth(profile)
+    ? `✅ Connected (${escapeHtml(profile.email || 'Linked')})`
+    : '— Not linked';
+
+  const displayTitle = username
+    ? `@${username}${firstName && firstName.toLowerCase() !== username.toLowerCase() ? ` (${firstName})` : ''}`
+    : (firstName || `User ${userId}`);
+  const idLine = userId ? `<code>${escapeHtml(userId)}</code>` : '<i>Unknown (never interacted yet)</i>';
+
+  const text =
+    `<blockquote><b>User Status Report</b>\n\n` +
+    `${escapeHtml(displayTitle)}</blockquote>\n\n` +
+    `User ID  ·  ${idLine}\n` +
+    `Admin Status  ·  ${adminStatus}\n` +
+    `Bot Started (DM)  ·  ${dmStartedText}\n` +
+    `Google Drive  ·  ${gdriveText}\n\n` +
+    `<b>Mirror Statistics</b>\n\n` +
+    `Tried to Mirror  ·  <code>${stats.tried}</code>\n` +
+    `Succeeded  ·  <code>${stats.succeeded}</code>\n` +
+    `Not Direct Link  ·  <code>${stats.notDirect}</code>\n` +
+    `Cancelled  ·  <code>${stats.cancelled}</code>\n` +
+    `Failed  ·  <code>${stats.failed}</code>`;
+
+  return { ok: true, text };
+}
+
+async function sendOwnerStatusOverview(chatId, env, replyToMsgId = null, threadId = null) {
+  const admins = await getAdminsMap(env);
+  const pending = await getPendingAdminsMap(env);
+  const adminCount = Object.keys(admins).length;
+  const pendingCount = Object.keys(pending).length;
+
+  const text =
+    `<blockquote><b>Owner Status Center</b></blockquote>\n\n` +
+    `Approved Admins  ·  <code>${adminCount}</code>\n` +
+    `Pending Admins  ·  <code>${pendingCount}</code>\n\n` +
+    `Send <code>/status @username</code> or <code>/status &lt;user_id&gt;</code> (or reply to a user's message with <code>/status</code>) to inspect Admin status, bot start state, and mirror statistics.`;
+
+  const kb = {
+    inline_keyboard: [
+      [{ text: '🔍 Check User Status (@username / ID)', callback_data: 'st_user_prompt', style: 'primary' }],
+      [{ text: '📋 View Active Tasks', callback_data: 'st_active_tasks' }]
+    ]
+  };
+  await sendMessage(chatId, text, env, kb, replyToMsgId, threadId);
 }
 
 async function getApprovedChat(chatId, env) {
@@ -1657,6 +1864,10 @@ async function handleTelegramUpdate(update, env) {
   if (hasActor) {
     await indexTelegramUser(msg.from, env);
     await resolvePendingAdminOnSeen(msg.from, env);
+    if (isPrivate) {
+      const fullName = [msg.from.first_name, msg.from.last_name].filter(Boolean).join(' ');
+      await bumpUserStats(msg.from.id, {}, { dmStarted: true, lastDmAt: Date.now(), username: msg.from.username || '', firstName: fullName }, env);
+    }
   }
   const userId = hasActor ? msg.from.id : (isChannel ? getOwnerId(env) : (msg.from?.id || getOwnerId(env)));
   const username = hasActor
@@ -1961,6 +2172,17 @@ async function handleTelegramUpdate(update, env) {
   }
 
   if (cmd === '/tasks' || cmd === '/status') {
+    if (cmd === '/status' && isPrivate && isOwner(userId, env)) {
+      const targetArg = cmdArgs.trim().split(/\s+/)[0] || '';
+      const replyActor = msg.reply_to_message?.forward_from || msg.reply_to_message?.from || null;
+      if (targetArg || (replyActor && !replyActor.is_bot)) {
+        const rep = await buildUserStatusReport(targetArg, targetArg ? null : replyActor, env);
+        await sendMessage(chatId, rep.ok ? rep.text : rep.error, env, null, msg.message_id, threadId);
+      } else {
+        await sendOwnerStatusOverview(chatId, env, msg.message_id, threadId);
+      }
+      return;
+    }
     await sendActiveTasks(chatId, userId, env, isGroup || isChannel ? chatId : null, threadId);
     return;
   }
@@ -2183,6 +2405,9 @@ async function startTaskFromTelegramMedia(msg, tgMedia, env, ctx = {}) {
   const mCtx = await resolveMirrorContext(chatType, chatId, isChannel ? null : userId, ctx.chatRecord, env);
   const profile = mCtx.profile;
   const defaultDest = mCtx.dest;
+  if (!isChannel) {
+    await bumpUserStats(userId, { tried: 1 }, { username }, env);
+  }
 
   let duplicateExists = false;
   try {
@@ -2343,10 +2568,17 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
   const taskId = crypto.randomUUID().replace(/-/g, '').slice(0, 12);
   let task;
 
+  if (!isChannel) {
+    await bumpUserStats(userId, { tried: 1 }, { username }, env);
+  }
+
   try {
   if (hasSourceForge) {
     const expanded = await expandSourceForgeInputs(urls);
     if (expanded.error) {
+      if (!isChannel) {
+        await bumpUserStats(userId, { notDirect: 1 }, {}, env);
+      }
       const errText =
         `<blockquote><b>SourceForge Link Error</b></blockquote>\n\n` +
         `Reason  ·  <code>${escapeHtml(expanded.error)}</code>`;
@@ -2374,6 +2606,9 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       if (resolved.kind === 'ytdl') {
         ytdlUrl = resolved.finalUrl || rawUrl;
       } else if (resolved.kind === 'error') {
+        if (!isChannel) {
+          await bumpUserStats(userId, { notDirect: 1 }, {}, env);
+        }
         const errText =
           `<blockquote><b>Invalid Stream Link</b></blockquote>\n\n` +
           `Reason  ·  <code>${escapeHtml(resolved.reason)}</code>\n\n` +
@@ -2620,6 +2855,9 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
     await getStore(env).put(`task:${taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
   }
   } catch (err) {
+    if (!isChannel) {
+      await bumpUserStats(userId, { notDirect: 1 }, {}, env);
+    }
     const failText =
       `<blockquote><b>Link Inspection Failed</b></blockquote>\n\n` +
       `Reason  ·  <code>${escapeHtml(err?.message || String(err))}</code>`;
@@ -2664,6 +2902,13 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
         threadId
       );
     }
+    return;
+  }
+
+  if (promptState.type === 'status_user') {
+    if (!isOwner(userId, env)) return;
+    const rep = await buildUserStatusReport(text, msgObj?.forward_from || null, env);
+    await sendMessage(chatId, rep.ok ? rep.text : rep.error, env, null, msgId, threadId);
     return;
   }
 
@@ -2829,6 +3074,10 @@ async function handleCallbackQuery(cb, env) {
   if (cb.from && !cb.from.is_bot) {
     await indexTelegramUser(cb.from, env);
     await resolvePendingAdminOnSeen(cb.from, env);
+    if (chatType === 'private') {
+      const fullName = [cb.from.first_name, cb.from.last_name].filter(Boolean).join(' ');
+      await bumpUserStats(cb.from.id, {}, { dmStarted: true, lastDmAt: Date.now(), username: cb.from.username || '', firstName: fullName }, env);
+    }
   }
 
   if (data === 'req_admin') {
@@ -3046,6 +3295,30 @@ async function handleCallbackQuery(cb, env) {
       await editMessage(chatId, msgId, panel.text, env, panel.kb);
       return;
     }
+  }
+
+  if (data === 'st_user_prompt' || data === 'st_active_tasks') {
+    if (!isOwner(userId, env)) {
+      await answerCb(cb.id, 'Owner only.', true, env);
+      return;
+    }
+    if (data === 'st_user_prompt') {
+      await getStore(env).put(promptKey(chatId, userId), JSON.stringify({ type: 'status_user' }), { expirationTtl: 600 });
+      await answerCb(cb.id, 'Send @username or ID', false, env);
+      await sendMessage(
+        chatId,
+        `<blockquote><b>Check User Status</b></blockquote>\n\n` +
+          `Send the user's <code>@username</code>, numeric User ID, or forward a message from them — or /cancel:`,
+        env,
+        null,
+        null,
+        threadId
+      );
+      return;
+    }
+    await answerCb(cb.id, 'Loading active tasks...', false, env);
+    await sendActiveTasks(chatId, userId, env, null, threadId);
+    return;
   }
 
   if (data.startsWith('perm_req:')) {
@@ -3364,6 +3637,9 @@ async function handleCallbackQuery(cb, env) {
 
     if (action === 'tm_cancel') {
       await getStore(env).delete(`task:${tid}`);
+      if (!task.isChannel) {
+        await bumpUserStats(task.userId || userId, { cancelled: 1 }, {}, env);
+      }
       await editMessage(chatId, msgId, `<blockquote><b>Task Cancelled</b></blockquote>`, env);
       await answerCb(cb.id, 'Cancelled', false, env);
       return;
@@ -4204,10 +4480,10 @@ async function executeDirectDriveCopy(task, item, accessToken, env) {
     }
 
     const rows = [[
-      { text: '▸  Open File', url: fileLink, style: 'success' },
+      { text: task.isSharedGcTemp ? '⬇ Download File' : '▸  Open File', url: fileLink, style: 'success' },
       { text: 'Open Folder', url: folderUrl, style: 'primary' }
     ]];
-    if (direct) {
+    if (direct && !task.isSharedGcTemp) {
       rows.push([{ text: '⬇ Direct Download', url: direct, style: 'primary' }]);
     }
     if (task.isSharedGcTemp && status === 'completed' && fid && size <= PERM_REQ_MAX_BYTES) {
@@ -4246,7 +4522,13 @@ async function executeDirectDriveCopy(task, item, accessToken, env) {
       shared,
       ts: Date.now()
     }], env);
+    if (!task.isChannel) {
+      await bumpUserStats(task.userId || userId, { succeeded: 1 }, {}, env);
+    }
   } catch (err) {
+    if (!task.isChannel) {
+      await bumpUserStats(task.userId || userId, { failed: 1 }, {}, env);
+    }
     const reason = friendlyDriveError(err.message) || err.message || 'Drive copy failed';
     await editMessage(
       chatId,
@@ -4340,6 +4622,11 @@ async function handleInternalRunner(request, path, env) {
 
   if (path === '/internal/complete') {
     job.status = body.status || 'completed';
+    if (!job.statsRecorded && !job.isChannel) {
+      job.statsRecorded = true;
+      const statField = job.status === 'cancelled' ? 'cancelled' : (job.status === 'failed' ? 'failed' : 'succeeded');
+      await bumpUserStats(job.userId, { [statField]: 1 }, {}, env);
+    }
     await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 3600 });
     await removeActiveJobForUser(job.userId, jobId, env);
 
@@ -4472,6 +4759,10 @@ async function cancelActiveJob(chatId, userId, jobId, env, threadId = null) {
   }
   job.cancelled = true;
   job.status = 'cancelled';
+  if (!job.statsRecorded && !job.isChannel) {
+    job.statsRecorded = true;
+    await bumpUserStats(job.userId, { cancelled: 1 }, {}, env);
+  }
   await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 3600 });
   await removeActiveJobForUser(job.userId, jobId, env);
 
@@ -4660,6 +4951,7 @@ async function sendHelpScreen(chatId, userId, env, opts = {}) {
   if (!opts.isGroup && isOwnerUser) {
     adminLines += `\n\n<b>Owner Commands</b>\n\n` +
       `/admin — Manage Admins &amp; Authorized Groups/Channels\n\n` +
+      `<code>/status @username</code> — Check Admin status, bot start &amp; mirror stats\n\n` +
       `<code>/auth &lt;id&gt;</code> / <code>/unauth &lt;id&gt;</code> — Quick approve or revoke a user/chat ID\n\n` +
       `/authorize — Approve the current group/channel`;
   }
