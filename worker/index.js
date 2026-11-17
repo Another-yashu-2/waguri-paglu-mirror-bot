@@ -666,6 +666,10 @@ function buildTaskMenuMessage(task) {
   let extras = '';
   if (task.batch) {
     extras += `\n✓ <b>Batch:</b> <code>${task.items.length} links</code>`;
+    const gfCount = task.items.filter(i => i.type === 'gofile').length;
+    if (gfCount > 0) {
+      extras += `\n✓ <b>Gofile:</b> <code>${gfCount} link(s)</code>`;
+    }
   } else if (task.isYtdl) {
     extras += `\n✓ <b>Media:</b> <code>${escapeHtml(truncate(task.detectedName || 'Media Link', 56))}</code>`;
     if (task.mediaAuthor) {
@@ -679,6 +683,17 @@ function buildTaskMenuMessage(task) {
     extras += `\n✓ <b>Source:</b> Telegram MTProto (Kurigram)`;
   } else if (task.isDrive) {
     extras += `\n✓ <b>Source:</b> ${task.isFolder ? 'Google Drive Folder' : (isGofile ? 'Google Drive' : 'Google Drive (Server-Side)')}`;
+  } else if (task.isGofileSource) {
+    extras += `\n✓ <b>Source:</b> Gofile ${task.isFolder ? 'Folder' : 'File'}`;
+    if (task.detectedName) {
+      extras += `\n✓ <b>Name:</b> <code>${escapeHtml(truncate(task.detectedName, 56))}</code>`;
+    }
+    if (task.fileSize > 0) {
+      extras += `\n✓ <b>Size:</b> <code>${fmtBytes(task.fileSize)}</code>`;
+    }
+    if (task.isFolder && task.gofileChildrenCount > 0) {
+      extras += `\n✓ <b>Items:</b> <code>${task.gofileChildrenCount}</code>`;
+    }
   } else if (task.resolvedVia) {
     extras += `\n✓ <b>Extracted:</b> ${escapeHtml(task.resolvedVia)}`;
   }
@@ -2595,6 +2610,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
   const defaultDest = mCtx.dest;
 
   const hasSourceForge = urls.some(u => isSourceForgeUrl(u));
+  const hasGofile = urls.some(u => isGofileUrl(u));
   const isBatchInitial = urls.length > 1;
   const allMediaInitial = forceYtdl || urls.every(u => isMediaSiteUrl(u));
   let checkingMsgId = editExistingMsgId;
@@ -2603,11 +2619,13 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       chatId,
       hasSourceForge
         ? `<blockquote><b>Generating download link...</b>\n\n<i>Fetching direct SourceForge mirror link...</i></blockquote>`
-        : isBatchInitial
-          ? `<blockquote><b>Preparing Batch</b>\n\n<i>Queued ${urls.length} links...</i></blockquote>`
-          : allMediaInitial
-            ? `<blockquote><b>Inspecting Media</b>\n\n<i>Fetching title and preparing yt-dlp options...</i></blockquote>`
-            : `<blockquote><b>Inspecting Link</b>\n\n<i>Verifying stream headers and file size...</i></blockquote>`,
+        : hasGofile
+          ? `<blockquote><b>Inspecting Gofile...</b>\n\n<i>Reading file/folder metadata from the Gofile API...</i></blockquote>`
+          : isBatchInitial
+            ? `<blockquote><b>Preparing Batch</b>\n\n<i>Queued ${urls.length} links...</i></blockquote>`
+            : allMediaInitial
+              ? `<blockquote><b>Inspecting Media</b>\n\n<i>Fetching title and preparing yt-dlp options...</i></blockquote>`
+              : `<blockquote><b>Inspecting Link</b>\n\n<i>Verifying stream headers and file size...</i></blockquote>`,
       env,
       null,
       replyToMsgId,
@@ -2653,7 +2671,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
 
     if (!ytdlUrl) {
       accessToken = hasDrive ? await getValidAccessToken(mCtx.credUserId, env) : null;
-      resolved = await resolveAndInspectInput(rawUrl, accessToken);
+      resolved = await resolveAndInspectInput(rawUrl, accessToken, env);
 
       if (resolved.kind === 'ytdl') {
         ytdlUrl = resolved.finalUrl || rawUrl;
@@ -2739,6 +2757,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       const isDrive = resolved.kind === 'gdrive';
       const isTgMedia = resolved.kind === 'tg_media';
       const isSfFolder = resolved.kind === 'sf_folder';
+      const isGofileSource = resolved.kind === 'gofile';
       const fileUrl = resolved.finalUrl;
 
       let duplicateExists = false;
@@ -2766,14 +2785,16 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
           ? resolved.tgInfo
           : isSfFolder
             ? resolved.sfInfo
-            : {
-                type: 'url',
-                url: fileUrl,
-                sourceUrl: resolved.sourceUrl || '',
-                resolvedVia: resolved.resolvedVia || '',
-                name: verification.fileName,
-                size: verification.sizeBytes || 0
-              };
+            : isGofileSource
+              ? resolved.gofileInfo
+              : {
+                  type: 'url',
+                  url: fileUrl,
+                  sourceUrl: resolved.sourceUrl || '',
+                  resolvedVia: resolved.resolvedVia || '',
+                  name: verification.fileName,
+                  size: verification.sizeBytes || 0
+                };
 
       task = {
         taskId,
@@ -2795,6 +2816,8 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         isFolder: !!verification.isFolder,
         isYtdl: false,
         isTgMedia,
+        isGofileSource,
+        gofileChildrenCount: isGofileSource ? (resolved.gofileInfo?.childrenCount || 0) : 0,
         resolvedVia: resolved.resolvedVia || '',
         detectedName: verification.fileName,
         customName: '',
@@ -2836,6 +2859,10 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       if (gd) {
         return { type: 'gdrive', id: gd.id, resourceKey: gd.resourceKey || '' };
       }
+      const gf = parseGofileUrl(u);
+      if (gf) {
+        return { type: 'gofile', id: gf.id, url: u, name: guessNameFromUrl(u) };
+      }
       return { type: 'url', url: u, name: guessNameFromUrl(u) };
     });
 
@@ -2859,6 +2886,8 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       isDrive: items.every(i => i.type === 'gdrive'),
       isFolder: false,
       isYtdl: batchHasYtdl,
+      isGofileSource: items.some(i => i.type === 'gofile'),
+      gofileChildrenCount: 0,
       ytQuality: profile.ytQuality || 'best',
       ytContainer: profile.ytContainer || 'mp4',
       ytSubs: false,
@@ -5307,6 +5336,217 @@ function uaForUrl(rawUrl) {
   return isSourceForgeUrl(rawUrl) ? WGET_UA : DEFAULT_UA;
 }
 
+// ============================================================================
+// GOFILE SOURCE (download FROM Gofile)
+// Gofile's store links are authorized by the same guest token that listed the
+// content. The website token is derived from UA + account token + a rotating
+// salt; the salt lives (hex-escaped) in https://gofile.io/js/wt.obf.js.
+// ============================================================================
+
+const GOFILE_API_BASE = 'https://api.gofile.io';
+const GOFILE_DEFAULT_WT_SALT = '12af056dacea0b';
+let gofileSaltCache = { salt: '', at: 0 };
+
+function isGofileHost(host) {
+  const h = String(host || '').toLowerCase().replace(/^www\./, '');
+  return h === 'gofile.io' || h.endsWith('.gofile.io');
+}
+
+function isGofileUrl(rawUrl) {
+  return !!parseGofileUrl(rawUrl);
+}
+
+function isGofileContentId(value) {
+  const v = String(value || '').trim();
+  if (!v) return false;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)) return true;
+  if (!/^[A-Za-z0-9]{8}$/.test(v)) return false;
+  return !['download', 'contents', 'accounts', 'uploadfile', 'createfolder'].includes(v.toLowerCase());
+}
+
+function parseGofileUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    const host = u.hostname.toLowerCase().replace(/^www\./, '');
+    if (!isGofileHost(host)) return null;
+
+    for (const key of ['c', 'id', 'contentId', 'code']) {
+      const v = (u.searchParams.get(key) || '').trim();
+      if (isGofileContentId(v)) {
+        return { id: v, host, url: u.toString(), isStore: host !== 'gofile.io' };
+      }
+    }
+
+    const segs = u.pathname.split('/').filter(Boolean).map(s => decodeURIComponent(s));
+    let cand = '';
+    if (segs[0] === 'd' && segs[1]) cand = segs[1];
+    else if (segs[0] === 'download' && segs[1]) cand = segs[1] === 'web' ? (segs[2] || '') : segs[1];
+    else if (segs[0] === 'f' && segs[1]) cand = segs[1];
+    if (isGofileContentId(cand)) {
+      return { id: cand, host, url: u.toString(), isStore: host !== 'gofile.io' };
+    }
+
+    const uuid = u.pathname.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    if (uuid) return { id: uuid[0], host, url: u.toString(), isStore: host !== 'gofile.io' };
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function gofileWebsiteToken(ua, token, salt) {
+  const slot = Math.floor(Date.now() / 1000 / 14400);
+  const raw = `${ua}::en-US::${token}::${slot}::${salt}`;
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function getGofileWtSalt(env, force = false) {
+  const override = String(env?.GOFILE_WT_SALT || '').trim();
+  if (override) return override;
+  if (!force && gofileSaltCache.salt && Date.now() - gofileSaltCache.at < 60 * 60 * 1000) {
+    return gofileSaltCache.salt;
+  }
+  try {
+    const res = await fetchWithTimeout(
+      'https://gofile.io/js/wt.obf.js',
+      { headers: { 'User-Agent': DEFAULT_UA, Accept: '*/*' } },
+      6000
+    );
+    if (res.ok) {
+      const text = await res.text();
+      const decoded = text.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+      const hits = decoded.match(/[0-9a-f]{12,20}/g) || [];
+      const salt = hits.find(s => /[a-f]/.test(s) && /\d/.test(s)) || hits[0];
+      if (salt) {
+        gofileSaltCache = { salt, at: Date.now() };
+        return salt;
+      }
+    }
+  } catch (_) {}
+  return GOFILE_DEFAULT_WT_SALT;
+}
+
+async function gofileApiFetch(path, opts = {}) {
+  const {
+    method = 'GET',
+    token = '',
+    env,
+    body = null,
+    timeoutMs = 9000,
+    retrySalt = true
+  } = opts;
+  const ua = DEFAULT_UA;
+
+  const doFetch = async (salt) => {
+    const wt = await gofileWebsiteToken(ua, token, salt);
+    const headers = {
+      'User-Agent': ua,
+      'X-Website-Token': wt,
+      'X-BL': 'en-US',
+      Accept: '*/*',
+      Origin: 'https://gofile.io',
+      Referer: 'https://gofile.io/'
+    };
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+      headers.Cookie = `accountToken=${token}`;
+    }
+    if (body !== null) headers['Content-Type'] = 'application/json';
+    const res = await fetchWithTimeout(`${GOFILE_API_BASE}${path}`, {
+      method,
+      headers,
+      body: body === null ? undefined : (typeof body === 'string' ? body : JSON.stringify(body)),
+      redirect: 'follow'
+    }, timeoutMs);
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    return { res, data };
+  };
+
+  let salt = await getGofileWtSalt(env);
+  let out = await doFetch(salt);
+  if (retrySalt && out.data?.status === 'error-notPremium') {
+    salt = await getGofileWtSalt(env, true);
+    out = await doFetch(salt);
+  }
+  return out;
+}
+
+async function gofileGuestToken(env) {
+  const { res, data } = await gofileApiFetch('/accounts', { method: 'POST', body: {}, env });
+  const token = data?.data?.token;
+  if (!res.ok || data?.status !== 'ok' || !token) {
+    throw new Error(data?.status || `HTTP ${res.status}`);
+  }
+  return token;
+}
+
+async function inspectGofileLink(info, env) {
+  try {
+    const token = await gofileGuestToken(env);
+    const { res, data } = await gofileApiFetch(
+      `/contents/${encodeURIComponent(info.id)}?cache=true&page=1&pageSize=1000&sortField=createTime&sortDirection=1`,
+      { token, env, timeoutMs: 10000 }
+    );
+    const status = data?.status;
+    const d = data?.data || {};
+    if (status === 'error-notFound' || res.status === 404) {
+      return { valid: false, reason: 'Gofile content was not found (expired, deleted, or invalid link).' };
+    }
+    if (status !== 'ok' || !d.id) {
+      return { valid: false, reason: `Gofile API error: ${status || `HTTP ${res.status}`}` };
+    }
+    if (d.canAccess === false) {
+      return { valid: false, reason: 'This Gofile content is not publicly accessible.' };
+    }
+    const isFolder = d.type === 'folder';
+    const name = String(d.name || '').trim() || `Gofile_${String(info.id).slice(0, 8)}`;
+    const size = isFolder ? Number(d.totalSize || 0) : Number(d.size || 0);
+    return {
+      valid: true,
+      fileName: name,
+      sizeBytes: size,
+      contentType: isFolder ? 'inode/directory' : (d.mimetype || 'application/octet-stream'),
+      acceptRanges: true,
+      isFolder,
+      gofileMeta: {
+        id: d.id || info.id,
+        name,
+        size,
+        childrenCount: isFolder ? Number(d.childrenCount || 0) : 0,
+        md5: d.md5 || '',
+        type: d.type || 'file'
+      }
+    };
+  } catch (err) {
+    // Cloudflare egress can be blocked by Gofile. Keep the task usable and let
+    // the runner inspect with Chrome impersonation.
+    const guess = guessNameFromUrl(info.url || '') || `Gofile_${String(info.id).slice(0, 8)}`;
+    return {
+      valid: true,
+      fallback: true,
+      fileName: guess,
+      sizeBytes: 0,
+      contentType: 'application/octet-stream',
+      acceptRanges: true,
+      isFolder: false,
+      gofileMeta: { id: info.id, name: guess, size: 0, childrenCount: 0, md5: '', type: 'file' },
+      warning: `Gofile metadata unavailable from Worker (${err?.message || err}); runner will inspect.`
+    };
+  }
+}
+
 function normalizeSourceForgeUrl(rawUrl) {
   try {
     const u = new URL(rawUrl);
@@ -5844,7 +6084,39 @@ function parseMetaFromResponse(res, fallbackUrl) {
   };
 }
 
-async function resolveAndInspectInput(rawUrl, accessToken) {
+async function resolveAndInspectInput(rawUrl, accessToken, env) {
+  const gofileInfo = parseGofileUrl(rawUrl);
+  if (gofileInfo) {
+    const inspection = await inspectGofileLink(gofileInfo, env);
+    if (!inspection.valid) {
+      return { kind: 'error', reason: inspection.reason };
+    }
+    return {
+      kind: 'gofile',
+      gofileInfo: {
+        type: 'gofile',
+        id: inspection.gofileMeta?.id || gofileInfo.id,
+        url: rawUrl,
+        name: inspection.fileName,
+        size: inspection.sizeBytes || 0,
+        isFolder: !!inspection.isFolder,
+        childrenCount: inspection.gofileMeta?.childrenCount || 0,
+        md5: inspection.gofileMeta?.md5 || ''
+      },
+      verification: {
+        valid: true,
+        fileName: inspection.fileName,
+        sizeBytes: inspection.sizeBytes || 0,
+        contentType: inspection.contentType || 'application/octet-stream',
+        acceptRanges: true,
+        isFolder: !!inspection.isFolder
+      },
+      finalUrl: rawUrl,
+      sourceUrl: '',
+      resolvedVia: inspection.fallback ? 'Gofile (Runner Metadata)' : 'Gofile API'
+    };
+  }
+
   let currentUrl = normalizeSourceForgeUrl(rawUrl);
   const sfInit = isSourceForgeUrl(currentUrl) ? parseSourceForgeProjectPath(currentUrl) : null;
   if (sfInit && sfInit.kind === 'folder') {

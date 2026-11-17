@@ -9,6 +9,7 @@ crons = ["0 */6 * * *"]
 GITHUB_OWNER = "ur-yashu"
 GITHUB_REPO = "waguri-paglu-mirror-bot"
 GITHUB_WORKFLOW = "mirror.yml"
+WORKER_URL = "https://telegram-gdrive-bot.yashdaive.workers.dev"
 
 [[kv_namespaces]]
 binding = "SETTINGS_KV"

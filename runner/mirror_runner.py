@@ -13,6 +13,7 @@ Job item types:
 
 import asyncio
 import base64
+import hashlib
 import html
 import http.client
 import http.server
@@ -881,6 +882,211 @@ def _resolve_sf_via_cffi(raw_url: str) -> str:
     raise RuntimeError("Could not extract direct download link from SourceForge page (anti-bot blocked).")
 
 
+# ============================================================================
+# GOFILE SOURCE (download FROM Gofile)
+# ============================================================================
+
+GOFILE_API_BASE = "https://api.gofile.io"
+GOFILE_DEFAULT_WT_SALT = "12af056dacea0b"
+_GOFILE_SALT_CACHE = {"salt": "", "at": 0.0}
+
+
+def _is_gofile_id(value: str) -> bool:
+    v = (value or "").strip()
+    if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", v, re.I):
+        return True
+    if re.fullmatch(r"[A-Za-z0-9]{8}", v):
+        return v.lower() not in {"download", "contents", "accounts", "uploadfile", "createfolder"}
+    return False
+
+
+def gofile_parse_id(raw_url: str) -> str:
+    try:
+        u = urllib.parse.urlparse(raw_url)
+        host = (u.hostname or "").lower().replace("www.", "", 1)
+        if host != "gofile.io" and not host.endswith(".gofile.io"):
+            return ""
+        q = urllib.parse.parse_qs(u.query)
+        for key in ("c", "id", "contentId", "code"):
+            for value in q.get(key, []):
+                if _is_gofile_id(value):
+                    return value
+        segs = [urllib.parse.unquote(s) for s in u.path.split("/") if s]
+        cand = ""
+        if len(segs) >= 2 and segs[0] == "d":
+            cand = segs[1]
+        elif len(segs) >= 2 and segs[0] == "download":
+            cand = segs[2] if (segs[1] == "web" and len(segs) >= 3) else segs[1]
+        elif len(segs) >= 2 and segs[0] == "f":
+            cand = segs[1]
+        if _is_gofile_id(cand):
+            return cand
+        m = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", u.path, re.I)
+        return m.group(0) if m else ""
+    except Exception:
+        return ""
+
+
+def gofile_name_from_url(raw_url: str) -> str:
+    try:
+        u = urllib.parse.urlparse(raw_url)
+        segs = [urllib.parse.unquote(s) for s in u.path.split("/") if s]
+        if len(segs) >= 3 and segs[0] == "download":
+            return segs[-1]
+    except Exception:
+        pass
+    return ""
+
+
+def gofile_salt(refresh: bool = False) -> str:
+    env_salt = (os.environ.get("GOFILE_WT_SALT") or "").strip()
+    if env_salt:
+        return env_salt
+    now = time.time()
+    cached = _GOFILE_SALT_CACHE.get("salt") or ""
+    if not refresh and cached and now - float(_GOFILE_SALT_CACHE.get("at") or 0) < 3600:
+        return cached
+    try:
+        code, body, _ = _fetch_text_resilient(
+            "https://gofile.io/js/wt.obf.js",
+            accept="application/javascript,text/javascript,*/*",
+        )
+        if code < 400 and body:
+            decoded = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), body)
+            hits = re.findall(r"[0-9a-f]{12,20}", decoded)
+            salt = next((s for s in hits if re.search(r"[a-f]", s) and re.search(r"\d", s)), hits[0] if hits else "")
+            if salt:
+                _GOFILE_SALT_CACHE.update({"salt": salt, "at": now})
+                return salt
+    except Exception:
+        pass
+    return GOFILE_DEFAULT_WT_SALT
+
+
+def gofile_website_token(ua: str, token: str, salt: str = None) -> str:
+    salt = salt or gofile_salt()
+    slot = int(time.time() // 14400)
+    raw = f"{ua}::en-US::{token}::{slot}::{salt}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def gofile_http(
+    url: str,
+    method: str = "GET",
+    token: str = "",
+    body: bytes = None,
+    range_header: str = None,
+    timeout: int = 40,
+    allow_redirects: bool = False,
+    refresh_salt: bool = False,
+    extra_headers: dict = None,
+):
+    """Low-level Gofile HTTP call with Chrome impersonation and urllib fallback."""
+    ua = DEFAULT_UA
+    salt = gofile_salt(refresh=refresh_salt)
+    wt = gofile_website_token(ua, token, salt)
+    headers = {
+        "User-Agent": ua,
+        "Accept": "*/*",
+        "Origin": "https://gofile.io",
+        "Referer": "https://gofile.io/",
+        "X-Website-Token": wt,
+        "X-BL": "en-US",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["Cookie"] = f"accountToken={token}"
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    if range_header:
+        headers["Range"] = range_header
+    if extra_headers:
+        headers.update(extra_headers)
+
+    try:
+        _prepare_pkg_paths()
+        try:
+            from curl_cffi import requests as cffi_req
+        except ImportError:
+            _pip_install_target(["curl_cffi"], _TG_PKG_TARGET)
+            from curl_cffi import requests as cffi_req
+        sess = cffi_req.Session(impersonate="chrome")
+        resp = sess.request(
+            method,
+            url,
+            headers=headers,
+            data=body,
+            timeout=timeout,
+            allow_redirects=allow_redirects,
+        )
+        try:
+            return resp.status_code, {k.lower(): v for k, v in resp.headers.items()}, resp.content or b""
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    opener = urllib.request.build_opener() if allow_redirects else _NO_REDIR_OPENER
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
+
+
+def gofile_api_json(path_or_url: str, token: str = "", method: str = "GET", body: dict = None, refresh_salt: bool = False):
+    url = path_or_url if path_or_url.startswith("http") else f"{GOFILE_API_BASE}{path_or_url}"
+    payload = None
+    if method.upper() != "GET":
+        payload = json.dumps(body if body is not None else {}).encode("utf-8")
+    status, _headers, raw = gofile_http(
+        url,
+        method=method,
+        token=token,
+        body=payload,
+        timeout=40,
+        allow_redirects=True,
+        refresh_salt=refresh_salt,
+    )
+    try:
+        return status, json.loads(raw.decode("utf-8", "ignore"))
+    except Exception:
+        return status, {"status": f"http-{status}", "raw": raw[:200].decode("utf-8", "ignore")}
+
+
+def gofile_new_account() -> str:
+    status, data = gofile_api_json("/accounts", method="POST", body={})
+    if data.get("status") == "error-notPremium":
+        status, data = gofile_api_json("/accounts", method="POST", body={}, refresh_salt=True)
+    token = (data.get("data") or {}).get("token")
+    if not token:
+        raise RuntimeError(f"Could not create Gofile guest account (HTTP {status}, status={data.get('status')})")
+    mask_secret(token)
+    return token
+
+
+def gofile_error_text(status: str) -> str:
+    if status == "error-notPremium":
+        return "Gofile rejected the guest website token (salt may have rotated)."
+    if status == "error-rateLimit":
+        return "Gofile rate limit reached. Try again in a few minutes."
+    if status == "error-notFound":
+        return "Gofile content was not found (expired, deleted, or invalid link)."
+    return f"Gofile API error: {status or 'unknown'}"
+
+
+def md5_file(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def resolve_download_url(raw_url: str) -> dict:
     cur = raw_url
     visited = set()
@@ -888,6 +1094,10 @@ def resolve_download_url(raw_url: str) -> dict:
         tg = parse_telegram_post_url(cur)
         if tg:
             return tg
+
+        gid = gofile_parse_id(cur)
+        if gid:
+            return {"type": "gofile", "id": gid, "url": cur, "name": gofile_name_from_url(cur)}
 
         gd = parse_drive_url(cur)
         if gd:
@@ -1343,6 +1553,7 @@ class Mirror:
         self.gofile_root_id = ""
         self.gofile_link = ""
         self.gofile_folders = {}
+        self.gofile_src_token = ""
 
         items = job.get("items") or []
         if not items and job.get("fileUrl"):
@@ -1637,7 +1848,7 @@ class Mirror:
             except Exception:
                 pass
 
-    def aria_download(self, url: str, dest_dir: Path, out_name: str = None, headers: list = None, label: str = None) -> Path:
+    def aria_download(self, url: str, dest_dir: Path, out_name: str = None, headers: list = None, label: str = None, user_agent: str = None) -> Path:
         if not self.aria_proc:
             self.start_aria()
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -1646,6 +1857,8 @@ class Mirror:
             opts["out"] = out_name
         if headers:
             opts["header"] = headers
+        if user_agent:
+            opts["user-agent"] = user_agent
         elif is_sourceforge_url(url):
             opts["user-agent"] = WGET_UA
         add_res = aria2_rpc("aria2.addUri", [[url], opts])
@@ -2441,11 +2654,20 @@ class Mirror:
         return bundle
 
     def resolve_item(self, item: dict) -> dict:
-        if item.get("_resolved") or item.get("type") in ("gdrive", "ytdl", "tg_media", "sf_folder"):
+        if item.get("_resolved") or item.get("type") in ("gdrive", "ytdl", "tg_media", "sf_folder", "gofile"):
             return item
         target = item.get("sourceUrl") or item.get("url") or ""
         if not target:
             return item
+        gid = gofile_parse_id(target)
+        if gid:
+            return {
+                "type": "gofile",
+                "id": gid,
+                "url": target,
+                "name": item.get("name") or gofile_name_from_url(target),
+                "_resolved": True,
+            }
         tg = parse_telegram_post_url(target)
         if tg:
             tg["_resolved"] = True
@@ -2457,7 +2679,7 @@ class Mirror:
             return item
         try:
             resolved = resolve_download_url(target)
-            if resolved.get("type") in ("gdrive", "tg_media"):
+            if resolved.get("type") in ("gdrive", "tg_media", "gofile"):
                 resolved["_resolved"] = True
                 return resolved
             if resolved.get("url"):
@@ -2471,6 +2693,249 @@ class Mirror:
                 return item
             raise RuntimeError(str(e))
         return item
+
+    # ---------------- Gofile sources ----------------
+
+    def gofile_src_account(self, force: bool = False) -> str:
+        if force or not self.gofile_src_token:
+            self.gofile_src_token = gofile_new_account()
+        return self.gofile_src_token
+
+    def gofile_src_list(self, content_id: str) -> dict:
+        cid = urllib.parse.quote(str(content_id))
+        page = 1
+        children = {}
+        first = None
+        while page <= 50:
+            url = (
+                f"/contents/{cid}?cache=true&sortField=createTime&sortDirection=1"
+                f"&page={page}&pageSize=1000"
+            )
+            status, data = gofile_api_json(url, token=self.gofile_src_account())
+            if data.get("status") == "error-notPremium":
+                self.gofile_src_account(force=True)
+                status, data = gofile_api_json(
+                    url, token=self.gofile_src_account(), refresh_salt=True
+                )
+            if data.get("status") != "ok":
+                raise RuntimeError(gofile_error_text(data.get("status")))
+            d = data.get("data") or {}
+            if d.get("canAccess") is False:
+                raise RuntimeError("Gofile content is not publicly accessible.")
+            if first is None:
+                first = d
+            batch = d.get("children") or {}
+            children.update(batch)
+            total = int(d.get("childrenCount") or 0)
+            if not batch or (total > 0 and len(children) >= total):
+                break
+            page += 1
+        if first is None:
+            raise RuntimeError("Gofile content was not found.")
+        first["children"] = children
+        return first
+
+    def gofile_probe_link(self, link: str, token: str):
+        status, headers, _body = gofile_http(
+            link,
+            token=token,
+            range_header="bytes=0-0",
+            timeout=40,
+            allow_redirects=False,
+        )
+        ctype = str(headers.get("content-type") or "").lower()
+        if status in (200, 206) and "text/html" not in ctype:
+            return True, headers
+        return False, headers
+
+    def _gofile_stream_download(self, link: str, out_path: Path, token: str, size_hint: int = 0, label: str = "") -> Path:
+        global cancelled
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        ua = DEFAULT_UA
+        headers = {
+            "User-Agent": ua,
+            "Accept": "*/*",
+            "Origin": "https://gofile.io",
+            "Referer": "https://gofile.io/",
+            "X-Website-Token": gofile_website_token(ua, token),
+            "X-BL": "en-US",
+            "Authorization": f"Bearer {token}",
+            "Cookie": f"accountToken={token}",
+        }
+        _prepare_pkg_paths()
+        try:
+            from curl_cffi import requests as cffi_req
+        except ImportError:
+            _pip_install_target(["curl_cffi"], _TG_PKG_TARGET)
+            from curl_cffi import requests as cffi_req
+
+        sess = cffi_req.Session(impersonate="chrome")
+        resp = sess.get(link, headers=headers, stream=True, timeout=120, allow_redirects=False)
+        try:
+            if resp.status_code not in (200, 206):
+                raise RuntimeError(f"Gofile download failed (HTTP {resp.status_code}).")
+            ctype = str(resp.headers.get("content-type") or "").lower()
+            if "text/html" in ctype:
+                raise RuntimeError("Gofile returned the share page instead of the file.")
+            total = int(resp.headers.get("content-length") or size_hint or 0)
+            done = 0
+            started = time.time()
+            with open(out_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 256):
+                    if cancelled:
+                        raise InterruptedError("Cancelled by user")
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    done += len(chunk)
+                    elapsed = max(0.001, time.time() - started)
+                    speed = done / elapsed
+                    pct = (100.0 * done / total) if total > 0 else 0.0
+                    eta = ((total - done) / speed) if speed > 0 and total > done else None
+                    self.tick(out_path.name, "Download..", pct, done, total, speed, eta, "Gofile API")
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        return out_path
+
+    def gofile_download_file(self, item: dict, dest_dir: Path, out_name: str = None, label: str = None) -> Path:
+        global cancelled
+        content_id = str(item.get("id") or "")
+        link = str(item.get("link") or "")
+        name = out_name or item.get("name") or f"gofile_{content_id[:8] or 'file'}"
+        name = re.sub(r'[/\\?%*:|"<>]', "_", str(name)).strip() or f"gofile_{JOB_ID}"
+        size_hint = int(item.get("size") or 0)
+        md5 = str(item.get("md5") or "").lower()
+        token = self.gofile_src_account()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        authorized = False
+        for attempt in range(4):
+            if cancelled:
+                raise InterruptedError("Cancelled by user")
+            if link:
+                ok, _headers = self.gofile_probe_link(link, token)
+                if ok:
+                    authorized = True
+                    break
+            # Re-list the file itself; this re-authorizes its store link for the token.
+            try:
+                fresh = self.gofile_src_list(content_id) if content_id else {}
+                if fresh.get("link"):
+                    link = fresh["link"]
+                token = self.gofile_src_account()
+            except Exception:
+                if attempt >= 2:
+                    break
+            if attempt >= 1:
+                token = self.gofile_src_account(force=True)
+            time.sleep(1.0 + attempt)
+        if not authorized:
+            raise RuntimeError("Gofile did not authorize the download link (it redirected to the share page).")
+
+        ua = DEFAULT_UA
+        headers_list = [
+            f"Authorization: Bearer {token}",
+            f"Cookie: accountToken={token}",
+            "Referer: https://gofile.io/",
+            "Origin: https://gofile.io",
+            f"X-Website-Token: {gofile_website_token(ua, token)}",
+            "X-BL: en-US",
+        ]
+        try:
+            local = self.aria_download(
+                link,
+                dest_dir,
+                out_name=name,
+                headers=headers_list,
+                label=label or name,
+                user_agent=ua,
+            )
+        except InterruptedError:
+            raise
+        except Exception:
+            local = self._gofile_stream_download(link, dest_dir / name, token, size_hint, label or name)
+
+        if not local.exists() or local.stat().st_size <= 0:
+            raise RuntimeError("Gofile download produced an empty file.")
+        got_size = local.stat().st_size
+        if size_hint > 0 and got_size < int(size_hint * 0.99):
+            raise RuntimeError(f"Gofile download incomplete ({got_size} of {size_hint} bytes).")
+        if md5:
+            got_md5 = md5_file(local)
+            if got_md5 and got_md5 != md5:
+                raise RuntimeError(f"Gofile MD5 mismatch (expected {md5[:8]}…, got {got_md5[:8]}…).")
+        return local
+
+    def _gofile_walk_folder(self, folder: dict, out_dir: Path, depth: int = 0):
+        global cancelled
+        if depth > 25:
+            return
+        children = folder.get("children") or {}
+        if not children and int(folder.get("childrenCount") or 0) > 0 and folder.get("id"):
+            folder = self.gofile_src_list(folder["id"])
+            children = folder.get("children") or {}
+        folders = [c for c in children.values() if isinstance(c, dict) and c.get("type") == "folder"]
+        files = [c for c in children.values() if isinstance(c, dict) and c.get("type") == "file"]
+        folders.sort(key=lambda c: str(c.get("name") or "").lower())
+        files.sort(key=lambda c: str(c.get("name") or "").lower())
+
+        for child in folders:
+            if cancelled:
+                raise InterruptedError("Cancelled by user")
+            sub_name = re.sub(r'[/\\?%*:|"<>]', "_", str(child.get("name") or child.get("id") or "folder")).strip() or "folder"
+            sub_dir = out_dir / sub_name
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            self._gofile_walk_folder(child, sub_dir, depth + 1)
+
+        total = len(files)
+        for idx, child in enumerate(files, 1):
+            if cancelled:
+                raise InterruptedError("Cancelled by user")
+            fname = re.sub(r'[/\\?%*:|"<>]', "_", str(child.get("name") or child.get("id") or f"file_{idx}")).strip() or f"file_{idx}"
+            target = out_dir / fname
+            if target.exists():
+                stem, suffix = target.stem, target.suffix
+                n = 2
+                while target.exists():
+                    target = out_dir / f"{stem} ({n}){suffix}"
+                    n += 1
+                fname = target.name
+            label = f"[{idx}/{total}] {fname}" if total > 1 else fname
+            self.gofile_download_file(child, out_dir, out_name=fname, label=label)
+
+    def gofile_download_item(self, item: dict, dest_dir: Path) -> Path:
+        content_id = str(item.get("id") or gofile_parse_id(item.get("url") or ""))
+        if not content_id:
+            raise RuntimeError("Could not parse the Gofile content ID.")
+        self.tick(
+            item.get("name") or "Gofile",
+            "Inspecting Gofile..",
+            0.0, 0, 0, 0, None,
+            "Gofile API",
+            force=True,
+        )
+        data = self.gofile_src_list(content_id)
+        is_folder = data.get("type") == "folder"
+        root_name = self.single_name() or data.get("name") or f"Gofile_{content_id[:8]}"
+        root_name = re.sub(r'[/\\?%*:|"<>]', "_", str(root_name)).strip() or f"Gofile_{content_id[:8]}"
+
+        if not is_folder:
+            return self.gofile_download_file(
+                data,
+                dest_dir,
+                out_name=(self.single_name() or data.get("name")),
+                label=self.item_label(item),
+            )
+
+        out_root = dest_dir / root_name
+        out_root.mkdir(parents=True, exist_ok=True)
+        self._gofile_walk_folder(data, out_root, depth=0)
+        if not any(p.is_file() for p in out_root.rglob("*")):
+            raise RuntimeError("This Gofile folder is empty.")
+        return out_root
 
     def sf_folder_download(self, item: dict, dest_dir: Path) -> Path:
         folder_url = item.get("url") or ""
@@ -2681,6 +3146,8 @@ class Mirror:
     def acquire_local(self, item: dict, dest_dir: Path) -> Path:
         """Downloads an item to local disk (used for extract/zip modes, yt-dlp, Telegram media, and URL items)."""
         item = self.resolve_item(item)
+        if item.get("type") == "gofile":
+            return self.gofile_download_item(item, dest_dir)
         if item.get("type") == "sf_folder":
             return self.sf_folder_download(item, dest_dir)
         if item.get("type") == "tg_media":
