@@ -6,7 +6,9 @@
  */
 
 export class StateDO {
-  constructor(state) {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
     this.sql = state.storage.sql;
     this.ready = false;
   }
@@ -14,13 +16,89 @@ export class StateDO {
   ensureSchema() {
     if (this.ready) return;
     this.sql.exec('CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL, exp INTEGER)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS leech_del (job_id TEXT PRIMARY KEY, payload TEXT NOT NULL, exp INTEGER NOT NULL)');
     this.ready = true;
+  }
+
+  async rescheduleAlarm() {
+    const rows = [...this.sql.exec('SELECT MIN(exp) AS next_exp FROM leech_del')];
+    const nextExp = rows[0]?.next_exp;
+    if (nextExp && Number(nextExp) > 0) {
+      await this.state.storage.setAlarm(Number(nextExp));
+    } else {
+      await this.state.storage.deleteAlarm();
+    }
+  }
+
+  async purgeLeechRecord(rec) {
+    if (!rec?.chatId || !this.env?.TELEGRAM_BOT_TOKEN) return;
+    const tok = this.env.TELEGRAM_BOT_TOKEN;
+    const ids = Array.isArray(rec.fileMsgIds) ? rec.fileMsgIds.filter(Boolean) : [];
+    for (const mid of ids) {
+      await fetch(`https://api.telegram.org/bot${tok}/deleteMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: rec.chatId, message_id: mid })
+      }).catch(() => {});
+    }
+    if (rec.noticeMsgId) {
+      await fetch(`https://api.telegram.org/bot${tok}/editMessageText`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: rec.chatId,
+          message_id: rec.noticeMsgId,
+          text: `<blockquote><b>⌛ Auto-Deleted (30 Minutes)</b></blockquote>\n\n<i>Leeched file(s) have been automatically deleted after 30 minutes. Please forward files immediately next time to keep them safe.</i>`,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          reply_markup: { inline_keyboard: [] }
+        })
+      }).catch(() => {});
+    }
+  }
+
+  async alarm() {
+    this.ensureSchema();
+    const now = Date.now();
+    const due = [...this.sql.exec('SELECT job_id, payload FROM leech_del WHERE exp <= ?', now)];
+    for (const row of due) {
+      try {
+        const rec = JSON.parse(row.payload);
+        await this.purgeLeechRecord(rec);
+      } catch (_) {}
+      this.sql.exec('DELETE FROM leech_del WHERE job_id = ?', row.job_id);
+      this.sql.exec('DELETE FROM kv WHERE k = ?', `leech_del:${row.job_id}`);
+    }
+    await this.rescheduleAlarm();
   }
 
   async fetch(request) {
     this.ensureSchema();
     const url = new URL(request.url);
     const now = Date.now();
+    if (url.pathname === '/leech-schedule') {
+      if (request.method === 'POST') {
+        const rec = await request.json();
+        if (rec?.jobId && rec?.expiresAt) {
+          this.sql.exec(
+            'INSERT OR REPLACE INTO leech_del (job_id, payload, exp) VALUES (?, ?, ?)',
+            String(rec.jobId),
+            JSON.stringify(rec),
+            Number(rec.expiresAt)
+          );
+          await this.rescheduleAlarm();
+        }
+        return Response.json({ ok: true });
+      }
+      if (request.method === 'DELETE') {
+        const jobId = url.searchParams.get('job_id') || '';
+        if (jobId) {
+          this.sql.exec('DELETE FROM leech_del WHERE job_id = ?', jobId);
+          await this.rescheduleAlarm();
+        }
+        return Response.json({ ok: true });
+      }
+    }
     if (request.method === 'GET') {
       const k = url.searchParams.get('k') || '';
       const rows = [...this.sql.exec('SELECT v, exp FROM kv WHERE k = ?', k)];
@@ -751,9 +829,13 @@ function buildTaskMenuMessage(task) {
       : task.isSharedGcTemp
         ? `✓ <b>Destination:</b> Shared Group Drive (5-Day Temp)`
         : `✓ <b>Custom Upload:</b> ${escapeHtml(task.folderName || 'My Drive')}`;
-  const leechNoticeHtml = (!task.batch && task.fileSize >= TG_BOT_MAX_BYTES)
-    ? `📤 <b>Telegram Leech (&gt; 2 GB):</b> Automatically splits into <code>1.95 GB</code> 7z parts before uploading to Telegram.`
-    : `📤 <b>Telegram Leech:</b> Uploads directly to this chat (files &gt; <code>2.00 GB</code> auto-split into <code>1.95 GB</code> parts).`;
+  const leechWarnLines = [
+    (!task.batch && task.fileSize >= TG_BOT_MAX_BYTES)
+      ? `📤 <b>Telegram Leech (&gt; 2 GB):</b> Automatically splits into <code>1.95 GB</code> 7z parts before uploading to Telegram.`
+      : `📤 <b>Telegram Leech:</b> Uploads directly to this chat (files &gt; <code>2.00 GB</code> auto-split into <code>1.95 GB</code> parts).`,
+    `⚠️ <b>Copyright Warning:</b> Do not leech copyrighted content — it could get the group and bot both flagged or banned.${task.chatType === 'private' ? ' Files auto-delete in <b>30 min</b> in DM.' : ''}`
+  ];
+  const leechNoticeHtml = leechWarnLines.join('\n\n');
   const warnBlock = isLeech
     ? `\n\n<blockquote>${leechNoticeHtml}</blockquote>`
     : isGofile
@@ -2357,9 +2439,9 @@ async function handleTelegramUpdate(update, env) {
     if (isYtCmd) {
       await sendMessage(chatId, `Usage  ·  <code>/yt https://youtube.com/watch?v=...</code>\n\n<i>Works with YouTube, Instagram, TikTok, X, Twitch, Vimeo, SoundCloud, and 1000+ media sites.</i>`, env, null, msg.message_id, threadId);
     } else if (isLCmd) {
-      await sendMessage(chatId, `Usage  ·  <code>/l https://example.com/file.mkv</code>\n\n<i>Leeches direct URLs, Drive links, Gofile, SourceForge, media sites, or reply </i><code>/l</code><i> to any message/file directly into Telegram (auto-splits files &gt; 2 GB).</i>`, env, null, msg.message_id, threadId);
+      await sendMessage(chatId, `Usage  ·  <code>/leech https://example.com/file.mkv</code>  or  <code>/l https://example.com/file.mkv</code>\n\n<i>Leeches direct URLs, Drive links, Gofile, SourceForge, media sites, or reply </i><code>/leech</code><i> / </i><code>/l</code><i> to any message/file directly into Telegram (auto-splits files &gt; 2 GB).</i>`, env, null, msg.message_id, threadId);
     } else if (isMCmd) {
-      await sendMessage(chatId, `Usage  ·  <code>/m https://example.com/file.mkv</code>\n\n<i>You can also forward/send any Telegram file (up to 4 GB), send a </i><code>https://t.me/...</code><i> post link, a </i><code>.txt</code><i> file of URLs, or </i><code>/yt &lt;url&gt;</code><i> / </i><code>/l &lt;url&gt;</code><i>.</i>`, env, null, msg.message_id, threadId);
+      await sendMessage(chatId, `Usage  ·  <code>/m https://example.com/file.mkv</code>\n\n<i>You can also forward/send any Telegram file (up to 4 GB), send a </i><code>https://t.me/...</code><i> post link, a </i><code>.txt</code><i> file of URLs, or </i><code>/yt &lt;url&gt;</code><i> / </i><code>/leech &lt;url&gt;</code><i>.</i>`, env, null, msg.message_id, threadId);
     }
     return;
   }
@@ -3484,6 +3566,44 @@ async function handleCallbackQuery(cb, env) {
     return;
   }
 
+  if (data.startsWith('leech_del:')) {
+    const jobId = data.split(':')[1];
+    const raw = await getStore(env).get(`leech_del:${jobId}`);
+    if (!raw) {
+      await answerCb(cb.id, 'Already deleted or expired.', true, env);
+      await editMessage(chatId, msgId, `<blockquote><b>🗑 File(s) Deleted ✓</b></blockquote>\n\n<i>These leeched file(s) have already been removed.</i>`, env, { inline_keyboard: [] });
+      return;
+    }
+    const rec = JSON.parse(raw);
+    const allowed =
+      String(rec.userId) === String(userId) ||
+      isOwner(userId, env) ||
+      (chatType !== 'private' && await isAdmin(userId, env));
+    if (!allowed) {
+      await answerCb(cb.id, 'Only the requester or Admin/Owner can delete these files.', true, env);
+      return;
+    }
+
+    const ids = Array.isArray(rec.fileMsgIds) ? rec.fileMsgIds.filter(Boolean) : [];
+    for (const mid of ids) {
+      await deleteMessage(rec.chatId || chatId, mid, env).catch(() => {});
+    }
+    await getStore(env).delete(`leech_del:${jobId}`);
+    if (env.STATE_DO) {
+      const stub = env.STATE_DO.get(env.STATE_DO.idFromName('global'));
+      await stub.fetch(`https://state.do/leech-schedule?job_id=${encodeURIComponent(jobId)}`, { method: 'DELETE' }).catch(() => {});
+    }
+    await answerCb(cb.id, 'Deleted uploaded file(s)!', false, env);
+    await editMessage(
+      chatId,
+      msgId,
+      `<blockquote><b>🗑 File(s) Deleted ✓</b></blockquote>\n\n<i>All leeched file(s) from this task have been removed.</i>`,
+      env,
+      { inline_keyboard: [] }
+    );
+    return;
+  }
+
   if (data.startsWith('perm_req:')) {
     const jobId = data.split(':')[1];
     if (chatType === 'channel' && !(await isAdmin(userId, env))) {
@@ -4526,6 +4646,10 @@ async function launchMirrorTask(task, env) {
   const userRole = task.userRole || await getUserRoleTag(userId, !!task.isChannel, env);
   const displayBy = /^[a-zA-Z0-9_]{4,}$/.test(String(task.username || '')) ? `@${task.username}` : (task.username || 'User');
 
+  const copyrightLine = isLeech
+    ? `\n\n<blockquote>⚠️ <b>Copyright Warning:</b> Do not leech copyrighted content — it could get the group and bot both flagged or banned.${task.chatType === 'private' ? ' DM files auto-delete in 30m.' : ''}</blockquote>`
+    : '';
+
   const bootText =
     `${fallbackNotice}` +
     `<blockquote>📄 <b>Name :</b> <code>${escapeHtml(displayTitle)}</code></blockquote>\n\n` +
@@ -4542,7 +4666,7 @@ async function launchMirrorTask(task, env) {
     `├ 🟢 Cpu [□□□□□□□□□□] 0.0%\n` +
     `├ 🟢 Ram [□□□□□□□□□□] 0.0%\n` +
     `├ 🟢 Free [■□□□□□□□□□] 115.00GB\n` +
-    `└ 🕒 Allocating runner (~10s)..</code></pre>`;
+    `└ 🕒 Allocating runner (~10s)..</code></pre>${copyrightLine}`;
 
   await editMessage(chatId, menuMsgId, bootText, env, {
     inline_keyboard: [
@@ -4889,6 +5013,45 @@ async function handleInternalRunner(request, path, env) {
         await appendHistory(job.userId, doneItems, env);
       }
 
+      if (job.dest === 'telegram') {
+        const msgIds = Array.isArray(body.leech_msg_ids) ? body.leech_msg_ids.filter(Boolean) : [];
+        if (msgIds.length > 0 && job.chatId) {
+          const isPrivateChat = job.chatType === 'private';
+          const noticeText = isPrivateChat
+            ? `<blockquote><b>⏳ Save Your File(s) — Auto-Delete in 30 Minutes</b></blockquote>\n\n` +
+              `Please forward these file(s) to <b>Saved Messages</b> or somewhere safe — they will be <b>automatically deleted in 30 minutes</b>.\n\n` +
+              `<blockquote>⚠️ <b>Copyright Warning:</b> Do not leech copyrighted content, as it could get the group and bot both flagged and possibly banned.</blockquote>`
+            : `<blockquote><b>⚠️ Copyright Notice</b></blockquote>\n\n` +
+              `Do not leech copyrighted content — it could get the group and bot both flagged and possibly banned.\n\n` +
+              `<i>Use the button below to delete the uploaded file(s) anytime.</i>`;
+          const delKb = {
+            inline_keyboard: [[
+              { text: isPrivateChat ? '🗑 Delete Now' : '🗑 Delete File(s)', callback_data: `leech_del:${jobId}`, style: 'danger' }
+            ]]
+          };
+          const sentNotice = await sendMessage(job.chatId, noticeText, env, delKb, null, job.threadId || null).catch(() => null);
+          const delRec = {
+            jobId,
+            chatId: String(job.chatId),
+            userId: String(job.userId),
+            isPrivate: isPrivateChat,
+            fileMsgIds: msgIds,
+            noticeMsgId: sentNotice?.result?.message_id || null,
+            createdAt: Date.now(),
+            expiresAt: isPrivateChat ? (Date.now() + 30 * 60 * 1000) : null
+          };
+          await getStore(env).put(`leech_del:${jobId}`, JSON.stringify(delRec), { expirationTtl: isPrivateChat ? 3600 : 2592000 });
+          if (isPrivateChat && env.STATE_DO && delRec.expiresAt) {
+            const stub = env.STATE_DO.get(env.STATE_DO.idFromName('global'));
+            await stub.fetch('https://state.do/leech-schedule', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(delRec)
+            }).catch(() => {});
+          }
+        }
+      }
+
       if (job.isSharedGcTemp && job.dest === 'gdrive') {
         const expFiles = doneItems.filter(it => it.status === 'completed' && it.id);
         if (expFiles.length) {
@@ -5132,7 +5295,7 @@ async function sendStartScreen(chatId, userId, username, env, opts = {}) {
       `${osNote}\n\n` +
       `<b>Commands</b>\n\n` +
       `<code>/m &lt;link&gt;</code> — Mirror URLs, reply to any Telegram file, or send a <code>t.me</code> link\n\n` +
-      `<code>/l &lt;link&gt;</code> — Leech files directly into Telegram (auto-splits &gt; 2 GB)\n\n` +
+      `<code>/leech &lt;link&gt;</code> (<code>/l</code>) — Leech files directly into Telegram (auto-splits &gt; 2 GB)\n\n` +
       `<code>/yt &lt;link&gt;</code> — Download videos / audio / playlists via yt-dlp\n\n` +
       `/help — Full guide    /tasks — Active transfers    /history — Recent transfers\n\n` +
       `/settings — Preferences    /login — Connect Google Drive (Permanent)`;
@@ -5166,7 +5329,7 @@ async function sendStartScreen(chatId, userId, username, env, opts = {}) {
     `${osNote}\n\n` +
     `<b>Commands</b>\n\n` +
     `<code>/m &lt;link&gt;</code> — Mirror URLs, Drive links, Telegram files, or <code>t.me</code> links\n\n` +
-    `<code>/l &lt;link&gt;</code> — Leech files directly into Telegram (auto-splits &gt; 2 GB)\n\n` +
+    `<code>/leech &lt;link&gt;</code> (<code>/l</code>) — Leech files directly into Telegram (auto-splits &gt; 2 GB)\n\n` +
     `<code>/yt &lt;link&gt;</code> — Download videos / audio / playlists via yt-dlp\n\n` +
     `/setdldir — Browse &amp; select target folder\n\n` +
     `/tasks — Active transfers    /history — Recent transfers\n\n` +
@@ -5213,7 +5376,7 @@ async function sendHelpScreen(chatId, userId, env, opts = {}) {
     `<blockquote><b>Cloud Mirror &amp; Leech Engine — Help &amp; Guide</b></blockquote>\n\n` +
     `<b>Mirror &amp; Leech Commands</b>\n\n` +
     `<code>/m &lt;url&gt;</code> — Mirror direct links, Drive links, Gofile, SourceForge, <code>t.me</code> posts, or reply <code>/m</code> to any file\n\n` +
-    `<code>/l &lt;url&gt;</code> — Leech files straight to Telegram (auto-splits files &gt; 2 GB into <code>1.95 GB</code> parts)\n\n` +
+    `<code>/leech &lt;url&gt;</code> (<code>/l</code>) — Leech files straight to Telegram (auto-splits files &gt; 2 GB into <code>1.95 GB</code> parts)\n\n` +
     `<code>/yt &lt;url&gt;</code> — Download videos, audio, or playlists (YouTube, Instagram, TikTok, X, etc.)\n\n` +
     `<b>Account &amp; Preferences</b>\n\n` +
     `/login — Connect your personal Google Drive (works in both DMs &amp; Groups)\n\n` +

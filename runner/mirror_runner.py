@@ -396,12 +396,14 @@ def build_status_card(
     sys_snap: dict,
     batch_pos=None,
 ) -> str:
-    mode_map = {"normal": "Mirror", "extract": "Extract", "zip": "ArchiveZIP"}
+    is_leech = job.get("dest") == "telegram"
+    mode_map = {"normal": "Leech" if is_leech else "Mirror", "extract": "Extract", "zip": "ArchiveZIP"}
     if job.get("isYtdl"):
         q = job.get("ytQuality", "best")
-        mode_str = "Audio" if q in ("mp3", "m4a", "opus", "flac") else "yt-dlp"
+        mode_str = ("Audio" if q in ("mp3", "m4a", "opus", "flac") else "yt-dlp") + (" #Leech" if is_leech else "")
     else:
-        mode_str = mode_map.get(job.get("mode", "normal"), "Mirror")
+        base_m = mode_map.get(job.get("mode", "normal"), "Mirror")
+        mode_str = f"{base_m} #Leech" if (is_leech and base_m != "Leech") else base_m
     uname = job.get("username") or "User"
     if not uname.startswith("@") and re.match(r"^[A-Za-z0-9_]{4,}$", uname) and uname != "User":
         uname = "@" + uname
@@ -453,6 +455,13 @@ def build_status_card(
         "",
         f"<pre><code>{html.escape(sys_block)}</code></pre>",
     ]
+    if is_leech:
+        dm_hint = " DM files auto-delete in 30m." if job.get("chatType") == "private" else ""
+        lines.append("")
+        lines.append(
+            f"<blockquote>⚠️ <b>Copyright Warning:</b> Do not leech copyrighted content — "
+            f"it could get the group and bot both flagged or banned.{dm_hint}</blockquote>"
+        )
     return "\n".join(lines)
 
 
@@ -3315,6 +3324,7 @@ class Mirror:
                         "size": sz,
                         "status": "completed",
                         "link": msg_link,
+                        "msgId": getattr(sent_msg, "id", None),
                         "direct": "",
                         "shared": False,
                     })
@@ -3804,15 +3814,26 @@ class Mirror:
         _, synced_msg_id = sync_worker_state(JOB_ID)
         if synced_msg_id is not None:
             self.message_id = synced_msg_id
-        worker_call("/internal/complete", {
-            "job_id": JOB_ID,
-            "status": overall,
-            "items": results,
-            "msg_id": self.message_id,
-            "mirror_html": text,
-            "mirror_kb": kb,
-        })
-        finish_status(self.chat_id, self.message_id, text, kb, thread_id=self.thread_id)
+        leech_msg_ids = [r.get("msgId") for r in ok if r.get("msgId")] if is_leech else []
+        if is_leech:
+            finish_status(self.chat_id, self.message_id, text, kb, thread_id=self.thread_id)
+            worker_call("/internal/complete", {
+                "job_id": JOB_ID,
+                "status": overall,
+                "items": results,
+                "msg_id": self.message_id,
+                "leech_msg_ids": leech_msg_ids,
+            })
+        else:
+            worker_call("/internal/complete", {
+                "job_id": JOB_ID,
+                "status": overall,
+                "items": results,
+                "msg_id": self.message_id,
+                "mirror_html": text,
+                "mirror_kb": kb,
+            })
+            finish_status(self.chat_id, self.message_id, text, kb, thread_id=self.thread_id)
 
 
 def main():
