@@ -1,0 +1,111 @@
+name: Gofile Egress Test (temporary)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install aria2 + curl_cffi
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2
+          python3 -m pip install --quiet curl_cffi && echo "CURL_CFFI_OK"
+
+      - name: Probe Gofile API and download
+        env:
+          FILE_ID: 18c08fa5-836e-4782-9af9-2baaa71c0067
+          SMALL_ID: a633d337-1a7a-45a2-a89d-9cda0b1ffa0a
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, time, urllib.request, urllib.error
+
+          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+          SALT = "12af056dacea0b"
+
+          def wt(token, salt=SALT):
+              slot = int(time.time() // 14400)
+              return hashlib.sha256(f"{UA}::en-US::{token}::{slot}::{salt}".encode()).hexdigest()
+
+          def call(url, method="GET", body=None, token="", rng=None, redirect=True, salt=SALT):
+              h = {"User-Agent": UA, "Accept": "*/*", "Origin": "https://gofile.io",
+                   "Referer": "https://gofile.io/", "X-Website-Token": wt(token, salt), "X-BL": "en-US"}
+              if token:
+                  h["Authorization"] = f"Bearer {token}"
+                  h["Cookie"] = f"accountToken={token}"
+              if body is not None:
+                  h["Content-Type"] = "application/json"
+              if rng:
+                  h["Range"] = rng
+              class N(urllib.request.HTTPRedirectHandler):
+                  def redirect_request(self, *a, **k):
+                      return None
+              op = urllib.request.build_opener() if redirect else urllib.request.build_opener(N)
+              try:
+                  with op.open(urllib.request.Request(url, data=body, headers=h, method=method), timeout=60) as r:
+                      return r.status, dict(r.headers), r.read()
+              except urllib.error.HTTPError as e:
+                  return e.code, dict(e.headers), e.read()
+
+          print("=== EGRESS: api.gofile.io ===")
+          st, _, raw = call("https://api.gofile.io/accounts", "POST", b"{}")
+          print("accounts HTTP", st, "status", json.loads(raw).get("status"))
+          token = json.loads(raw)["data"]["token"]
+          print("guest token acquired:", bool(token))
+
+          fid = os.environ["FILE_ID"]
+          st, _, raw = call(f"https://api.gofile.io/contents/{fid}?cache=true&page=1&pageSize=1000", token=token)
+          d = json.loads(raw)["data"]
+          print("list HTTP", st, "| name:", d.get("name"), "| size:", d.get("size"), "| md5:", d.get("md5"))
+          link = d["link"]
+
+          print("=== RANGE PROBE (urllib) ===")
+          st, h, body = call(link, token=token, rng="bytes=0-15", redirect=False)
+          print("probe HTTP", st, "| type:", h.get("Content-Type"), "| range:", h.get("Content-Range"))
+
+          sid = os.environ["SMALL_ID"]
+          st, _, raw = call(f"https://api.gofile.io/contents/{sid}?cache=true", token=token)
+          sd = json.loads(raw)["data"]
+          print("small file:", sd.get("name"), sd.get("size"), sd.get("md5"))
+          with open("/tmp/small_link", "w") as f:
+              f.write(sd["link"])
+          with open("/tmp/small_md5", "w") as f:
+              f.write(sd.get("md5") or "")
+          with open("/tmp/gf_token", "w") as f:
+              f.write(token)
+          with open("/tmp/gf_wt", "w") as f:
+              f.write(wt(token))
+
+          print("=== curl_cffi impersonate ===")
+          from curl_cffi import requests as cr
+          s = cr.Session(impersonate="chrome")
+          r = s.get(link, headers={"Authorization": f"Bearer {token}", "Cookie": f"accountToken={token}",
+                                   "X-Website-Token": wt(token), "X-BL": "en-US",
+                                   "Referer": "https://gofile.io/", "Origin": "https://gofile.io"},
+                    allow_redirects=False, timeout=60)
+          print("curl_cffi HTTP", r.status_code, "| type:", r.headers.get("content-type"))
+          PY
+
+      - name: aria2 download with auth headers
+        run: |
+          TOKEN=$(cat /tmp/gf_token)
+          WT=$(cat /tmp/gf_wt)
+          LINK=$(cat /tmp/small_link)
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+          mkdir -p out
+          aria2c --no-conf --console-log-level=warn --summary-interval=0 \
+            --user-agent="$UA" \
+            --header="Authorization: Bearer $TOKEN" \
+            --header="Cookie: accountToken=$TOKEN" \
+            --header="X-Website-Token: $WT" \
+            --header="X-BL: en-US" \
+            --header="Referer: https://gofile.io/" \
+            --header="Origin: https://gofile.io" \
+            -d out -o small.bin "$LINK"
+          echo "--- result ---"
+          ls -l out
+          echo "expected md5: $(cat /tmp/small_md5)"
+          echo "actual   md5: $(md5sum out/small.bin | cut -d' ' -f1)"
+          test "$(md5sum out/small.bin | cut -d' ' -f1)" = "$(cat /tmp/small_md5)" && echo "MD5_OK"
