@@ -495,6 +495,7 @@ def finish_status(chat_id, message_id, text: str, reply_markup: dict = None, thr
 # ============================================================================
 
 DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+WGET_UA = "Wget/1.21.3"
 DIRECT_EXT_RE = re.compile(
     r"\.(zip|rar|7z|tar\.gz|tgz|tar\.bz2|tar\.xz|txz|mkv|mp4|avi|webm|mov|m4v|mp3|flac|m4a|ogg|wav|iso|img|apk|exe|msi|dmg|deb|rpm|appimage|pdf|epub|bin)(\?.*)?$",
     re.I,
@@ -580,6 +581,18 @@ def parse_telegram_post_url(raw_url: str):
         return None
 
 
+def is_sourceforge_url(raw_url: str) -> bool:
+    try:
+        host = (urllib.parse.urlparse(raw_url).hostname or "").lower().removeprefix("www.")
+        return host in ("sourceforge.net", "sf.net", "dl.sourceforge.net") or host.endswith(".dl.sourceforge.net")
+    except Exception:
+        return False
+
+
+def ua_for_url(raw_url: str) -> str:
+    return WGET_UA if is_sourceforge_url(raw_url) else DEFAULT_UA
+
+
 def rewrite_known_direct_url(raw_url: str):
     try:
         u = urllib.parse.urlparse(raw_url)
@@ -606,8 +619,18 @@ def rewrite_known_direct_url(raw_url: str):
         if host == "huggingface.co" and "/blob/" in u.path:
             return urllib.parse.urlunparse(u._replace(path=u.path.replace("/blob/", "/resolve/", 1)))
         if host == "sourceforge.net":
-            if re.match(r"^/projects/[^/]+/files/.+$", u.path) and not u.path.endswith("/download") and not u.path.endswith("/"):
-                return urllib.parse.urlunparse(u._replace(path=u.path + "/download"))
+            path = u.path
+            m_p = re.match(r"^/p/([^/]+)(/files/.*)$", path)
+            if m_p:
+                path = f"/projects/{m_p.group(1)}{m_p.group(2)}"
+            m_dl = re.match(r"^/projects/([^/]+)/files/(.+?)/download/?$", path)
+            if m_dl and m_dl.group(2) != "latest":
+                return f"https://downloads.sourceforge.net/project/{m_dl.group(1)}/{m_dl.group(2)}?viasf=1"
+            m_file = re.match(r"^/projects/([^/]+)/files/(.+?)/?$", path)
+            if m_file and m_file.group(2) != "latest" and not path.endswith("/"):
+                return f"https://downloads.sourceforge.net/project/{m_file.group(1)}/{m_file.group(2)}?viasf=1"
+        if host == "master.dl.sourceforge.net":
+            return raw_url.replace("://master.dl.sourceforge.net/", "://downloads.sourceforge.net/", 1)
     except Exception:
         pass
     return None
@@ -635,8 +658,53 @@ def _extract_attr(tag: str, name: str) -> str:
     return html.unescape(val.strip())
 
 
+def _curl_probe_single(url: str, method: str = "HEAD", follow: bool = False):
+    curl_bin = shutil.which("curl")
+    if not curl_bin:
+        return None
+    cmd = [curl_bin, "-sS", "--max-time", "15", "-A", ua_for_url(url), "-D", "-", "-o", "/dev/null", "-w", "\n__FINAL_URL__:%{url_effective}"]
+    if follow:
+        cmd.append("-L")
+    if method == "HEAD":
+        cmd.append("-I")
+    else:
+        cmd.extend(["-r", "0-0"])
+    cmd.append(url)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    out = res.stdout or ""
+    final_url = url
+    if "__FINAL_URL__:" in out:
+        hdr_part, final_url = out.rsplit("__FINAL_URL__:", 1)
+        final_url = final_url.strip() or url
+    else:
+        hdr_part = out
+    blocks = [b.strip() for b in re.split(r"\r?\n\r?\n", hdr_part.strip()) if b.strip()]
+    if not blocks:
+        return None
+    last_block = blocks[-1] if follow else blocks[0]
+    lines = last_block.splitlines()
+    status = 0
+    if lines:
+        m = re.match(r"HTTP/\S+\s+(\d{3})", lines[0].strip())
+        if m:
+            status = int(m.group(1))
+    hdrs = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            hdrs[k.strip()] = v.strip()
+    return status, hdrs, final_url
+
+
 def _probe_single(url: str, method: str = "HEAD", follow: bool = False):
-    headers = {"User-Agent": DEFAULT_UA}
+    if is_sourceforge_url(url):
+        c_res = _curl_probe_single(url, method=method, follow=follow)
+        if c_res is not None:
+            return c_res
+    headers = {"User-Agent": ua_for_url(url)}
     if method == "GET":
         headers["Range"] = "bytes=0-0"
     req = urllib.request.Request(url, headers=headers, method=method)
@@ -768,7 +836,10 @@ def resolve_download_url(raw_url: str) -> dict:
                 raise RuntimeError(f"Remote server returned HTTP {status}.")
             return {"type": "url", "url": cur}
 
-        req = urllib.request.Request(cur, headers={"User-Agent": DEFAULT_UA, "Accept": "text/html,application/xhtml+xml"})
+        if low.get("cf-mitigated", "").lower() == "challenge":
+            raise RuntimeError("Protected by anti-bot verification. Open in your browser and send the direct file link.")
+
+        req = urllib.request.Request(cur, headers={"User-Agent": ua_for_url(cur), "Accept": "text/html,application/xhtml+xml"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             final_url = resp.geturl() or cur
             if final_url != cur:
@@ -1416,6 +1487,8 @@ class Mirror:
             opts["out"] = out_name
         if headers:
             opts["header"] = headers
+        elif is_sourceforge_url(url):
+            opts["user-agent"] = WGET_UA
         add_res = aria2_rpc("aria2.addUri", [[url], opts])
         gid = add_res.get("result")
         if not gid:
