@@ -55,9 +55,11 @@ RCLONE_CONF = Path.home() / ".config" / "rclone" / "rclone.conf"
 TICK_SECONDS = 2.5
 TOKEN_REFRESH_SECONDS = 40 * 60  # Google access tokens live ~60 min
 TG_BOT_MAX_BYTES = 2000 * 1024 * 1024  # Telegram Bot MTProto 2,000 MiB upload limit
+TG_SPLIT_BYTES = 1950 * 1024 * 1024  # Safe < 2,000 MiB volume size for auto-splitting
 PERM_REQ_MAX_BYTES = 50 * 1024 * 1024 * 1024  # 50 GiB limit for permanent gcusrfiles request button
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi"}
 AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".flac", ".aac", ".ogg", ".wav"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 FOLDER_MIME = "application/vnd.google-apps.folder"
 TAR_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tgz", ".tbz2", ".txz", ".tar")
 COMPOUND_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst")
@@ -1539,8 +1541,13 @@ class Mirror:
         self.is_shared_gc_temp = bool(job.get("isSharedGcTemp"))
         self.message_id = job.get("messageId")
         self.dest = job.get("dest") or "gdrive"
+        self.leech_as_doc = bool(job.get("leechAsDoc"))
         self.folder_id = job.get("folderId") or "root"
-        self.folder_name = "Gofile (Guest)" if self.dest == "gofile" else ("GC Shared (5-Day Temp)" if self.is_shared_gc_temp else (job.get("folderName") or "My Drive"))
+        self.folder_name = (
+            "Telegram (Leech)"
+            if self.dest == "telegram"
+            else ("Gofile (Guest)" if self.dest == "gofile" else ("GC Shared (5-Day Temp)" if self.is_shared_gc_temp else (job.get("folderName") or "My Drive")))
+        )
         self.custom_name = (job.get("customName") or "").strip()
         self.mode = job.get("mode") or "normal"
         self.select_filter = (job.get("selectFilter") or "").strip()
@@ -2206,7 +2213,9 @@ class Mirror:
             "direct": "",
         }
 
-    def upload(self, target: Path) -> dict:
+    def upload(self, target: Path):
+        if self.dest == "telegram":
+            return self.upload_telegram(target)
         if self.dest == "gofile":
             return self.upload_gofile(target)
         self.ensure_token(max_age=10 * 60)
@@ -3165,8 +3174,12 @@ class Mirror:
             return self.gdrive_download_file(item, meta, dest_dir, name)
         return self.aria_download(item["url"], dest_dir, out_name=self.single_name(), label=self.item_label(item))
 
-    async def _kurigram_send_files(self, files: list) -> int:
+    async def _kurigram_send_files(self, files: list, as_doc: bool = False, base_root: Path = None) -> list:
         from pyrogram import Client
+        try:
+            from pyrogram.errors import FloodWait
+        except Exception:
+            FloodWait = None
         try:
             from pyrogram.enums import ParseMode
             pm_html = ParseMode.HTML
@@ -3179,7 +3192,7 @@ class Mirror:
         except Exception:
             reply_id = None
 
-        sent_count = 0
+        sent_items = []
         async with Client(
             f"mirror_{JOB_ID or 'run'}",
             api_id=int(TELEGRAM_API_ID),
@@ -3192,8 +3205,18 @@ class Mirror:
                 if cancelled:
                     raise InterruptedError("Cancelled by user")
                 sz = fpath.stat().st_size
-                meta = probe_media_meta(fpath)
-                thumb = make_media_thumb(fpath, fpath.parent)
+                if sz <= 0:
+                    continue
+                try:
+                    rel_label = str(fpath.relative_to(base_root)) if base_root else fpath.name
+                except Exception:
+                    rel_label = fpath.name
+                suffix = fpath.suffix.lower()
+                is_audio = (not as_doc) and (suffix in AUDIO_EXTS)
+                is_video = (not as_doc) and (suffix in VIDEO_EXTS)
+                is_image = (not as_doc) and (suffix in IMAGE_EXTS) and (sz <= 10 * 1024 * 1024)
+                meta = probe_media_meta(fpath) if (is_audio or is_video or (as_doc and suffix in VIDEO_EXTS)) else {"duration": 0, "width": 0, "height": 0}
+                thumb = make_media_thumb(fpath, fpath.parent) if (is_audio or is_video or (as_doc and suffix in VIDEO_EXTS)) else None
                 t_start = time.time()
                 win = [t_start, 0]
 
@@ -3213,7 +3236,9 @@ class Mirror:
                         win[0] = now
                         win[1] = current
 
-                caption = f"<code>{html.escape(fpath.name)}</code>  ·  <code>{fmt_bytes(sz)}</code>"
+                caption = f"<code>{html.escape(rel_label)}</code>  ·  <code>{fmt_bytes(sz)}</code>"
+                if len(caption) > 1000:
+                    caption = f"<code>{html.escape(truncate(fpath.name, 180))}</code>  ·  <code>{fmt_bytes(sz)}</code>"
                 kw = {"caption": caption, "progress": on_prog}
                 if pm_html is not None:
                     kw["parse_mode"] = pm_html
@@ -3224,41 +3249,149 @@ class Mirror:
                 elif self.thread_id and idx == 1:
                     kw["message_thread_id"] = int(self.thread_id)
 
-                try:
-                    if fpath.suffix.lower() in AUDIO_EXTS:
+                async def _send_once():
+                    if is_audio:
+                        akw = dict(kw)
                         if meta["duration"]:
-                            kw["duration"] = meta["duration"]
-                        kw["title"] = fpath.stem
+                            akw["duration"] = meta["duration"]
+                        akw["title"] = fpath.stem
                         try:
-                            await app.send_audio(self.chat_id, audio=str(fpath), **kw)
+                            return await app.send_audio(self.chat_id, audio=str(fpath), **akw)
                         except Exception:
-                            kw.pop("reply_to_message_id", None)
-                            await app.send_audio(self.chat_id, audio=str(fpath), **kw)
-                    else:
+                            akw.pop("reply_to_message_id", None)
+                            return await app.send_audio(self.chat_id, audio=str(fpath), **akw)
+                    if is_video:
+                        vkw = dict(kw)
                         if meta["duration"]:
-                            kw["duration"] = meta["duration"]
+                            vkw["duration"] = meta["duration"]
                         if meta["width"] and meta["height"]:
-                            kw["width"] = meta["width"]
-                            kw["height"] = meta["height"]
-                        kw["supports_streaming"] = True
+                            vkw["width"] = meta["width"]
+                            vkw["height"] = meta["height"]
+                        vkw["supports_streaming"] = True
                         try:
-                            await app.send_video(self.chat_id, video=str(fpath), **kw)
+                            return await app.send_video(self.chat_id, video=str(fpath), **vkw)
                         except Exception:
-                            if "reply_to_message_id" in kw:
-                                kw.pop("reply_to_message_id", None)
+                            if "reply_to_message_id" in vkw:
+                                vkw.pop("reply_to_message_id", None)
                                 try:
-                                    await app.send_video(self.chat_id, video=str(fpath), **kw)
+                                    return await app.send_video(self.chat_id, video=str(fpath), **vkw)
                                 except Exception:
-                                    doc_kw = {k: v for k, v in kw.items() if k in ("caption", "progress", "parse_mode", "thumb")}
-                                    await app.send_document(self.chat_id, document=str(fpath), **doc_kw)
-                            else:
-                                doc_kw = {k: v for k, v in kw.items() if k in ("caption", "progress", "parse_mode", "thumb")}
-                                await app.send_document(self.chat_id, document=str(fpath), **doc_kw)
-                    sent_count += 1
+                                    pass
+                            dkw = {k: v for k, v in vkw.items() if k in ("caption", "progress", "parse_mode", "thumb", "message_thread_id")}
+                            return await app.send_document(self.chat_id, document=str(fpath), **dkw)
+                    if is_image:
+                        pkw = {k: v for k, v in kw.items() if k in ("caption", "progress", "parse_mode", "reply_to_message_id", "message_thread_id")}
+                        try:
+                            return await app.send_photo(self.chat_id, photo=str(fpath), **pkw)
+                        except Exception:
+                            dkw = {k: v for k, v in kw.items() if k in ("caption", "progress", "parse_mode", "thumb", "message_thread_id")}
+                            return await app.send_document(self.chat_id, document=str(fpath), **dkw)
+                    dkw = {k: v for k, v in kw.items() if k in ("caption", "progress", "parse_mode", "thumb", "reply_to_message_id", "message_thread_id")}
+                    try:
+                        return await app.send_document(self.chat_id, document=str(fpath), **dkw)
+                    except Exception:
+                        dkw.pop("reply_to_message_id", None)
+                        return await app.send_document(self.chat_id, document=str(fpath), **dkw)
+
+                sent_msg = None
+                try:
+                    for attempt in range(3):
+                        try:
+                            sent_msg = await _send_once()
+                            break
+                        except Exception as err:
+                            if FloodWait is not None and isinstance(err, FloodWait):
+                                wait_s = min(int(getattr(err, "value", 10)) + 1, 180)
+                                self.tick(fpath.name, f"FloodWait ({wait_s}s)..", 0.0, 0, sz, 0, wait_s, "Kurigram MTProto", force=True)
+                                await asyncio.sleep(wait_s)
+                                continue
+                            if attempt < 2 and any(t in str(err).lower() for t in ("timed out", "timeout", "connection", "reset", "eof")):
+                                await asyncio.sleep(2 * (attempt + 1))
+                                continue
+                            raise
+                    msg_link = getattr(sent_msg, "link", "") or ""
+                    sent_items.append({
+                        "name": rel_label,
+                        "size": sz,
+                        "status": "completed",
+                        "link": msg_link,
+                        "direct": "",
+                        "shared": False,
+                    })
                 finally:
                     if thumb:
                         thumb.unlink(missing_ok=True)
-        return sent_count
+        return sent_items
+
+    def split_for_telegram(self, fpath: Path) -> list:
+        sz = fpath.stat().st_size
+        if sz < TG_BOT_MAX_BYTES:
+            return [fpath]
+        du_free = shutil.disk_usage("/").free
+        if du_free < sz * 1.05:
+            raise RuntimeError(
+                f"File '{fpath.name}' ({fmt_bytes(sz)}) exceeds 2 GB Telegram limit and remaining disk ({fmt_bytes(du_free)}) is too small to split it."
+            )
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        split_dir = OUT_DIR / f"split_{uuid.uuid4().hex[:8]}"
+        split_dir.mkdir(parents=True, exist_ok=True)
+        base_archive = split_dir / f"{fpath.name}.7z"
+        vol_mb = TG_SPLIT_BYTES // (1024 * 1024)
+        cmd = ["7z", "a", "-t7z", "-mx=0", f"-v{vol_mb}m", "-bsp1", "-bb0"]
+        if self.password:
+            cmd += [f"-p{self.password}", "-mhe=on"]
+        cmd += [str(base_archive), fpath.name]
+        rc, _ = self.run_progress(cmd, fpath.name, "Splitting (>2GB)..", "7-Zip Store", sz, cwd=str(fpath.parent), estimate_dir=split_dir)
+        parts = sorted(p for p in split_dir.iterdir() if p.is_file() and p.stat().st_size > 0)
+        if rc not in (0, 1) or not parts:
+            shutil.rmtree(split_dir, ignore_errors=True)
+            raise RuntimeError(f"Failed to split '{fpath.name}' into < 2 GB Telegram volumes.")
+        fpath.unlink(missing_ok=True)
+        return parts
+
+    def upload_telegram(self, target: Path) -> list:
+        if not BOT_TOKEN or not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
+            raise RuntimeError("Telegram Leech requires TELEGRAM_API_ID, TELEGRAM_API_HASH, and BOT_TOKEN configured on the runner.")
+        if target.is_file():
+            raw_files = [target]
+            base_root = target.parent
+        elif target.is_dir():
+            raw_files = sorted(
+                p for p in target.rglob("*")
+                if p.is_file() and not p.name.endswith((".aria2", ".ytdl", ".part")) and p.stat().st_size > 0
+            )
+            base_root = target
+        else:
+            raise RuntimeError("No downloaded file found to leech.")
+        if not raw_files:
+            raise RuntimeError("Downloaded folder contains no files to leech.")
+
+        upload_queue = []
+        split_dirs = set()
+        for f in raw_files:
+            if f.stat().st_size >= TG_BOT_MAX_BYTES:
+                parts = self.split_for_telegram(f)
+                for part in parts:
+                    split_dirs.add(part.parent)
+                upload_queue.extend(parts)
+            else:
+                upload_queue.append(f)
+
+        self.tick(upload_queue[0].name, "Setting up Kurigram..", 0.0, 0, path_size(upload_queue[0]), 0, None, "Kurigram MTProto", force=True)
+        ensure_kurigram_tools()
+        try:
+            sent_items = asyncio.run(
+                self._kurigram_send_files(
+                    upload_queue,
+                    as_doc=self.leech_as_doc,
+                    base_root=(None if split_dirs else base_root),
+                )
+            )
+            self.tg_sent += len(sent_items)
+            return sent_items
+        finally:
+            for sd in split_dirs:
+                shutil.rmtree(sd, ignore_errors=True)
 
     def _wait_tg_overlimit_decision(self, under: list, over: list) -> str:
         over_lines = "\n".join(
@@ -3360,8 +3493,8 @@ class Mirror:
         try:
             self.tick(targets[0].name, "Setting up Kurigram..", 0.0, 0, path_size(targets[0]), 0, None, "Kurigram MTProto", force=True)
             ensure_kurigram_tools()
-            sent_n = asyncio.run(self._kurigram_send_files(targets))
-            self.tg_sent += sent_n
+            sent_items = asyncio.run(self._kurigram_send_files(targets))
+            self.tg_sent += len(sent_items)
         except InterruptedError:
             raise
         except Exception as e:
@@ -3417,15 +3550,18 @@ class Mirror:
             meta = self.gdrive_meta(item)
             name = self.single_name() or meta["name"]
             mime = meta.get("mimeType", "")
-            if self.dest != "gofile":
+            if self.dest not in ("gofile", "telegram"):
                 if mime == FOLDER_MIME and self.mode != "zip":
                     return self.gdrive_clone_folder(meta, name)
                 if mime != FOLDER_MIME and (self.mode == "normal" or mime.startswith("application/vnd.google-apps.")):
                     return self.gdrive_copy_file(item, meta, name)
         local = self.acquire_local(item, item_dir)
-        if item.get("type") == "ytdl":
+        if item.get("type") == "ytdl" and self.dest != "telegram":
             self.tg_upload_ytdl_media(local)
-        return self.process_and_upload(local)
+        res = self.process_and_upload(local)
+        if isinstance(res, list):
+            return res[0] if len(res) == 1 else {"_multi": res}
+        return res
 
     def run_batch_zip(self) -> list:
         bdir = DL_DIR / "batch"
@@ -3435,7 +3571,7 @@ class Mirror:
             self.idx = i
             try:
                 local = self.acquire_local(item, bdir)
-                if item.get("type") == "ytdl":
+                if item.get("type") == "ytdl" and self.dest != "telegram":
                     self.tg_upload_ytdl_media(local)
             except InterruptedError:
                 raise
@@ -3451,7 +3587,12 @@ class Mirror:
         if not zipped:
             raise RuntimeError("Failed to create batch ZIP archive.")
         shutil.rmtree(bdir, ignore_errors=True)
-        results.insert(0, self.upload(zipped))
+        up = self.upload(zipped)
+        if isinstance(up, list):
+            for entry in reversed(up):
+                results.insert(0, entry)
+        else:
+            results.insert(0, up)
         return results
 
     def run(self) -> list:
@@ -3460,7 +3601,8 @@ class Mirror:
         all_light_disk = all(it.get("type") in ("ytdl", "tg_media") for it in self.items)
         if not all_light_disk:
             est = int(self.job.get("fileSize") or 0)
-            mult = 2.2 if self.mode in ("extract", "zip") else 1.15
+            needs_split = (self.dest == "telegram") and est >= TG_BOT_MAX_BYTES
+            mult = 2.2 if (self.mode in ("extract", "zip") or needs_split) else 1.15
             needed = (int(est * mult) + 4 * 1024**3) if est > 0 else (35 * 1024**3 if self.batch else 0)
             if needed > 0:
                 ensure_disk_space(needed)
@@ -3468,14 +3610,16 @@ class Mirror:
             self.start_token_server()
             self.write_rclone_conf()
 
-        if len(self.items) > 1:
-            later = self.items[1:]
-            need_bg_ytdl = any(it.get("type") == "ytdl" or is_media_site_url(it.get("url") or "") for it in later)
-            need_bg_kg = any(it.get("type") in ("ytdl", "tg_media") or is_media_site_url(it.get("url") or "") for it in self.items)
-            if need_bg_ytdl or need_bg_kg:
-                prewarm_tools_async(need_ytdl=need_bg_ytdl, need_kurigram=need_bg_kg)
-        elif self.items and self.items[0].get("type") == "ytdl":
-            prewarm_tools_async(need_kurigram=True)
+        need_bg_kg = (self.dest == "telegram") or any(
+            it.get("type") in ("ytdl", "tg_media") or is_media_site_url(it.get("url") or "")
+            for it in self.items
+        )
+        need_bg_ytdl = len(self.items) > 1 and any(
+            it.get("type") == "ytdl" or is_media_site_url(it.get("url") or "")
+            for it in self.items[1:]
+        )
+        if need_bg_ytdl or need_bg_kg:
+            prewarm_tools_async(need_ytdl=need_bg_ytdl, need_kurigram=need_bg_kg)
 
         if self.batch and self.mode == "zip":
             return self.run_batch_zip()
@@ -3485,7 +3629,13 @@ class Mirror:
             self.idx = i
             item_dir = DL_DIR / f"item_{i}"
             try:
-                results.append(self.process_item(item, item_dir))
+                out_res = self.process_item(item, item_dir)
+                if isinstance(out_res, dict) and "_multi" in out_res:
+                    results.extend(out_res["_multi"])
+                elif isinstance(out_res, list):
+                    results.extend(out_res)
+                else:
+                    results.append(out_res)
             except InterruptedError:
                 raise
             except Exception as e:
@@ -3511,13 +3661,55 @@ class Mirror:
         elapsed = fmt_duration(time.time() - self.task_start)
         ok = [r for r in results if r.get("status") in ("completed", "skipped")]
         overall = "completed" if ok else "failed"
+        is_leech = self.dest == "telegram"
         is_gofile = self.dest == "gofile"
-        is_gc_temp = bool(self.is_shared_gc_temp and not is_gofile)
+        is_gc_temp = bool(self.is_shared_gc_temp and not is_gofile and not is_leech)
         completed_with_id = [r for r in ok if r.get("status") == "completed" and r.get("id")]
         total_gc_size = sum(int(r.get("size") or 0) for r in completed_with_id)
         can_req_perm = bool(is_gc_temp and completed_with_id and total_gc_size <= PERM_REQ_MAX_BYTES)
 
-        if not self.batch and len(results) == 1:
+        if is_leech:
+            if not ok and len(results) == 1 and results[0].get("status") == "failed":
+                raise RuntimeError(results[0].get("error") or "Leech failed")
+            total_sz = sum(int(r.get("size") or 0) for r in ok)
+            if len(results) == 1 and ok:
+                r = ok[0]
+                text = (
+                    f"<blockquote><b>Leech Complete</b>\n\n"
+                    f"<code>{html.escape(r['name'])}</code></blockquote>\n\n"
+                    f"Size  ·  <code>{fmt_bytes(r.get('size', 0))}</code>\n\n"
+                    f"Dest  ·  Telegram Chat ({'Document' if self.leech_as_doc else 'Media'})\n\n"
+                    f"Elapsed  ·  <code>{elapsed}</code>\n\nUser  ·  {html.escape(self.uname())}"
+                )
+                kb = {"inline_keyboard": [[{"text": "▸  Jump to File", "url": r["link"], "style": "success"}]]} if r.get("link") else None
+            else:
+                header = (
+                    f"<blockquote><b>{'Leech Complete' if ok else 'Leech Failed'}</b>\n\n"
+                    f"<code>{len(ok)} / {len(results)} uploaded</code>"
+                    f"{f' · {fmt_bytes(total_sz)}' if total_sz > 0 else ''}</blockquote>\n\n"
+                )
+                footer = (
+                    f"\nDest  ·  Telegram Chat ({'Document' if self.leech_as_doc else 'Media'})\n\n"
+                    f"Elapsed  ·  <code>{elapsed}</code>\n\nUser  ·  {html.escape(self.uname())}"
+                )
+                body = ""
+                for n, r in enumerate(results, 1):
+                    name = html.escape(truncate(r.get("name", "item"), 48))
+                    if r.get("status") == "completed":
+                        if r.get("link"):
+                            line = f"{n}. ✓ <a href=\"{html.escape(r['link'], quote=True)}\">{name}</a>  <code>{fmt_bytes(r.get('size', 0))}</code>\n"
+                        else:
+                            line = f"{n}. ✓ <code>{name}</code>  <code>{fmt_bytes(r.get('size', 0))}</code>\n"
+                    else:
+                        line = f"{n}. ✗ <code>{name}</code>\n    <i>{html.escape(truncate(r.get('error', 'failed'), 120))}</i>\n"
+                    if len(header) + len(body) + len(line) + len(footer) > 3900:
+                        body += f"\n<i>…and {len(results) - n + 1} more file(s).</i>\n"
+                        break
+                    body += line
+                text = header + body + footer
+                first_link = next((r.get("link") for r in ok if r.get("link")), "")
+                kb = {"inline_keyboard": [[{"text": "▸  Jump to First File", "url": first_link, "style": "success"}]]} if first_link else None
+        elif not self.batch and len(results) == 1:
             r = results[0]
             if r.get("status") == "failed":
                 raise RuntimeError(r.get("error") or "Transfer failed")

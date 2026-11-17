@@ -105,6 +105,7 @@ const RUNNER_LIMIT_BYTES = 112 * 1024 * 1024 * 1024;
 const MAX_BATCH_URLS = 50;
 const MAX_HISTORY_ITEMS = 15;
 const OWNER_ID = '8138661911';
+const TG_BOT_MAX_BYTES = 2000 * 1024 * 1024;
 const GC_TEMP_FOLDER_NAME = 'GC_Temp_5Days';
 const GC_PERM_FOLDER_NAME = 'gcusrfiles';
 const GC_TEMP_TTL_MS = 5 * 24 * 60 * 60 * 1000;
@@ -409,7 +410,10 @@ function getEffectiveProfile(userId, stored) {
     tokenExpiry: base.tokenExpiry || 0,
     folderId: base.folderId || 'root',
     folderName: base.folderName || 'My Drive',
-    defaultDest: hasDrive ? (base.defaultDest === 'gofile' ? 'gofile' : 'gdrive') : 'gofile',
+    defaultDest: hasDrive
+      ? (['gofile', 'telegram'].includes(base.defaultDest) ? base.defaultDest : 'gdrive')
+      : (base.defaultDest === 'telegram' ? 'telegram' : 'gofile'),
+    leechAsDoc: !!base.leechAsDoc,
     buttonMode: base.buttonMode !== false,
     autoShare: !!base.autoShare,
     conflict: base.conflict || 'rename',
@@ -663,6 +667,7 @@ function conflictLabel(policy) {
 
 function buildTaskMenuMessage(task) {
   const isGofile = task.dest === 'gofile';
+  const isLeech = task.dest === 'telegram';
   let extras = '';
   if (task.batch) {
     extras += `\n✓ <b>Batch:</b> <code>${task.items.length} links</code>`;
@@ -682,7 +687,7 @@ function buildTaskMenuMessage(task) {
     }
     extras += `\n✓ <b>Source:</b> Telegram MTProto (Kurigram)`;
   } else if (task.isDrive) {
-    extras += `\n✓ <b>Source:</b> ${task.isFolder ? 'Google Drive Folder' : (isGofile ? 'Google Drive' : 'Google Drive (Server-Side)')}`;
+    extras += `\n✓ <b>Source:</b> ${task.isFolder ? 'Google Drive Folder' : ((isGofile || isLeech) ? 'Google Drive' : 'Google Drive (Server-Side)')}`;
   } else if (task.isGofileSource) {
     extras += `\n✓ <b>Source:</b> Gofile ${task.isFolder ? 'Folder' : 'File'}`;
     if (task.detectedName) {
@@ -723,7 +728,10 @@ function buildTaskMenuMessage(task) {
   if (task.archivePassword) {
     extras += `\n✓ <b>Password:</b> <code>Set (hidden)</code>`;
   }
-  if (!isGofile) {
+  if (isLeech) {
+    extras += `\n✓ <b>Upload As:</b> ${task.leechAsDoc ? 'Document (Original File)' : 'Media (Stream Video / Audio)'}`;
+  }
+  if (!isGofile && !isLeech) {
     if (task.share) {
       extras += `\n✓ <b>Share:</b> Anyone with link`;
     }
@@ -736,16 +744,23 @@ function buildTaskMenuMessage(task) {
     }
   }
 
-  const destLine = isGofile
-    ? `✓ <b>Destination:</b> Gofile (New Guest Account)`
-    : task.isSharedGcTemp
-      ? `✓ <b>Destination:</b> Shared Group Drive (5-Day Temp)`
-      : `✓ <b>Custom Upload:</b> ${escapeHtml(task.folderName || 'My Drive')}`;
-  const warnBlock = isGofile
-    ? `\n\n<blockquote>${GOFILE_NOTICE_HTML}</blockquote>`
-    : task.isSharedGcTemp
-      ? `\n\n<blockquote>${GC_TEMP_NOTICE_HTML}</blockquote>`
-      : '';
+  const destLine = isLeech
+    ? `✓ <b>Destination:</b> Telegram (Leech to Chat)`
+    : isGofile
+      ? `✓ <b>Destination:</b> Gofile (New Guest Account)`
+      : task.isSharedGcTemp
+        ? `✓ <b>Destination:</b> Shared Group Drive (5-Day Temp)`
+        : `✓ <b>Custom Upload:</b> ${escapeHtml(task.folderName || 'My Drive')}`;
+  const leechNoticeHtml = (!task.batch && task.fileSize >= TG_BOT_MAX_BYTES)
+    ? `📤 <b>Telegram Leech (&gt; 2 GB):</b> Automatically splits into <code>1.95 GB</code> 7z parts before uploading to Telegram.`
+    : `📤 <b>Telegram Leech:</b> Uploads directly to this chat (files &gt; <code>2.00 GB</code> auto-split into <code>1.95 GB</code> parts).`;
+  const warnBlock = isLeech
+    ? `\n\n<blockquote>${leechNoticeHtml}</blockquote>`
+    : isGofile
+      ? `\n\n<blockquote>${GOFILE_NOTICE_HTML}</blockquote>`
+      : task.isSharedGcTemp
+        ? `\n\n<blockquote>${GC_TEMP_NOTICE_HTML}</blockquote>`
+        : '';
 
   return (
     `📌 <b>Choose option for your task?</b>\n\n` +
@@ -757,6 +772,7 @@ function buildTaskMenuMessage(task) {
 function buildTaskMenuKeyboard(task) {
   const tid = task.taskId;
   const isGofile = task.dest === 'gofile';
+  const isLeech = task.dest === 'telegram';
   const extLabel = task.mode === 'extract' ? '✓ Extract' : 'Extract';
   const zipLabel = task.mode === 'zip' ? '✓ Create ZIP' : 'Create ZIP';
   const renLabel = task.batch && task.mode === 'zip'
@@ -767,18 +783,20 @@ function buildTaskMenuKeyboard(task) {
   const shareLabel = task.share ? '✓ Share Link' : 'Share Link';
   const confText = `Duplicate: ${conflictLabel(task.conflict || 'rename')}`;
   const folderShort = truncate(task.driveFolderName || task.folderName || 'My Drive', 14);
-  const destBtnText = isGofile
-    ? '☁️ Dest: Gofile (Temp)'
-    : task.isSharedGcTemp
-      ? '☁️ Dest: GC Drive (5d)'
-      : '☁️ Dest: Google Drive';
+  const destBtnText = isLeech
+    ? '📤 Dest: Telegram (Leech)'
+    : isGofile
+      ? '☁️ Dest: Gofile (Temp)'
+      : task.isSharedGcTemp
+        ? '☁️ Dest: GC Drive (5d)'
+        : '☁️ Dest: Google Drive';
 
   const rows = [
-    [{ text: '▶️ START MIRROR', callback_data: `tm_start:${tid}`, style: 'success' }]
+    [{ text: isLeech ? '▶️ START LEECH' : '▶️ START MIRROR', callback_data: `tm_start:${tid}`, style: 'success' }]
   ];
 
   const canRename = !task.batch || task.mode === 'zip';
-  if (isGofile || task.isSharedGcTemp) {
+  if (isLeech || isGofile || task.isSharedGcTemp) {
     if (canRename) {
       rows.push([
         { text: renLabel, callback_data: `tm_ren:${tid}` },
@@ -801,6 +819,15 @@ function buildTaskMenuKeyboard(task) {
     } else if (task.hasDrive) {
       rows.push([{ text: `Upload: ${folderShort}`, callback_data: `tm_dir:${tid}` }]);
     }
+  }
+
+  if (isLeech) {
+    const typeBtn = {
+      text: task.leechAsDoc ? '📄 Upload As: Document' : '🎬 Upload As: Media (Auto)',
+      callback_data: `tm_asdoc:${tid}`,
+      style: 'primary'
+    };
+    rows.push([typeBtn]);
   }
 
   if (task.isYtdl) {
@@ -874,7 +901,7 @@ function buildTaskMenuKeyboard(task) {
     }
   }
 
-  if (!isGofile) {
+  if (!isGofile && !isLeech) {
     if (task.isSharedGcTemp) {
       rows.push([{ text: confText, callback_data: `tm_confmenu:${tid}` }]);
     } else {
@@ -1477,29 +1504,54 @@ async function resolveMirrorContext(chatType, chatId, actorUserId, chatRecord, e
     const uid = actorUserId || getOwnerId(env);
     const profile = getEffectiveProfile(uid, storedUser);
     const hasDrive = hasDriveAuth(storedUser);
-    const dest = hasDrive ? (profile.defaultDest === 'gofile' ? 'gofile' : 'gdrive') : 'gofile';
+    const dest = profile.defaultDest === 'telegram'
+      ? 'telegram'
+      : (hasDrive ? (profile.defaultDest === 'gofile' ? 'gofile' : 'gdrive') : 'gofile');
     return {
       credUserId: String(uid),
       profile,
       hasDrive,
       dest,
       isSharedGcTemp: false,
-      folderId: dest === 'gofile' ? '' : (profile.folderId || 'root'),
-      folderName: dest === 'gofile' ? 'Gofile (Guest)' : (profile.folderName || 'My Drive'),
+      folderId: (dest === 'gofile' || dest === 'telegram') ? '' : (profile.folderId || 'root'),
+      folderName: dest === 'telegram' ? 'Telegram (Leech)' : (dest === 'gofile' ? 'Gofile (Guest)' : (profile.folderName || 'My Drive')),
       driveFolderId: profile.folderId || 'root',
       driveFolderName: profile.folderName || 'My Drive',
-      share: !!profile.autoShare
+      share: dest === 'telegram' ? false : !!profile.autoShare
     };
   }
 
-  // Group/Channel user without personal /login -> use Owner's 5-Day Shared Temp Drive folder
+  // Group/Channel user without personal /login (unless user chose Telegram Leech default)
   const credOwnerId = String(chatRecord?.credOwnerId || getOwnerId(env));
-  const ownerProfile = getEffectiveProfile(credOwnerId, await getUserProfile(credOwnerId, env));
   const ownerToken = await getValidAccessToken(credOwnerId, env);
+  const userEff = getEffectiveProfile(actorUserId || credOwnerId, storedUser);
+  if (!isChannel && storedUser?.defaultDest === 'telegram') {
+    let driveFolderId = '';
+    let driveFolderName = '';
+    if (ownerToken) {
+      const tf = await ensureOwnerDriveFolder(ownerToken, 'gc_temp_folder', GC_TEMP_FOLDER_NAME, env);
+      if (tf?.folderId) {
+        driveFolderId = tf.folderId;
+        driveFolderName = tf.folderName;
+      }
+    }
+    return {
+      credUserId: credOwnerId,
+      profile: { ...userEff, defaultDest: 'telegram' },
+      hasDrive: false,
+      dest: 'telegram',
+      isSharedGcTemp: false,
+      folderId: '',
+      folderName: 'Telegram (Leech)',
+      driveFolderId,
+      driveFolderName,
+      share: false
+    };
+  }
+
   if (ownerToken) {
     const tempFolder = await ensureOwnerDriveFolder(ownerToken, 'gc_temp_folder', GC_TEMP_FOLDER_NAME, env);
     if (tempFolder?.folderId) {
-      const userEff = getEffectiveProfile(actorUserId || credOwnerId, storedUser);
       return {
         credUserId: credOwnerId,
         profile: { ...userEff, defaultDest: 'gdrive' },
@@ -2047,10 +2099,11 @@ async function handleTelegramUpdate(update, env) {
   }
 
   // 4) Direct media handling
-  // In Groups: ignore plain chat media unless captioned with /m or /mirror (or replied to with /m)
+  // In Groups: ignore plain chat media unless captioned with /m, /mirror, /l, or /leech
   if (directMedia) {
     const hasMirrorCmdCaption = cmd === '/m' || cmd === '/mirror';
-    if (isGroup && !hasMirrorCmdCaption) {
+    const hasLeechCmdCaption = cmd === '/l' || cmd === '/leech';
+    if (isGroup && !hasMirrorCmdCaption && !hasLeechCmdCaption) {
       return;
     }
     const isSmallTxt =
@@ -2058,12 +2111,19 @@ async function handleTelegramUpdate(update, env) {
       ((msg.document.file_name || '').toLowerCase().endsWith('.txt') ||
         (msg.document.mime_type || '').toLowerCase() === 'text/plain') &&
       (!msg.document.file_size || msg.document.file_size <= 512 * 1024) &&
-      cmd !== '/m' && cmd !== '/mirror';
+      !hasMirrorCmdCaption && !hasLeechCmdCaption;
     if (isSmallTxt) {
       const handledTxt = await handleDocumentMessage(msg, env, { chatType, chatRecord, threadId, actorUserId: userId, displayUser: username });
       if (handledTxt) return;
     }
-    await startTaskFromTelegramMedia(msg, directMedia, env, { chatType, chatRecord, threadId, actorUserId: userId, displayUser: username });
+    await startTaskFromTelegramMedia(msg, directMedia, env, {
+      chatType,
+      chatRecord,
+      threadId,
+      actorUserId: userId,
+      displayUser: username,
+      forceLeech: hasLeechCmdCaption
+    });
     return;
   }
 
@@ -2267,18 +2327,26 @@ async function handleTelegramUpdate(update, env) {
 
   const isYtCmd = cmd === '/yt' || cmd === '/ytdl';
   const isMCmd = cmd === '/m' || cmd === '/mirror';
+  const isLCmd = cmd === '/l' || cmd === '/leech';
 
-  // In Groups: ignore bare links that do not start with /m or /yt
-  if (isGroup && !isYtCmd && !isMCmd) {
+  // In Groups: ignore bare links that do not start with /m, /l, or /yt
+  if (isGroup && !isYtCmd && !isMCmd && !isLCmd) {
     return;
   }
 
   let urls = extractUrls(text);
 
-  if (!urls.length && (isMCmd || isYtCmd) && msg.reply_to_message) {
+  if (!urls.length && (isMCmd || isYtCmd || isLCmd) && msg.reply_to_message) {
     const repliedMedia = extractTelegramMedia(msg.reply_to_message);
-    if (repliedMedia && isMCmd) {
-      await startTaskFromTelegramMedia(msg, repliedMedia, env, { chatType, chatRecord, threadId, actorUserId: userId, displayUser: username });
+    if (repliedMedia && (isMCmd || isLCmd)) {
+      await startTaskFromTelegramMedia(msg, repliedMedia, env, {
+        chatType,
+        chatRecord,
+        threadId,
+        actorUserId: userId,
+        displayUser: username,
+        forceLeech: isLCmd
+      });
       return;
     }
     const repliedText = msg.reply_to_message.text || msg.reply_to_message.caption || '';
@@ -2288,14 +2356,17 @@ async function handleTelegramUpdate(update, env) {
   if (!urls.length) {
     if (isYtCmd) {
       await sendMessage(chatId, `Usage  ·  <code>/yt https://youtube.com/watch?v=...</code>\n\n<i>Works with YouTube, Instagram, TikTok, X, Twitch, Vimeo, SoundCloud, and 1000+ media sites.</i>`, env, null, msg.message_id, threadId);
+    } else if (isLCmd) {
+      await sendMessage(chatId, `Usage  ·  <code>/l https://example.com/file.mkv</code>\n\n<i>Leeches direct URLs, Drive links, Gofile, SourceForge, media sites, or reply </i><code>/l</code><i> to any message/file directly into Telegram (auto-splits files &gt; 2 GB).</i>`, env, null, msg.message_id, threadId);
     } else if (isMCmd) {
-      await sendMessage(chatId, `Usage  ·  <code>/m https://example.com/file.mkv</code>\n\n<i>You can also forward/send any Telegram file (up to 4 GB), send a </i><code>https://t.me/...</code><i> post link, a </i><code>.txt</code><i> file of URLs, or </i><code>/yt &lt;url&gt;</code><i> for media sites.</i>`, env, null, msg.message_id, threadId);
+      await sendMessage(chatId, `Usage  ·  <code>/m https://example.com/file.mkv</code>\n\n<i>You can also forward/send any Telegram file (up to 4 GB), send a </i><code>https://t.me/...</code><i> post link, a </i><code>.txt</code><i> file of URLs, or </i><code>/yt &lt;url&gt;</code><i> / </i><code>/l &lt;url&gt;</code><i>.</i>`, env, null, msg.message_id, threadId);
     }
     return;
   }
 
   await startTaskFromUrls(chatId, userId, username, msg.message_id, urls, env, {
     forceYtdl: isYtCmd,
+    forceLeech: isLCmd,
     chatType,
     chatRecord,
     threadId
@@ -2469,16 +2540,18 @@ async function startTaskFromTelegramMedia(msg, tgMedia, env, ctx = {}) {
   const username = ctx.displayUser || msg.from?.username || msg.from?.first_name || msg.author_signature || msg.chat?.title || 'User';
   const replyToMsgId = msg.message_id;
 
+  const forceLeech = !!ctx.forceLeech;
   const mCtx = await resolveMirrorContext(chatType, chatId, isChannel ? null : userId, ctx.chatRecord, env);
   const profile = mCtx.profile;
-  const defaultDest = mCtx.dest;
+  const defaultDest = forceLeech ? 'telegram' : mCtx.dest;
+  const isSharedGcTemp = defaultDest === 'telegram' ? false : mCtx.isSharedGcTemp;
   if (!isChannel) {
     await bumpUserStats(userId, { tried: 1 }, { username }, env);
   }
 
   let duplicateExists = false;
   try {
-    if (defaultDest === 'gdrive' && (mCtx.hasDrive || mCtx.isSharedGcTemp) && tgMedia.name) {
+    if (defaultDest === 'gdrive' && (mCtx.hasDrive || isSharedGcTemp) && tgMedia.name) {
       const accessToken = await getValidAccessToken(mCtx.credUserId, env);
       if (accessToken) {
         const existing = await findDriveExisting(accessToken, mCtx.folderId || 'root', tgMedia.name);
@@ -2498,7 +2571,7 @@ async function startTaskFromTelegramMedia(msg, tgMedia, env, ctx = {}) {
     chatId,
     chatType,
     isChannel,
-    isSharedGcTemp: mCtx.isSharedGcTemp,
+    isSharedGcTemp,
     threadId,
     replyToMsgId,
     menuMsgId: null,
@@ -2516,15 +2589,16 @@ async function startTaskFromTelegramMedia(msg, tgMedia, env, ctx = {}) {
     contentType: tgMedia.mimeType || 'application/octet-stream',
     acceptRanges: true,
     dest: defaultDest,
+    leechAsDoc: !!profile.leechAsDoc,
     hasDrive: mCtx.hasDrive,
     driveFolderId: mCtx.driveFolderId,
     driveFolderName: mCtx.driveFolderName,
-    folderId: mCtx.folderId,
-    folderName: mCtx.folderName,
+    folderId: defaultDest === 'telegram' ? '' : mCtx.folderId,
+    folderName: defaultDest === 'telegram' ? 'Telegram (Leech)' : mCtx.folderName,
     mode: 'normal',
     selectFilter: '',
     archivePassword: '',
-    share: mCtx.share,
+    share: defaultDest === 'telegram' ? false : mCtx.share,
     conflict: profile.conflict || 'rename',
     duplicateExists,
     createdAt: Date.now()
@@ -2600,6 +2674,7 @@ async function handleDocumentMessage(msg, env, ctx = {}) {
 
 async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, env, opts = {}) {
   const forceYtdl = !!opts.forceYtdl;
+  const forceLeech = !!opts.forceLeech;
   const editExistingMsgId = opts.editMsgId || null;
   const chatType = opts.chatType || 'private';
   const isChannel = chatType === 'channel';
@@ -2607,7 +2682,11 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
   const mCtx = await resolveMirrorContext(chatType, chatId, isChannel ? null : userId, opts.chatRecord, env);
   const profile = mCtx.profile;
   const hasDrive = mCtx.hasDrive;
-  const defaultDest = mCtx.dest;
+  const defaultDest = forceLeech ? 'telegram' : mCtx.dest;
+  const isSharedGcTemp = defaultDest === 'telegram' ? false : mCtx.isSharedGcTemp;
+  const taskFolderId = defaultDest === 'telegram' ? '' : mCtx.folderId;
+  const taskFolderName = defaultDest === 'telegram' ? 'Telegram (Leech)' : mCtx.folderName;
+  const taskShare = defaultDest === 'telegram' ? false : mCtx.share;
 
   const hasSourceForge = urls.some(u => isSourceForgeUrl(u));
   const hasGofile = urls.some(u => isGofileUrl(u));
@@ -2713,7 +2792,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         chatId,
         chatType,
         isChannel,
-        isSharedGcTemp: mCtx.isSharedGcTemp,
+        isSharedGcTemp,
         threadId,
         replyToMsgId,
         menuMsgId: checkingMsgId,
@@ -2739,15 +2818,16 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         contentType: 'video/mp4',
         acceptRanges: true,
         dest: defaultDest,
+        leechAsDoc: !!profile.leechAsDoc,
         hasDrive,
         driveFolderId: mCtx.driveFolderId,
         driveFolderName: mCtx.driveFolderName,
-        folderId: mCtx.folderId,
-        folderName: mCtx.folderName,
+        folderId: taskFolderId,
+        folderName: taskFolderName,
         mode: 'normal',
         selectFilter: '',
         archivePassword: '',
-        share: mCtx.share,
+        share: taskShare,
         conflict: profile.conflict || 'rename',
         duplicateExists: false,
         createdAt: Date.now()
@@ -2762,10 +2842,10 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
 
       let duplicateExists = false;
       try {
-        if (defaultDest === 'gdrive' && (hasDrive || mCtx.isSharedGcTemp) && verification.fileName) {
+        if (defaultDest === 'gdrive' && (hasDrive || isSharedGcTemp) && verification.fileName) {
           const dupToken = accessToken || await getValidAccessToken(mCtx.credUserId, env);
           if (dupToken) {
-            const existing = await findDriveExisting(dupToken, mCtx.folderId || 'root', verification.fileName);
+            const existing = await findDriveExisting(dupToken, taskFolderId || 'root', verification.fileName);
             duplicateExists = existing.length > 0;
           }
         }
@@ -2805,7 +2885,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         chatId,
         chatType,
         isChannel,
-        isSharedGcTemp: mCtx.isSharedGcTemp,
+        isSharedGcTemp,
         threadId,
         replyToMsgId,
         menuMsgId: checkingMsgId,
@@ -2825,15 +2905,16 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         contentType: verification.contentType || 'application/octet-stream',
         acceptRanges: verification.acceptRanges || false,
         dest: defaultDest,
+        leechAsDoc: !!profile.leechAsDoc,
         hasDrive,
         driveFolderId: mCtx.driveFolderId,
         driveFolderName: mCtx.driveFolderName,
-        folderId: mCtx.folderId,
-        folderName: mCtx.folderName,
+        folderId: taskFolderId,
+        folderName: taskFolderName,
         mode: 'normal',
         selectFilter: '',
         archivePassword: '',
-        share: mCtx.share,
+        share: taskShare,
         conflict: profile.conflict || 'rename',
         duplicateExists,
         createdAt: Date.now()
@@ -2876,7 +2957,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       chatId,
       chatType,
       isChannel,
-      isSharedGcTemp: mCtx.isSharedGcTemp,
+      isSharedGcTemp,
       threadId,
       replyToMsgId,
       menuMsgId: checkingMsgId,
@@ -2903,15 +2984,16 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       contentType: 'application/octet-stream',
       acceptRanges: false,
       dest: defaultDest,
+      leechAsDoc: !!profile.leechAsDoc,
       hasDrive,
       driveFolderId: mCtx.driveFolderId,
       driveFolderName: mCtx.driveFolderName,
-      folderId: mCtx.folderId,
-      folderName: mCtx.folderName,
+      folderId: taskFolderId,
+      folderName: taskFolderName,
       mode: 'normal',
       selectFilter: '',
       archivePassword: '',
-      share: mCtx.share,
+      share: taskShare,
       conflict: profile.conflict || 'rename',
       duplicateExists: false,
       createdAt: Date.now()
@@ -3982,45 +4064,73 @@ async function handleCallbackQuery(cb, env) {
       return;
     }
 
+    if (action === 'tm_asdoc') {
+      task.leechAsDoc = !task.leechAsDoc;
+      await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+      await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
+      await answerCb(cb.id, `Upload As: ${task.leechAsDoc ? 'Document' : 'Media (Auto)'}`, false, env);
+      return;
+    }
+
     if (action === 'tm_dest') {
       const profile = await getUserProfile(userId, env);
       const canUseSharedGc = !!(task.chatType && task.chatType !== 'private' && task.driveFolderId && !hasDriveAuth(profile));
       if (!hasDriveAuth(profile) && !canUseSharedGc) {
-        const uname = cb.from.username || cb.from.first_name || 'User';
-        const authUrl = await createOAuthUrl(chatId, userId, uname, env);
-        await answerCb(cb.id, 'Connect Google Drive for permanent storage', false, env);
-        await sendMessage(
-          chatId,
-          `<blockquote><b>Permanent Storage — Google Drive</b></blockquote>\n\n` +
-            `${GOFILE_NOTICE_HTML}\n\n` +
-            `Connect your personal Google Drive below to store files permanently:`,
-          env,
-          { inline_keyboard: [[{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }]] },
-          null,
-          task.threadId || threadId
-        );
-        return;
-      }
-
-      if (canUseSharedGc) {
         if (task.dest === 'gofile') {
-          task.dest = 'gdrive';
-          task.isSharedGcTemp = true;
-          task.folderId = task.driveFolderId;
-          task.folderName = task.driveFolderName || GC_TEMP_FOLDER_NAME;
-          task.share = true;
+          task.dest = 'telegram';
+          task.isSharedGcTemp = false;
+          task.folderId = '';
+          task.folderName = 'Telegram (Leech)';
         } else {
           task.dest = 'gofile';
           task.isSharedGcTemp = false;
           task.folderId = '';
           task.folderName = 'Gofile (Guest)';
+        }
+        task.duplicateExists = false;
+        await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+        await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
+        await answerCb(cb.id, `Destination: ${task.dest === 'telegram' ? 'Telegram (Leech)' : 'Gofile (Temp)'}`, false, env);
+        return;
+      }
+
+      if (canUseSharedGc) {
+        if (task.dest === 'gdrive') {
+          task.dest = 'gofile';
+          task.isSharedGcTemp = false;
+          task.folderId = '';
+          task.folderName = 'Gofile (Guest)';
           task.duplicateExists = false;
+        } else if (task.dest === 'gofile') {
+          task.dest = 'telegram';
+          task.isSharedGcTemp = false;
+          task.folderId = '';
+          task.folderName = 'Telegram (Leech)';
+          task.duplicateExists = false;
+        } else {
+          task.dest = 'gdrive';
+          task.isSharedGcTemp = true;
+          task.folderId = task.driveFolderId;
+          task.folderName = task.driveFolderName || GC_TEMP_FOLDER_NAME;
+          task.share = true;
         }
       } else {
         task.hasDrive = true;
         task.isSharedGcTemp = false;
         task.credUserId = String(userId);
-        if (task.dest === 'gofile') {
+        if (task.dest === 'gdrive') {
+          task.dest = 'gofile';
+          task.driveFolderId = task.folderId || profile.folderId || 'root';
+          task.driveFolderName = task.folderName || profile.folderName || 'My Drive';
+          task.folderId = '';
+          task.folderName = 'Gofile (Guest)';
+          task.duplicateExists = false;
+        } else if (task.dest === 'gofile') {
+          task.dest = 'telegram';
+          task.folderId = '';
+          task.folderName = 'Telegram (Leech)';
+          task.duplicateExists = false;
+        } else {
           task.dest = 'gdrive';
           task.folderId = task.driveFolderId || profile.folderId || 'root';
           task.folderName = task.driveFolderName || profile.folderName || 'My Drive';
@@ -4031,18 +4141,11 @@ async function handleCallbackQuery(cb, env) {
               task.duplicateExists = ex.length > 0;
             }
           }
-        } else {
-          task.dest = 'gofile';
-          task.driveFolderId = task.folderId || profile.folderId || 'root';
-          task.driveFolderName = task.folderName || profile.folderName || 'My Drive';
-          task.folderId = '';
-          task.folderName = 'Gofile (Guest)';
-          task.duplicateExists = false;
         }
       }
       await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
       await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
-      await answerCb(cb.id, `Destination: ${task.dest === 'gofile' ? 'Gofile (Temp)' : (task.isSharedGcTemp ? 'GC Drive (5d)' : 'Google Drive')}`, false, env);
+      await answerCb(cb.id, `Destination: ${task.dest === 'telegram' ? 'Telegram (Leech)' : (task.dest === 'gofile' ? 'Gofile (Temp)' : (task.isSharedGcTemp ? 'GC Drive (5d)' : 'Google Drive'))}`, false, env);
       return;
     }
 
@@ -4183,13 +4286,25 @@ async function handleCallbackQuery(cb, env) {
     const stored = await getUserProfile(userId, env);
     const profile = getEffectiveProfile(userId, stored);
     if (data === 'cfg_toggle_dest') {
-      if (!hasDriveAuth(stored)) {
-        await answerCb(cb.id, 'Connect Google Drive via /login first', true, env);
-        return;
+      if (hasDriveAuth(stored)) {
+        const order = ['gdrive', 'gofile', 'telegram'];
+        const curIdx = order.indexOf(profile.defaultDest);
+        profile.defaultDest = order[(curIdx + 1) % order.length];
+      } else {
+        profile.defaultDest = profile.defaultDest === 'telegram' ? 'gofile' : 'telegram';
       }
-      profile.defaultDest = profile.defaultDest === 'gofile' ? 'gdrive' : 'gofile';
       await saveUserProfile(userId, profile, env);
-      await answerCb(cb.id, `Default Dest: ${profile.defaultDest === 'gofile' ? 'Gofile (Temp)' : 'Google Drive'}`, false, env);
+      const label = profile.defaultDest === 'telegram'
+        ? 'Telegram (Leech)'
+        : (profile.defaultDest === 'gofile' ? 'Gofile (Temp)' : 'Google Drive');
+      await answerCb(cb.id, `Default Dest: ${label}`, false, env);
+      await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
+      return;
+    }
+    if (data === 'cfg_toggle_asdoc') {
+      profile.leechAsDoc = !profile.leechAsDoc;
+      await saveUserProfile(userId, profile, env);
+      await answerCb(cb.id, `Leech As: ${profile.leechAsDoc ? 'Document' : 'Media (Auto)'}`, false, env);
       await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
       return;
     }
@@ -4329,11 +4444,12 @@ async function handleCallbackQuery(cb, env) {
 async function launchMirrorTask(task, env) {
   const { chatId, userId, taskId, menuMsgId } = task;
   const credUserId = String(task.credUserId || userId);
-  const dest = task.dest === 'gofile' ? 'gofile' : 'gdrive';
+  const dest = task.dest === 'gofile' ? 'gofile' : (task.dest === 'telegram' ? 'telegram' : 'gdrive');
   const isGofile = dest === 'gofile';
-  const accessToken = await getValidAccessToken(credUserId, env);
+  const isLeech = dest === 'telegram';
+  const accessToken = !isGofile ? await getValidAccessToken(credUserId, env) : null;
 
-  if (!isGofile && !accessToken) {
+  if (!isGofile && !isLeech && !accessToken) {
     await editMessage(
       chatId,
       menuMsgId,
@@ -4345,10 +4461,10 @@ async function launchMirrorTask(task, env) {
     return;
   }
 
-  const quota = !isGofile && accessToken ? await getDriveQuota(accessToken) : null;
+  const quota = (!isGofile && !isLeech && accessToken) ? await getDriveQuota(accessToken) : null;
   const fileSize = task.fileSize || 0;
 
-  if (!isGofile && !task.batch && fileSize > 0 && quota && quota.free !== Infinity && fileSize > quota.free) {
+  if (!isGofile && !isLeech && !task.batch && fileSize > 0 && quota && quota.free !== Infinity && fileSize > quota.free) {
     const msg =
       `<blockquote><b>Insufficient Drive Storage</b>\n\n` +
       `<code>${escapeHtml(task.customName || task.detectedName)}</code></blockquote>\n\n` +
@@ -4361,7 +4477,7 @@ async function launchMirrorTask(task, env) {
 
   // Fast server-side copy directly in Worker for single Drive file in normal mode
   const singleItem = !task.batch && task.items?.length === 1 ? task.items[0] : null;
-  if (!isGofile && singleItem && singleItem.type === 'gdrive' && !task.isFolder && task.mode === 'normal') {
+  if (!isGofile && !isLeech && singleItem && singleItem.type === 'gdrive' && !task.isFolder && task.mode === 'normal') {
     await executeDirectDriveCopy(task, singleItem, accessToken, env);
     return;
   }
@@ -4391,17 +4507,21 @@ async function launchMirrorTask(task, env) {
   }
 
   const modeTag = task.isYtdl
-    ? (YT_AUDIO_QUALITIES.has(task.ytQuality) ? '#Audio' : '#ytdlp')
-    : (task.mode === 'extract' ? '#Extract' : task.mode === 'zip' ? '#ArchiveZIP' : '#Mirror');
+    ? (YT_AUDIO_QUALITIES.has(task.ytQuality) ? '#Audio' : '#ytdlp') + (isLeech ? ' #Leech' : '')
+    : (isLeech
+        ? (task.mode === 'extract' ? '#Extract #Leech' : task.mode === 'zip' ? '#ZIP #Leech' : '#Leech')
+        : (task.mode === 'extract' ? '#Extract' : task.mode === 'zip' ? '#ArchiveZIP' : '#Mirror'));
   const freeDriveStr = quota && quota.free !== Infinity ? fmtBytes(quota.free) : 'Unlimited';
   const actionsUrl = getActionsUrl(env) || 'https://github.com';
   const displayTitle = task.batch
     ? `Batch (${task.items.length} links)`
     : (task.customName || task.detectedName);
 
-  const destLines = isGofile
-    ? `├ Dest : Gofile (Fresh Guest)\n├ Quota : <code>100GB DL / 10d idle</code>\n`
-    : `├ Folder : ${escapeHtml(task.isSharedGcTemp ? 'GC Shared (5-Day Temp)' : task.folderName)}\n├ Drive Free : <code>${freeDriveStr}</code>\n`;
+  const destLines = isLeech
+    ? `├ Dest : Telegram (Leech)\n├ Part Limit : <code>2.00 GB (Auto Split)</code>\n`
+    : isGofile
+      ? `├ Dest : Gofile (Fresh Guest)\n├ Quota : <code>100GB DL / 10d idle</code>\n`
+      : `├ Folder : ${escapeHtml(task.isSharedGcTemp ? 'GC Shared (5-Day Temp)' : task.folderName)}\n├ Drive Free : <code>${freeDriveStr}</code>\n`;
 
   const userRole = task.userRole || await getUserRoleTag(userId, !!task.isChannel, env);
   const displayBy = /^[a-zA-Z0-9_]{4,}$/.test(String(task.username || '')) ? `@${task.username}` : (task.username || 'User');
@@ -4455,12 +4575,13 @@ async function launchMirrorTask(task, env) {
     customName: task.customName,
     fileSize: task.fileSize,
     dest,
-    folderId: isGofile ? '' : task.folderId,
-    folderName: isGofile ? 'Gofile (Guest)' : task.folderName,
+    leechAsDoc: !!task.leechAsDoc,
+    folderId: (isGofile || isLeech) ? '' : task.folderId,
+    folderName: isLeech ? 'Telegram (Leech)' : (isGofile ? 'Gofile (Guest)' : task.folderName),
     mode: task.mode,
     selectFilter: task.selectFilter,
     archivePassword: task.archivePassword || '',
-    share: task.isSharedGcTemp ? true : !!task.share,
+    share: isLeech ? false : (task.isSharedGcTemp ? true : !!task.share),
     conflict: task.conflict || 'rename',
     isYtdl: !!task.isYtdl,
     ytQuality: task.ytQuality || 'best',
@@ -4704,7 +4825,7 @@ async function handleInternalRunner(request, path, env) {
       await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 25200 });
     }
     const tokenInfo = await getValidTokenInfo(credUid, env, false);
-    if (job.dest !== 'gofile' && !tokenInfo) {
+    if (job.dest !== 'gofile' && job.dest !== 'telegram' && !tokenInfo) {
       return jsonResponse({ ok: false, error: 'Could not mint Google access token for user' }, 400);
     }
     return jsonResponse({
@@ -4752,15 +4873,15 @@ async function handleInternalRunner(request, path, env) {
 
     if (Array.isArray(body.items) && body.items.length > 0) {
       const doneItems = body.items
-        .filter(it => it && (it.status === 'completed' || it.status === 'skipped') && it.link)
+        .filter(it => it && (it.status === 'completed' || it.status === 'skipped') && (it.link || job.dest === 'telegram'))
         .map(it => ({
           id: it.id || '',
           name: it.name || 'File',
-          link: it.link,
+          link: it.link || '',
           direct: it.direct || '',
           size: it.size || 0,
           status: it.status,
-          mode: job.mode || 'normal',
+          mode: job.dest === 'telegram' ? 'leech' : (job.mode || 'normal'),
           shared: !!it.shared,
           ts: Date.now()
         }));
@@ -4832,9 +4953,10 @@ async function sendHistory(chatId, userId, editMsgId, env, threadId = null) {
     const it = list[i];
     const icon = it.status === 'skipped' ? '↷' : '✓';
     const name = escapeHtml(truncate(it.name || 'File', 42));
-    const link = escapeHtml(it.link || 'https://drive.google.com');
     const sizeStr = it.size > 0 ? `  <code>${fmtBytes(it.size)}</code>` : '';
-    const line = `${i + 1}. ${icon} <a href="${link}">${name}</a>${sizeStr}\n`;
+    const line = it.link
+      ? `${i + 1}. ${icon} <a href="${escapeHtml(it.link)}">${name}</a>${sizeStr}\n`
+      : `${i + 1}. ${icon} <code>${name}</code>${it.mode === 'leech' ? ' <i>(Telegram)</i>' : ''}${sizeStr}\n`;
     if (body.length + line.length > 3400) break;
     body += line;
   }
@@ -4938,7 +5060,11 @@ async function sendActiveTasks(chatId, userId, env, _filterChatId = null, thread
     const name = escapeHtml(j.customName || j.detectedName || 'Task');
     const state = escapeHtml(j.status || 'starting');
     const userTag = j.username ? `@${escapeHtml(j.username)}` : `<code>${escapeHtml(String(j.userId || userId))}</code>`;
-    const folder = escapeHtml(j.dest === 'gofile' ? 'Gofile (Guest)' : (j.isSharedGcTemp ? 'GC Shared (5-Day Temp)' : (j.folderName || 'My Drive')));
+    const folder = escapeHtml(
+      j.dest === 'telegram'
+        ? 'Telegram (Leech)'
+        : (j.dest === 'gofile' ? 'Gofile (Guest)' : (j.isSharedGcTemp ? 'GC Shared (5-Day Temp)' : (j.folderName || 'My Drive')))
+    );
 
     const cardText = j.lastCardHtml || (
       `<code>${name}</code>\n\n` +
@@ -4994,18 +5120,19 @@ async function sendStartScreen(chatId, userId, username, env, opts = {}) {
 
   if (!hasDriveAuth(stored)) {
     const gcInfo = isGroup
-      ? `Default GC Dest  ·  <b>Shared Group Drive (5-Day Auto-Delete)</b>\n\n<i>Tip: Run /login to connect your own Google Drive for permanent storage.</i>\n\n`
-      : `Destination  ·  <b>Gofile (No Login Required)</b> — Fresh guest account per task\n\n`;
+      ? `Default GC Dest  ·  <b>${profile.defaultDest === 'telegram' ? 'Telegram (Leech)' : 'Shared Group Drive (5-Day Auto-Delete)'}</b>\n\n<i>Tip: Run /login to connect your own Google Drive for permanent storage.</i>\n\n`
+      : `Destination  ·  <b>${profile.defaultDest === 'telegram' ? 'Telegram (Leech)' : 'Gofile (No Login Required)'}</b>\n\n`;
     const text =
-      `<blockquote><b>Cloud Mirror Engine</b>\n\n` +
-      `Free On-Demand Mirroring (Gofile + Google Drive)</blockquote>\n\n` +
+      `<blockquote><b>Cloud Mirror &amp; Leech Engine</b>\n\n` +
+      `Free On-Demand Mirroring &amp; Leeching (Telegram + Gofile + Google Drive)</blockquote>\n\n` +
       gcInfo +
       `Bandwidth  ·  Up to <code>1.8 Gbps</code> (16x Aria2c)\n\n` +
-      `Features  ·  Direct URLs · Telegram Files (&lt;4GB) · yt-dlp · Batch · Extract · ZIP\n\n` +
+      `Features  ·  Direct URLs · Telegram Files (&lt;4GB) · Auto Split (&gt;2GB) · yt-dlp · Batch · Extract · ZIP\n\n` +
       `Telemetry  ·  <code>2.5s</code> Live Progress &amp; System Stats\n\n` +
       `${osNote}\n\n` +
       `<b>Commands</b>\n\n` +
       `<code>/m &lt;link&gt;</code> — Mirror URLs, reply to any Telegram file, or send a <code>t.me</code> link\n\n` +
+      `<code>/l &lt;link&gt;</code> — Leech files directly into Telegram (auto-splits &gt; 2 GB)\n\n` +
       `<code>/yt &lt;link&gt;</code> — Download videos / audio / playlists via yt-dlp\n\n` +
       `/help — Full guide    /tasks — Active transfers    /history — Recent transfers\n\n` +
       `/settings — Preferences    /login — Connect Google Drive (Permanent)`;
@@ -5026,9 +5153,11 @@ async function sendStartScreen(chatId, userId, username, env, opts = {}) {
     return;
   }
 
-  const destLabel = profile.defaultDest === 'gofile' ? 'Gofile (Temp Guest)' : 'Google Drive (Permanent)';
+  const destLabel = profile.defaultDest === 'telegram'
+    ? 'Telegram (Leech)'
+    : (profile.defaultDest === 'gofile' ? 'Gofile (Temp Guest)' : 'Google Drive (Permanent)');
   const text =
-    `<blockquote><b>Cloud Mirror Engine</b>\n\n` +
+    `<blockquote><b>Cloud Mirror &amp; Leech Engine</b>\n\n` +
     `<code>${escapeHtml(profile.email)}</code></blockquote>\n\n` +
     `Default Dest  ·  ${destLabel}\n\n` +
     `Upload Folder  ·  ${escapeHtml(profile.folderName || 'My Drive')}\n\n` +
@@ -5037,6 +5166,7 @@ async function sendStartScreen(chatId, userId, username, env, opts = {}) {
     `${osNote}\n\n` +
     `<b>Commands</b>\n\n` +
     `<code>/m &lt;link&gt;</code> — Mirror URLs, Drive links, Telegram files, or <code>t.me</code> links\n\n` +
+    `<code>/l &lt;link&gt;</code> — Leech files directly into Telegram (auto-splits &gt; 2 GB)\n\n` +
     `<code>/yt &lt;link&gt;</code> — Download videos / audio / playlists via yt-dlp\n\n` +
     `/setdldir — Browse &amp; select target folder\n\n` +
     `/tasks — Active transfers    /history — Recent transfers\n\n` +
@@ -5080,21 +5210,22 @@ async function sendHelpScreen(chatId, userId, env, opts = {}) {
   }
 
   const text =
-    `<blockquote><b>Cloud Mirror Engine — Help &amp; Guide</b></blockquote>\n\n` +
-    `<b>Mirroring Commands</b>\n\n` +
-    `<code>/m &lt;url&gt;</code> — Mirror direct links, Drive links, <code>t.me</code> posts, or reply <code>/m</code> to any Telegram file\n\n` +
+    `<blockquote><b>Cloud Mirror &amp; Leech Engine — Help &amp; Guide</b></blockquote>\n\n` +
+    `<b>Mirror &amp; Leech Commands</b>\n\n` +
+    `<code>/m &lt;url&gt;</code> — Mirror direct links, Drive links, Gofile, SourceForge, <code>t.me</code> posts, or reply <code>/m</code> to any file\n\n` +
+    `<code>/l &lt;url&gt;</code> — Leech files straight to Telegram (auto-splits files &gt; 2 GB into <code>1.95 GB</code> parts)\n\n` +
     `<code>/yt &lt;url&gt;</code> — Download videos, audio, or playlists (YouTube, Instagram, TikTok, X, etc.)\n\n` +
     `<b>Account &amp; Preferences</b>\n\n` +
     `/login — Connect your personal Google Drive (works in both DMs &amp; Groups)\n\n` +
     `/setdldir — Pick your default Drive upload folder\n\n` +
-    `/settings — Configure default destination, ButtonMode, Auto Share, Duplicate policy &amp; yt-dlp presets\n\n` +
+    `/settings — Configure default destination, Leech type, ButtonMode, Auto Share, Duplicate policy &amp; yt-dlp presets\n\n` +
     `/logout — Unlink your Google Drive\n\n` +
     `<b>Status &amp; History</b>\n\n` +
     `/tasks — View or reopen running jobs\n\n` +
     `/history — View recent transfers\n\n` +
     `<b>Group Storage Rules</b>\n\n` +
-    `• Bare links &amp; casual media in groups are ignored — always use <code>/m</code> or <code>/yt</code>.\n` +
-    `• Without <code>/login</code>, group files upload to shared temporary Drive storage (public link, auto-deleted after <b>5 days</b>; files ≤ 50 GB can be requested for permanent storage).\n` +
+    `• Bare links &amp; casual media in groups are ignored — always use <code>/m</code>, <code>/l</code>, or <code>/yt</code>.\n` +
+    `• Without <code>/login</code>, group <code>/m</code> files upload to shared temporary Drive storage (public link, auto-deleted after <b>5 days</b>; files ≤ 50 GB can be requested for permanent storage).\n` +
     `• With <code>/login</code>, your group mirrors upload straight to <b>your own Drive</b> privately.` +
     `${adminLines}\n\n` +
     `${osNote}`;
@@ -5118,12 +5249,16 @@ async function sendSettingsMenu(chatId, userId, profile, editMsgId, env, threadI
   const eff = getEffectiveProfile(userId, profile);
   const yq = ytQualityLabel(eff.ytQuality || 'best');
   const yc = ytContainerLabel(eff.ytContainer || 'mp4');
-  const destStr = eff.defaultDest === 'gofile' ? 'Gofile (Temp · Fresh Guest)' : 'Google Drive (Permanent)';
+  const destStr = eff.defaultDest === 'telegram'
+    ? 'Telegram (Leech to Chat)'
+    : (eff.defaultDest === 'gofile' ? 'Gofile (Temp · Fresh Guest)' : 'Google Drive (Permanent)');
+  const leechModeStr = eff.leechAsDoc ? 'Document (Original File)' : 'Media (Stream Video / Audio)';
   const acctLine = hasDrive ? `<code>${escapeHtml(eff.email)}</code>` : `<i>Guest Mode (No Google Drive Linked)</i>`;
   const text =
     `<blockquote><b>Preferences</b>\n\n` +
     `${acctLine}</blockquote>\n\n` +
     `Default Dest  ·  ${destStr}\n\n` +
+    `Leech Upload As  ·  ${leechModeStr}\n\n` +
     (hasDrive ? `Target Folder  ·  ${escapeHtml(eff.folderName || 'My Drive')}\n\n` : '') +
     `ButtonMode  ·  ${eff.buttonMode !== false ? 'Enabled' : 'Disabled'}\n\n` +
     (hasDrive
@@ -5132,9 +5267,15 @@ async function sendSettingsMenu(chatId, userId, profile, editMsgId, env, threadI
       : '') +
     `Media (yt-dlp)  ·  <code>${yq} · ${yc}</code>`;
 
+  const destBtnLabel = eff.defaultDest === 'telegram'
+    ? 'Telegram (Leech)'
+    : (eff.defaultDest === 'gofile' ? 'Gofile' : 'Google Drive');
   const rows = [];
+  rows.push([
+    { text: `Dest: ${destBtnLabel}`, callback_data: 'cfg_toggle_dest', style: 'primary' },
+    { text: `Leech: ${eff.leechAsDoc ? 'Document' : 'Media'}`, callback_data: 'cfg_toggle_asdoc' }
+  ]);
   if (hasDrive) {
-    rows.push([{ text: `☁️ Default Dest: ${eff.defaultDest === 'gofile' ? 'Gofile' : 'Google Drive'}`, callback_data: 'cfg_toggle_dest', style: 'primary' }]);
     rows.push([{ text: 'Browse / Change Folder', callback_data: 'cfg_dir', style: 'primary' }]);
     rows.push([
       { text: `ButtonMode: ${eff.buttonMode !== false ? 'ON' : 'OFF'}`, callback_data: 'cfg_toggle_btn' },
