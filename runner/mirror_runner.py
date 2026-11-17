@@ -402,6 +402,8 @@ def build_status_card(
     uname = job.get("username") or "User"
     if not uname.startswith("@") and re.match(r"^[A-Za-z0-9_]{4,}$", uname) and uname != "User":
         uname = "@" + uname
+    role = (job.get("userRole") or "").strip()
+    by_display = f"{uname} [{role}]" if role else uname
     uid = job.get("userId", "")
     short_id = job.get("jobId", "")
 
@@ -433,7 +435,7 @@ def build_status_card(
     if batch_pos:
         lines.append(f"├ Batch : <code>{batch_pos[0]} / {batch_pos[1]}</code>")
     lines += [
-        f"├ By : {html.escape(uname)}",
+        f"├ By : {html.escape(by_display)}",
         f"├ UserID : <code>[{html.escape(str(uid))}]</code>",
         f"├ Elapsed : <code>{fmt_duration(elapsed_sec)}</code>",
         f"├ Size : <code>{total_str}</code>",
@@ -1042,27 +1044,33 @@ def prepare_ytdl_cookiefile(raw_cookies: str = None):
 
 
 _PKG_TARGET = Path("/tmp/ytdl_pkgs")
+_TG_PKG_TARGET = Path("/tmp/tg_pkgs")
 _DISK_EXPANDED = False
+_YTDL_LOCK = threading.Lock()
+_KURIGRAM_LOCK = threading.Lock()
 
 
 def _prepare_pkg_paths():
-    if str(_PKG_TARGET) not in sys.path:
-        sys.path.insert(0, str(_PKG_TARGET))
+    for target in (_TG_PKG_TARGET, _PKG_TARGET):
+        if str(target) not in sys.path:
+            sys.path.insert(0, str(target))
     user_site = site.getusersitepackages()
     if user_site and os.path.isdir(user_site):
         site.addsitedir(user_site)
     importlib.invalidate_caches()
 
 
-def _pip_install_target(pkgs: list):
-    _PKG_TARGET.mkdir(parents=True, exist_ok=True)
+def _pip_install_target(pkgs: list, target_dir: Path = None):
+    tgt = target_dir or _PKG_TARGET
+    tgt.mkdir(parents=True, exist_ok=True)
+    common = ["--prefer-binary", "--no-cache-dir", "--disable-pip-version-check", "--upgrade", "-q", "--target", str(tgt)]
     res = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--break-system-packages", "--upgrade", "-q", "--target", str(_PKG_TARGET), *pkgs],
+        [sys.executable, "-m", "pip", "install", "--break-system-packages", *common, *pkgs],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     if res.returncode != 0:
         res = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "-q", "--target", str(_PKG_TARGET), *pkgs],
+            [sys.executable, "-m", "pip", "install", *common, *pkgs],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
         if res.returncode != 0:
@@ -1085,30 +1093,76 @@ def ensure_disk_space(min_free_bytes: int):
 
 
 def ensure_ytdl_tools():
-    _prepare_pkg_paths()
-    try:
+    with _YTDL_LOCK:
+        _prepare_pkg_paths()
+        need_pip = False
+        try:
+            import yt_dlp  # noqa: F401
+            import mutagen  # noqa: F401
+        except ImportError:
+            need_pip = True
+
+        need_ffmpeg = not shutil.which("ffmpeg")
+        if not need_pip and not need_ffmpeg:
+            return
+
+        errs = []
+
+        def do_pip():
+            try:
+                _pip_install_target(["yt-dlp[default]", "mutagen"], _PKG_TARGET)
+            except Exception as e:
+                errs.append(e)
+
+        def do_ffmpeg():
+            try:
+                subprocess.run(["sudo", "apt-get", "update", "-qq"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["sudo", "apt-get", "install", "-y", "-qq", "ffmpeg"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            except Exception as e:
+                errs.append(e)
+
+        threads = []
+        if need_pip:
+            threads.append(threading.Thread(target=do_pip, daemon=True))
+        if need_ffmpeg:
+            threads.append(threading.Thread(target=do_ffmpeg, daemon=True))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errs:
+            raise errs[0]
+        _prepare_pkg_paths()
         import yt_dlp  # noqa: F401
-        import mutagen  # noqa: F401
-    except ImportError:
-        _pip_install_target(["yt-dlp[default]", "mutagen"])
-        import yt_dlp  # noqa: F401
-    if not shutil.which("ffmpeg"):
-        subprocess.run(["sudo", "apt-get", "update", "-qq"], check=False)
-        subprocess.run(["sudo", "apt-get", "install", "-y", "-qq", "ffmpeg"], check=True)
 
 
 def ensure_kurigram_tools():
-    _prepare_pkg_paths()
-    try:
+    with _KURIGRAM_LOCK:
+        _prepare_pkg_paths()
+        try:
+            from pyrogram import Client  # noqa: F401
+            return
+        except ImportError:
+            pass
+        try:
+            _pip_install_target(["kurigram", "tgcrypto"], _TG_PKG_TARGET)
+        except Exception:
+            _pip_install_target(["kurigram"], _TG_PKG_TARGET)
         from pyrogram import Client  # noqa: F401
-        return
-    except ImportError:
-        pass
-    try:
-        _pip_install_target(["kurigram", "tgcrypto"])
-    except Exception:
-        _pip_install_target(["kurigram"])
-    from pyrogram import Client  # noqa: F401
+
+
+def prewarm_tools_async(need_ytdl: bool = False, need_kurigram: bool = False):
+    """Pre-install yt-dlp/ffmpeg and/or Kurigram in background threads while downloads run."""
+    def _safe_run(fn):
+        try:
+            fn()
+        except Exception:
+            pass
+
+    if need_ytdl:
+        threading.Thread(target=_safe_run, args=(ensure_ytdl_tools,), daemon=True).start()
+    if need_kurigram and BOT_TOKEN and TELEGRAM_API_ID and TELEGRAM_API_HASH:
+        threading.Thread(target=_safe_run, args=(ensure_kurigram_tools,), daemon=True).start()
 
 
 def probe_media_meta(path: Path) -> dict:
@@ -2003,6 +2057,7 @@ class Mirror:
     def ytdl_download(self, url: str, dest_dir: Path):
         global cancelled
         self.tick(self.job.get("detectedName") or "Media", "Setting up yt-dlp..", 0.0, 0, 0, 0, None, "yt-dlp + FFmpeg", force=True)
+        prewarm_tools_async(need_kurigram=True)
         ensure_ytdl_tools()
         import yt_dlp
         from yt_dlp.utils import DownloadCancelled, download_range_func
@@ -2760,6 +2815,15 @@ class Mirror:
             self.start_token_server()
             self.write_rclone_conf()
 
+        if len(self.items) > 1:
+            later = self.items[1:]
+            need_bg_ytdl = any(it.get("type") == "ytdl" or is_media_site_url(it.get("url") or "") for it in later)
+            need_bg_kg = any(it.get("type") in ("ytdl", "tg_media") or is_media_site_url(it.get("url") or "") for it in self.items)
+            if need_bg_ytdl or need_bg_kg:
+                prewarm_tools_async(need_ytdl=need_bg_ytdl, need_kurigram=need_bg_kg)
+        elif self.items and self.items[0].get("type") == "ytdl":
+            prewarm_tools_async(need_kurigram=True)
+
         if self.batch and self.mode == "zip":
             return self.run_batch_zip()
 
@@ -2786,8 +2850,9 @@ class Mirror:
     def uname(self) -> str:
         u = self.job.get("username") or "User"
         if not u.startswith("@") and re.match(r"^[A-Za-z0-9_]{4,}$", u) and u != "User":
-            return "@" + u
-        return u
+            u = "@" + u
+        role = (self.job.get("userRole") or "").strip()
+        return f"{u} [{role}]" if role else u
 
     def report(self, results: list):
         elapsed = fmt_duration(time.time() - self.task_start)

@@ -981,6 +981,204 @@ async function isAdmin(userId, env) {
   return !!admins[String(userId)];
 }
 
+async function getUserRoleTag(userId, isChannel, env) {
+  if (isChannel) return 'Channel';
+  if (isOwner(userId, env)) return 'Owner';
+  if (await isAdmin(userId, env)) return 'Admin';
+  return 'User';
+}
+
+async function getPendingAdminsMap(env) {
+  const raw = await getStore(env).get('auth:pending_admins');
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) || {};
+  } catch (_) {
+    return {};
+  }
+}
+
+async function savePendingAdminsMap(map, env) {
+  await getStore(env).put('auth:pending_admins', JSON.stringify(map || {}));
+}
+
+async function indexTelegramUser(user, env) {
+  if (!user || user.is_bot || !user.id || !user.username) return;
+  const unameLow = String(user.username).toLowerCase();
+  const fullName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username;
+  const idxKey = `user_index:${unameLow}`;
+  const curRaw = await getStore(env).get(idxKey);
+  if (curRaw) {
+    try {
+      const cur = JSON.parse(curRaw);
+      if (String(cur.userId) === String(user.id) && cur.username === user.username && cur.firstName === fullName) {
+        return;
+      }
+    } catch (_) {}
+  }
+  await getStore(env).put(idxKey, JSON.stringify({
+    userId: String(user.id),
+    username: user.username,
+    firstName: fullName,
+    updatedAt: Date.now()
+  }));
+}
+
+async function resolvePendingAdminOnSeen(user, env) {
+  if (!user || user.is_bot || !user.id || !user.username) return false;
+  const unameLow = String(user.username).toLowerCase();
+  const pending = await getPendingAdminsMap(env);
+  if (!pending[unameLow]) return false;
+
+  const uid = String(user.id);
+  const fullName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username;
+  const admins = await getAdminsMap(env);
+  admins[uid] = {
+    userId: uid,
+    username: user.username,
+    firstName: fullName,
+    addedAt: pending[unameLow].addedAt || Date.now(),
+    addedBy: pending[unameLow].addedBy || getOwnerId(env)
+  };
+  await saveAdminsMap(admins, env);
+  delete pending[unameLow];
+  await savePendingAdminsMap(pending, env);
+  await getStore(env).delete(`req:admin:${uid}`);
+  return true;
+}
+
+async function addAdminByInput(rawInput, forwardFrom, env) {
+  if (forwardFrom && !forwardFrom.is_bot && forwardFrom.id) {
+    const uid = String(forwardFrom.id);
+    const fullName = [forwardFrom.first_name, forwardFrom.last_name].filter(Boolean).join(' ') || `User ${uid}`;
+    const admins = await getAdminsMap(env);
+    admins[uid] = {
+      userId: uid,
+      username: forwardFrom.username || '',
+      firstName: fullName,
+      addedAt: Date.now(),
+      addedBy: getOwnerId(env)
+    };
+    await saveAdminsMap(admins, env);
+    await getStore(env).delete(`req:admin:${uid}`);
+    if (forwardFrom.username) {
+      const pending = await getPendingAdminsMap(env);
+      if (pending[forwardFrom.username.toLowerCase()]) {
+        delete pending[forwardFrom.username.toLowerCase()];
+        await savePendingAdminsMap(pending, env);
+      }
+    }
+    return { ok: true, mode: 'id', userId: uid, label: forwardFrom.username ? `@${forwardFrom.username}` : fullName };
+  }
+
+  const token = String(rawInput || '').trim().split(/\s+/)[0];
+  if (!token) {
+    return { ok: false, error: 'Send a <code>@username</code>, numeric User ID, or forward a message from the user.' };
+  }
+
+  if (/^\d{5,}$/.test(token)) {
+    const admins = await getAdminsMap(env);
+    admins[token] = admins[token] || {
+      userId: token,
+      username: '',
+      firstName: `User ${token}`,
+      addedAt: Date.now(),
+      addedBy: getOwnerId(env)
+    };
+    await saveAdminsMap(admins, env);
+    await getStore(env).delete(`req:admin:${token}`);
+    return { ok: true, mode: 'id', userId: token, label: `ID ${token}` };
+  }
+
+  const cleanUname = token.replace(/^@/, '').trim();
+  if (!/^[a-zA-Z0-9_]{4,32}$/.test(cleanUname)) {
+    return { ok: false, error: 'Invalid input. Send a valid <code>@username</code>, numeric User ID, or forward a message from the user.' };
+  }
+
+  const unameLow = cleanUname.toLowerCase();
+  const idxRaw = await getStore(env).get(`user_index:${unameLow}`);
+  if (idxRaw) {
+    try {
+      const idx = JSON.parse(idxRaw);
+      if (idx?.userId) {
+        const admins = await getAdminsMap(env);
+        admins[idx.userId] = {
+          userId: idx.userId,
+          username: idx.username || cleanUname,
+          firstName: idx.firstName || cleanUname,
+          addedAt: Date.now(),
+          addedBy: getOwnerId(env)
+        };
+        await saveAdminsMap(admins, env);
+        await getStore(env).delete(`req:admin:${idx.userId}`);
+        return { ok: true, mode: 'id', userId: idx.userId, label: `@${idx.username || cleanUname}` };
+      }
+    } catch (_) {}
+  }
+
+  // Try Telegram getChat(@username) in case Bot API knows this user
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getChat?chat_id=${encodeURIComponent('@' + cleanUname)}`);
+    const data = await res.json();
+    if (data?.ok && data.result?.type === 'private' && data.result.id) {
+      const uid = String(data.result.id);
+      const fullName = [data.result.first_name, data.result.last_name].filter(Boolean).join(' ') || cleanUname;
+      const admins = await getAdminsMap(env);
+      admins[uid] = {
+        userId: uid,
+        username: data.result.username || cleanUname,
+        firstName: fullName,
+        addedAt: Date.now(),
+        addedBy: getOwnerId(env)
+      };
+      await saveAdminsMap(admins, env);
+      await getStore(env).delete(`req:admin:${uid}`);
+      return { ok: true, mode: 'id', userId: uid, label: `@${data.result.username || cleanUname}` };
+    }
+  } catch (_) {}
+
+  // User hasn't interacted with the bot yet — pre-authorize username so they auto-promote on first message
+  const pending = await getPendingAdminsMap(env);
+  pending[unameLow] = {
+    username: cleanUname,
+    addedAt: Date.now(),
+    addedBy: getOwnerId(env)
+  };
+  await savePendingAdminsMap(pending, env);
+  return { ok: true, mode: 'pending', username: cleanUname, label: `@${cleanUname}` };
+}
+
+async function removeAdminByInput(rawInput, env) {
+  const token = String(rawInput || '').trim().split(/\s+/)[0];
+  if (!token) return false;
+  if (/^\d{5,}$/.test(token)) {
+    const admins = await getAdminsMap(env);
+    if (admins[token]) {
+      delete admins[token];
+      await saveAdminsMap(admins, env);
+      return true;
+    }
+    return false;
+  }
+  const cleanUname = token.replace(/^@/, '').toLowerCase();
+  const pending = await getPendingAdminsMap(env);
+  let removed = false;
+  if (pending[cleanUname]) {
+    delete pending[cleanUname];
+    await savePendingAdminsMap(pending, env);
+    removed = true;
+  }
+  const admins = await getAdminsMap(env);
+  for (const [uid, a] of Object.entries(admins)) {
+    if ((a.username || '').toLowerCase() === cleanUname) {
+      delete admins[uid];
+      removed = true;
+    }
+  }
+  if (removed) await saveAdminsMap(admins, env);
+  return removed;
+}
+
 async function getChatsMap(env) {
   const raw = await getStore(env).get('auth:chats');
   if (!raw) return {};
@@ -1360,14 +1558,16 @@ async function handleMyChatMember(mcm, env) {
 
 async function buildOwnerAdminPanel(tab = 'main', env) {
   const admins = await getAdminsMap(env);
+  const pendingAdmins = await getPendingAdminsMap(env);
   const chats = await getChatsMap(env);
   const adminList = Object.values(admins);
+  const pendingList = Object.values(pendingAdmins);
   const chatList = Object.values(chats);
 
   if (tab === 'admins') {
     let body = '';
-    const rows = [[{ text: '➕ Add Admin by ID', callback_data: 'adm_add', style: 'primary' }]];
-    if (!adminList.length) {
+    const rows = [[{ text: '➕ Add Admin (@username / ID)', callback_data: 'adm_add', style: 'primary' }]];
+    if (!adminList.length && !pendingList.length) {
       body = '<i>No extra admins added yet.</i>';
     } else {
       for (const a of adminList) {
@@ -1375,10 +1575,14 @@ async function buildOwnerAdminPanel(tab = 'main', env) {
         body += `• <b>${escapeHtml(label)}</b> — <code>${escapeHtml(a.userId)}</code>\n`;
         rows.push([{ text: `🗑 Remove ${truncate(label, 22)}`, callback_data: `adm_del:${a.userId}`, style: 'danger' }]);
       }
+      for (const p of pendingList) {
+        body += `• <b>@${escapeHtml(p.username)}</b> — <i>pending first DM</i>\n`;
+        rows.push([{ text: `🗑 Remove @${truncate(p.username, 20)}`, callback_data: `adm_pdel:${p.username.toLowerCase()}`, style: 'danger' }]);
+      }
     }
     rows.push([{ text: '↩ Back', callback_data: 'adm_panel:main', style: 'primary' }]);
     return {
-      text: `<blockquote><b>Manage Admins (${adminList.length})</b></blockquote>\n\n${body}\n\n<i>Tip: Quick commands </i><code>/auth &lt;id&gt;</code><i> and </i><code>/unauth &lt;id&gt;</code><i> also work.</i>`,
+      text: `<blockquote><b>Manage Admins (${adminList.length + pendingList.length})</b></blockquote>\n\n${body}\n\n<i>Tip: Quick commands </i><code>/auth @username</code><i>, </i><code>/auth &lt;id&gt;</code><i>, and </i><code>/unauth &lt;@user_or_id&gt;</code><i> also work.</i>`,
       kb: { inline_keyboard: rows }
     };
   }
@@ -1406,15 +1610,15 @@ async function buildOwnerAdminPanel(tab = 'main', env) {
     text:
       `<blockquote><b>Owner Control Panel</b></blockquote>\n\n` +
       `Owner ID  ·  <code>${escapeHtml(getOwnerId(env))}</code>\n` +
-      `Admins  ·  <code>${adminList.length}</code>\n` +
+      `Admins  ·  <code>${adminList.length}${pendingList.length ? ` (+${pendingList.length} pending)` : ''}</code>\n` +
       `Authorized Chats  ·  <code>${chatList.length}</code>\n\n` +
       `Quick Commands:\n` +
-      `<code>/auth &lt;user_or_chat_id&gt;</code> — Authorize admin/group\n` +
-      `<code>/unauth &lt;user_or_chat_id&gt;</code> — Revoke admin/group`,
+      `<code>/auth @username</code> or <code>/auth &lt;id&gt;</code> — Authorize admin/group\n` +
+      `<code>/unauth @username</code> or <code>/unauth &lt;id&gt;</code> — Revoke admin/group`,
     kb: {
       inline_keyboard: [
         [
-          { text: `👥 Admins (${adminList.length})`, callback_data: 'adm_panel:admins', style: 'primary' },
+          { text: `👥 Admins (${adminList.length + pendingList.length})`, callback_data: 'adm_panel:admins', style: 'primary' },
           { text: `💬 Chats (${chatList.length})`, callback_data: 'adm_panel:chats', style: 'primary' }
         ],
         [{ text: 'Close', callback_data: 'adm_close', style: 'danger' }]
@@ -1450,6 +1654,10 @@ async function handleTelegramUpdate(update, env) {
   const threadId = msg.is_topic_message && msg.message_thread_id ? msg.message_thread_id : (msg.message_thread_id || null);
 
   const hasActor = !!(msg.from && !msg.from.is_bot);
+  if (hasActor) {
+    await indexTelegramUser(msg.from, env);
+    await resolvePendingAdminOnSeen(msg.from, env);
+  }
   const userId = hasActor ? msg.from.id : (isChannel ? getOwnerId(env) : (msg.from?.id || getOwnerId(env)));
   const username = hasActor
     ? (msg.from.username || msg.from.first_name || 'User')
@@ -1545,10 +1753,10 @@ async function handleTelegramUpdate(update, env) {
     }
   }
 
-  // 3) Active prompt input (Rename / Filter / Password / mkdir / Admin Add ID)
+  // 3) Active prompt input (Rename / Filter / Password / mkdir / Admin Add)
   const pKey = promptKey(chatId, userId);
   const promptRaw = await getStore(env).get(pKey);
-  if (promptRaw && !directMedia && text) {
+  if (promptRaw && !directMedia && (text || msg.forward_from)) {
     if (cmd === '/cancel') {
       await getStore(env).delete(pKey);
       await sendMessage(chatId, `<i>Input cancelled.</i>`, env, null, msg.message_id, threadId);
@@ -1556,7 +1764,7 @@ async function handleTelegramUpdate(update, env) {
     }
     const promptState = JSON.parse(promptRaw);
     await getStore(env).delete(pKey);
-    await handleUserPromptInput(chatId, userId, text, promptState, msg.message_id, env, threadId);
+    await handleUserPromptInput(chatId, userId, text, promptState, msg.message_id, env, threadId, msg);
     return;
   }
 
@@ -1610,11 +1818,11 @@ async function handleTelegramUpdate(update, env) {
       return;
     }
     const targetId = cmdArgs.split(/\s+/)[0];
-    if (!targetId || !/^-?\d+$/.test(targetId)) {
-      await sendMessage(chatId, `Usage  ·  <code>${cmd} &lt;user_id_or_chat_id&gt;</code>`, env, null, msg.message_id, threadId);
+    if (!targetId) {
+      await sendMessage(chatId, `Usage  ·  <code>${cmd} @username</code> or <code>${cmd} &lt;user_or_chat_id&gt;</code>`, env, null, msg.message_id, threadId);
       return;
     }
-    if (targetId.startsWith('-')) {
+    if (/^-\d+$/.test(targetId)) {
       const chats = await getChatsMap(env);
       if (cmd === '/auth') {
         chats[targetId] = chats[targetId] || {
@@ -1634,25 +1842,35 @@ async function handleTelegramUpdate(update, env) {
         await saveChatsMap(chats, env);
         await sendMessage(chatId, `✓ Chat <code>${escapeHtml(targetId)}</code> revoked.`, env, null, msg.message_id, threadId);
       }
-    } else {
-      const admins = await getAdminsMap(env);
-      if (cmd === '/auth') {
-        admins[targetId] = admins[targetId] || {
-          userId: targetId,
-          username: '',
-          firstName: `User ${targetId}`,
-          addedAt: Date.now(),
-          addedBy: getOwnerId(env)
-        };
-        await saveAdminsMap(admins, env);
-        await getStore(env).delete(`req:admin:${targetId}`);
-        await sendMessage(chatId, `✓ Admin <code>${escapeHtml(targetId)}</code> added.`, env, null, msg.message_id, threadId);
-        await sendMessage(targetId, `<blockquote><b>Admin Access Granted</b>\n\nYou are now an Admin. Send /start to use the bot.</blockquote>`, env).catch(() => {});
-      } else {
-        delete admins[targetId];
-        await saveAdminsMap(admins, env);
-        await sendMessage(chatId, `✓ Admin <code>${escapeHtml(targetId)}</code> removed.`, env, null, msg.message_id, threadId);
+    } else if (cmd === '/auth') {
+      const res = await addAdminByInput(targetId, msg.reply_to_message?.from || null, env);
+      if (!res.ok) {
+        await sendMessage(chatId, res.error, env, null, msg.message_id, threadId);
+        return;
       }
+      if (res.mode === 'id') {
+        await sendMessage(chatId, `✓ Admin <b>${escapeHtml(res.label)}</b> (<code>${escapeHtml(res.userId)}</code>) added.`, env, null, msg.message_id, threadId);
+        await sendMessage(res.userId, `<blockquote><b>Admin Access Granted</b>\n\nYou are now an Admin. Send /start to use the bot.</blockquote>`, env).catch(() => {});
+      } else {
+        await sendMessage(
+          chatId,
+          `✓ Pre-approved Admin <b>${escapeHtml(res.label)}</b>.\n\n<i>They will automatically get Admin access as soon as they message the bot.</i>`,
+          env,
+          null,
+          msg.message_id,
+          threadId
+        );
+      }
+    } else {
+      const removed = await removeAdminByInput(targetId, env);
+      await sendMessage(
+        chatId,
+        removed ? `✓ Admin <code>${escapeHtml(targetId)}</code> removed.` : `<i>No matching admin found for <code>${escapeHtml(targetId)}</code>.</i>`,
+        env,
+        null,
+        msg.message_id,
+        threadId
+      );
     }
     return;
   }
@@ -1977,10 +2195,12 @@ async function startTaskFromTelegramMedia(msg, tgMedia, env, ctx = {}) {
     }
   } catch (_) {}
 
+  const userRole = await getUserRoleTag(userId, isChannel, env);
   const taskId = crypto.randomUUID().replace(/-/g, '').slice(0, 12);
   const task = {
     taskId,
     userId: String(userId),
+    userRole,
     credUserId: mCtx.credUserId,
     username,
     chatId,
@@ -2119,6 +2339,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
     checkingMsgId = checkingMsg?.result?.message_id;
   }
 
+  const userRole = await getUserRoleTag(userId, isChannel, env);
   const taskId = crypto.randomUUID().replace(/-/g, '').slice(0, 12);
   let task;
 
@@ -2181,6 +2402,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       task = {
         taskId,
         userId: String(userId),
+        userRole,
         credUserId: mCtx.credUserId,
         username,
         chatId,
@@ -2266,6 +2488,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       task = {
         taskId,
         userId: String(userId),
+        userRole,
         credUserId: mCtx.credUserId,
         username,
         chatId,
@@ -2330,6 +2553,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
     task = {
       taskId,
       userId: String(userId),
+      userRole,
       credUserId: mCtx.credUserId,
       username,
       chatId,
@@ -2416,26 +2640,27 @@ async function canControlRecord(rec, userId, env) {
   return false;
 }
 
-async function handleUserPromptInput(chatId, userId, text, promptState, msgId, env, threadId = null) {
+async function handleUserPromptInput(chatId, userId, text, promptState, msgId, env, threadId = null, msgObj = null) {
   if (promptState.type === 'add_admin_id') {
     if (!isOwner(userId, env)) return;
-    const targetId = text.trim();
-    if (!/^\d{5,}$/.test(targetId)) {
-      await sendMessage(chatId, `Invalid numeric user ID. Send a valid Telegram User ID (e.g. <code>123456789</code>).`, env, null, msgId, threadId);
+    const res = await addAdminByInput(text, msgObj?.forward_from || null, env);
+    if (!res.ok) {
+      await sendMessage(chatId, res.error, env, null, msgId, threadId);
       return;
     }
-    const admins = await getAdminsMap(env);
-    admins[targetId] = admins[targetId] || {
-      userId: targetId,
-      username: '',
-      firstName: `User ${targetId}`,
-      addedAt: Date.now(),
-      addedBy: getOwnerId(env)
-    };
-    await saveAdminsMap(admins, env);
-    await getStore(env).delete(`req:admin:${targetId}`);
-    await sendMessage(chatId, `✓ Admin <code>${escapeHtml(targetId)}</code> added.`, env, null, msgId, threadId);
-    await sendMessage(targetId, `<blockquote><b>Admin Access Granted</b>\n\nYou are now an Admin. Send /start to use the bot.</blockquote>`, env).catch(() => {});
+    if (res.mode === 'id') {
+      await sendMessage(chatId, `✓ Admin <b>${escapeHtml(res.label)}</b> (<code>${escapeHtml(res.userId)}</code>) added.`, env, null, msgId, threadId);
+      await sendMessage(res.userId, `<blockquote><b>Admin Access Granted</b>\n\nYou are now an Admin. Send /start to use the bot.</blockquote>`, env).catch(() => {});
+    } else {
+      await sendMessage(
+        chatId,
+        `✓ Pre-approved Admin <b>${escapeHtml(res.label)}</b>.\n\n<i>They will automatically get Admin access as soon as they message the bot.</i>`,
+        env,
+        null,
+        msgId,
+        threadId
+      );
+    }
     return;
   }
 
@@ -2598,6 +2823,10 @@ async function handleCallbackQuery(cb, env) {
   const threadId = cb.message.message_thread_id || null;
   const userId = cb.from.id;
   const data = cb.data || '';
+  if (cb.from && !cb.from.is_bot) {
+    await indexTelegramUser(cb.from, env);
+    await resolvePendingAdminOnSeen(cb.from, env);
+  }
 
   if (data === 'req_admin') {
     if (await isAdmin(userId, env)) {
@@ -2753,7 +2982,7 @@ async function handleCallbackQuery(cb, env) {
     return;
   }
 
-  if (data === 'adm_close' || data === 'adm_add' || data.startsWith('adm_panel:') || data.startsWith('adm_del:') || data.startsWith('grp_del:')) {
+  if (data === 'adm_close' || data === 'adm_add' || data.startsWith('adm_panel:') || data.startsWith('adm_del:') || data.startsWith('adm_pdel:') || data.startsWith('grp_del:')) {
     if (!isOwner(userId, env)) {
       await answerCb(cb.id, 'Owner only.', true, env);
       return;
@@ -2765,8 +2994,16 @@ async function handleCallbackQuery(cb, env) {
     }
     if (data === 'adm_add') {
       await getStore(env).put(promptKey(chatId, userId), JSON.stringify({ type: 'add_admin_id' }), { expirationTtl: 600 });
-      await answerCb(cb.id, 'Send numeric User ID', false, env);
-      await sendMessage(chatId, `<blockquote><b>Add Admin</b></blockquote>\n\nSend the user's numeric Telegram ID (e.g. <code>123456789</code>), or /cancel:`, env, null, null, threadId);
+      await answerCb(cb.id, 'Send @username or ID', false, env);
+      await sendMessage(
+        chatId,
+        `<blockquote><b>Add Admin</b></blockquote>\n\n` +
+          `Send the user's <code>@username</code>, numeric User ID (e.g. <code>123456789</code>), or forward a message from them — or /cancel:`,
+        env,
+        null,
+        null,
+        threadId
+      );
       return;
     }
     if (data.startsWith('adm_panel:')) {
@@ -2782,6 +3019,16 @@ async function handleCallbackQuery(cb, env) {
       delete admins[targetUid];
       await saveAdminsMap(admins, env);
       await answerCb(cb.id, 'Admin removed', false, env);
+      const panel = await buildOwnerAdminPanel('admins', env);
+      await editMessage(chatId, msgId, panel.text, env, panel.kb);
+      return;
+    }
+    if (data.startsWith('adm_pdel:')) {
+      const unameLow = data.split(':')[1];
+      const pending = await getPendingAdminsMap(env);
+      delete pending[unameLow];
+      await savePendingAdminsMap(pending, env);
+      await answerCb(cb.id, 'Pending admin removed', false, env);
       const panel = await buildOwnerAdminPanel('admins', env);
       await editMessage(chatId, msgId, panel.text, env, panel.kb);
       return;
@@ -3760,6 +4007,7 @@ async function launchMirrorTask(task, env) {
     ? `├ Dest : Gofile (Fresh Guest)\n├ Quota : <code>100GB DL / 10d idle</code>\n`
     : `├ Folder : ${escapeHtml(task.isSharedGcTemp ? 'GC Shared (5-Day Temp)' : task.folderName)}\n├ Drive Free : <code>${freeDriveStr}</code>\n`;
 
+  const userRole = task.userRole || await getUserRoleTag(userId, !!task.isChannel, env);
   const displayBy = /^[a-zA-Z0-9_]{4,}$/.test(String(task.username || '')) ? `@${task.username}` : (task.username || 'User');
 
   const bootText =
@@ -3767,7 +4015,7 @@ async function launchMirrorTask(task, env) {
     `<blockquote>📄 <b>Name :</b> <code>${escapeHtml(displayTitle)}</code></blockquote>\n\n` +
     `┌ Status : <a href="${actionsUrl}">Booting..</a> (0.00%)\n` +
     `├ [<code>□□□□□□□□□□□□</code>]\n` +
-    `├ By : ${escapeHtml(displayBy)}\n` +
+    `├ By : ${escapeHtml(displayBy)} [${escapeHtml(userRole)}]\n` +
     `├ UserID : <code>[${escapeHtml(String(userId))}]</code>\n` +
     `├ Size : <code>${fileSize > 0 ? fmtBytes(fileSize) : 'Unknown'}</code>\n` +
     `${destLines}` +
@@ -3792,6 +4040,7 @@ async function launchMirrorTask(task, env) {
   const jobData = {
     jobId: taskId,
     userId: String(userId),
+    userRole,
     credUserId,
     username: task.username,
     chatId,
@@ -3931,6 +4180,7 @@ async function executeDirectDriveCopy(task, item, accessToken, env) {
       }
     }
 
+    const userRole = task.userRole || await getUserRoleTag(userId, !!task.isChannel, env);
     const uname = task.username && !task.username.startsWith('@') && /^[a-zA-Z0-9_]{4,}$/.test(task.username)
       ? `@${task.username}`
       : (task.username || 'User');
@@ -3944,7 +4194,7 @@ async function executeDirectDriveCopy(task, item, accessToken, env) {
     if (shared) {
       text += `Access  ·  Anyone with the link\n\n`;
     }
-    text += `User  ·  ${escapeHtml(uname)}`;
+    text += `User  ·  ${escapeHtml(uname)} [${escapeHtml(userRole)}]`;
 
     if (task.isSharedGcTemp) {
       text += `\n\n<blockquote>${GC_TEMP_NOTICE_HTML}</blockquote>`;
