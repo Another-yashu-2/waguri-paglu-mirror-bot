@@ -6,7 +6,7 @@ compatibility_date = "2024-11-01"
 crons = ["0 */6 * * *"]
 
 [vars]
-GITHUB_OWNER = "ur-yashu"
+GITHUB_OWNER = "Another-yashu-2"
 GITHUB_REPO = "waguri-paglu-mirror-bot"
 GITHUB_WORKFLOW = "mirror.yml"
 WORKER_URL = "https://telegram-gdrive-bot.yashdaive.workers.dev"
