@@ -3400,7 +3400,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         chatId,
         chatType,
         isChannel,
-        isSharedGcTemp,
+        isSharedGcTemp: false,
         threadId,
         replyToMsgId,
         menuMsgId: checkingMsgId,
@@ -3425,7 +3425,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         fileSize: 0,
         contentType: 'video/mp4',
         acceptRanges: true,
-        dest: defaultDest,
+        dest: 'telegram',
         leechAsDoc: !!profile.leechAsDoc,
         hasDrive,
         hasGithub: !!mCtx.hasGithub,
@@ -3439,12 +3439,12 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         ghGenerateNotes: false,
         driveFolderId: mCtx.driveFolderId,
         driveFolderName: mCtx.driveFolderName,
-        folderId: taskFolderId,
-        folderName: taskFolderName,
+        folderId: '',
+        folderName: 'Telegram (Leech)',
         mode: 'normal',
         selectFilter: '',
         archivePassword: '',
-        share: taskShare,
+        share: false,
         conflict: profile.conflict || 'rename',
         duplicateExists: false,
         createdAt: Date.now()
@@ -3574,6 +3574,8 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
     });
 
     const batchHasYtdl = items.some(i => i.type === 'ytdl');
+    const batchAllYtdl = forceYtdl || items.every(i => i.type === 'ytdl');
+    const batchDest = batchAllYtdl ? 'telegram' : defaultDest;
     task = {
       taskId,
       userId: String(userId),
@@ -3583,7 +3585,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       chatId,
       chatType,
       isChannel,
-      isSharedGcTemp,
+      isSharedGcTemp: batchAllYtdl ? false : isSharedGcTemp,
       threadId,
       replyToMsgId,
       menuMsgId: checkingMsgId,
@@ -3609,7 +3611,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       fileSize: 0,
       contentType: 'application/octet-stream',
       acceptRanges: false,
-      dest: defaultDest,
+      dest: batchDest,
       leechAsDoc: !!profile.leechAsDoc,
       hasDrive,
       hasGithub: !!mCtx.hasGithub,
@@ -3623,12 +3625,12 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       ghGenerateNotes: false,
       driveFolderId: mCtx.driveFolderId,
       driveFolderName: mCtx.driveFolderName,
-      folderId: taskFolderId,
-      folderName: taskFolderName,
+      folderId: batchAllYtdl ? '' : taskFolderId,
+      folderName: batchAllYtdl ? 'Telegram (Leech)' : taskFolderName,
       mode: 'normal',
       selectFilter: '',
       archivePassword: '',
-      share: taskShare,
+      share: batchAllYtdl ? false : taskShare,
       conflict: profile.conflict || 'rename',
       duplicateExists: false,
       createdAt: Date.now()

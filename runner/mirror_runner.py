@@ -4357,8 +4357,6 @@ class Mirror:
                 if mime != FOLDER_MIME and (self.mode == "normal" or mime.startswith("application/vnd.google-apps.")):
                     return self.gdrive_copy_file(item, meta, name)
         local = self.acquire_local(item, item_dir)
-        if item.get("type") == "ytdl" and self.dest != "telegram":
-            self.tg_upload_ytdl_media(local)
         res = self.process_and_upload(local)
         if isinstance(res, list):
             return res[0] if len(res) == 1 else {"_multi": res}
@@ -4372,8 +4370,6 @@ class Mirror:
             self.idx = i
             try:
                 local = self.acquire_local(item, bdir)
-                if item.get("type") == "ytdl" and self.dest != "telegram":
-                    self.tg_upload_ytdl_media(local)
             except InterruptedError:
                 raise
             except Exception as e:
