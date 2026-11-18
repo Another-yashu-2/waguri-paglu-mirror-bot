@@ -301,7 +301,14 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runGcExpiryCleanup(env));
+    const tasks = [];
+    if (!event?.cron || event.cron === '0 */6 * * *') {
+      tasks.push(runGcExpiryCleanup(env));
+    }
+    if (!event?.cron || event.cron === '30 18 * * *') {
+      tasks.push(cleanupGithubWorkflowRuns(env));
+    }
+    ctx.waitUntil(Promise.allSettled(tasks));
   }
 };
 
@@ -2206,6 +2213,32 @@ async function moveDriveItemToFolder(accessToken, fileId, targetFolderId) {
     }
   );
   return patchRes.ok;
+}
+
+async function cleanupGithubWorkflowRuns(env) {
+  if (!env.GITHUB_OWNER || !env.GITHUB_REPO || !env.GITHUB_PAT) return;
+  const baseUrl = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions/runs`;
+  const headers = {
+    Accept: 'application/vnd.github+json',
+    Authorization: `Bearer ${env.GITHUB_PAT}`,
+    'User-Agent': 'Telegram-GDrive-Worker'
+  };
+  try {
+    // Keep total subrequests <= 46 per invocation (safe under Cloudflare Free tier 50 limit)
+    const listRes = await fetch(`${baseUrl}?status=completed&per_page=45`, { headers });
+    if (!listRes.ok) return;
+    const data = await listRes.json();
+    const runs = Array.isArray(data?.workflow_runs) ? data.workflow_runs : [];
+    const targets = runs.filter(r => r && (r.status === 'completed' || r.conclusion === 'cancelled'));
+    for (let i = 0; i < targets.length; i += 5) {
+      const batch = targets.slice(i, i + 5);
+      await Promise.allSettled(
+        batch.map(r => fetch(`${baseUrl}/${r.id}`, { method: 'DELETE', headers }))
+      );
+    }
+  } catch (err) {
+    console.error('Workflow cleanup error:', err);
+  }
 }
 
 async function runGcExpiryCleanup(env) {
