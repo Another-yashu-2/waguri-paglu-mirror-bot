@@ -3150,7 +3150,9 @@ class Mirror:
         hint_name = item.get("name") or ""
         hint_size = int(item.get("size") or 0)
 
-        async with Client(
+        FastClient = self._make_fast_kurigram_client_cls(Client)
+        loop = asyncio.get_running_loop()
+        async with FastClient(
             f"tgdl_{JOB_ID or 'run'}_{self.idx}",
             **_kurigram_client_kwargs(Client, {
                 "api_id": int(TELEGRAM_API_ID),
@@ -3227,11 +3229,13 @@ class Mirror:
 
             t_start = time.time()
             win = [t_start, 0]
+            tick_busy = [False]
+            tick_err = [None]
             self.tick(out_path.name, "Downloading (TG)..", 0.0, 0, real_size, 0, None, "Kurigram MTProto", force=True)
 
             def on_prog(current, total):
                 global cancelled
-                if cancelled:
+                if cancelled or tick_err[0] is not None:
                     app.stop_transmission()
                     return
                 now = time.time()
@@ -3240,18 +3244,29 @@ class Mirror:
                 tot = total or real_size
                 pct = (100.0 * current / tot) if tot > 0 else 0.0
                 eta = ((tot - current) / spd) if spd > 0 and tot > current else None
-                try:
-                    self.tick(out_path.name, "Downloading (TG)..", pct, current, tot, spd, eta, "Kurigram MTProto")
-                except InterruptedError:
-                    cancelled = True
-                    app.stop_transmission()
-                    return
+                if not tick_busy[0] and (now - self.last_tick >= TICK_SECONDS):
+                    tick_busy[0] = True
+                    def _run_tick():
+                        global cancelled
+                        try:
+                            self.tick(out_path.name, "Downloading (TG)..", pct, current, tot, spd, eta, "Kurigram MTProto")
+                        except InterruptedError as ie:
+                            cancelled = True
+                            tick_err[0] = ie
+                        except Exception:
+                            pass
+                        finally:
+                            tick_busy[0] = False
+                    loop.run_in_executor(None, _run_tick)
                 if now - win[0] >= TICK_SECONDS:
                     win[0] = now
                     win[1] = current
 
-            saved = await app.download_media(dl_target, file_name=str(out_path), progress=on_prog)
-            if cancelled:
+            try:
+                saved = await app.download_media(dl_target, file_name=str(out_path), progress=on_prog)
+            finally:
+                await app.close_media_pool()
+            if cancelled or tick_err[0] is not None:
                 raise InterruptedError("Cancelled by user")
             final_p = Path(saved) if saved else out_path
             if not final_p.exists() or final_p.stat().st_size == 0:
@@ -3290,41 +3305,209 @@ class Mirror:
         return self.aria_download(item["url"], dest_dir, out_name=self.single_name(), label=self.item_label(item))
 
     def _make_fast_kurigram_client_cls(self, base_client_cls):
-        """Build a Client subclass with pooled temporary media sessions and fast multi-chunk uploads."""
+        """Build a Client subclass with per-DC pooled temporary media sessions for fast uploads and downloads."""
+        import pyrogram
         from pyrogram import raw
 
         class _FastKurigramClient(base_client_cls):
             def __init__(self_cli, *args, **kwargs):
                 super().__init__(*args, **kwargs)
-                self_cli._media_pool = []
+                self_cli._media_pools = {}
                 self_cli._media_pool_lock = asyncio.Lock()
                 self_cli._preuploaded = {}
                 self_cli._concurrent_hint = 1
 
+            @property
+            def _media_pool(self_cli):
+                return [s for pool in self_cli._media_pools.values() for s in pool]
+
             async def _ensure_media_pool(self_cli, dc_id: int, target_size: int = 6) -> list:
                 async with self_cli._media_pool_lock:
-                    while len(self_cli._media_pool) < target_size:
+                    pool = self_cli._media_pools.setdefault(dc_id, [])
+                    if not pool:
+                        try:
+                            await self_cli.get_session(dc_id)
+                        except Exception:
+                            pass
+                    while len(pool) < target_size:
                         try:
                             sess = await self_cli.get_session(dc_id, is_media=True, temporary=True)
                         except TypeError:
                             sess = await self_cli.get_session(dc_id, is_media=True)
-                            if sess not in self_cli._media_pool:
-                                self_cli._media_pool.append(sess)
+                            if sess not in pool:
+                                pool.append(sess)
                             break
                         except Exception:
                             break
                         if sess is not None:
-                            self_cli._media_pool.append(sess)
-                    return list(self_cli._media_pool)
+                            pool.append(sess)
+                    return list(pool)
 
             async def close_media_pool(self_cli):
-                for sess in list(self_cli._media_pool):
-                    try:
-                        if getattr(sess, "is_started", None):
-                            await sess.stop()
-                    except Exception:
+                for pool in list(self_cli._media_pools.values()):
+                    for sess in list(pool):
+                        try:
+                            if getattr(sess, "is_started", None):
+                                await sess.stop()
+                        except Exception:
+                            pass
+                self_cli._media_pools.clear()
+
+            async def get_file(self_cli, file_id, file_size=0, limit=0, offset=0, progress=None, progress_args=()):
+                try:
+                    from pyrogram.file_id import FileType
+                except Exception:
+                    FileType = None
+
+                file_type = getattr(file_id, "file_type", None)
+                is_chat_photo = (FileType is not None and file_type == FileType.CHAT_PHOTO)
+                if is_chat_photo or limit != 0 or offset != 0 or not file_size or file_size <= 2 * 1024 * 1024:
+                    async for chunk in super().get_file(
+                        file_id, file_size=file_size, limit=limit, offset=offset, progress=progress, progress_args=progress_args
+                    ):
+                        yield chunk
+                    return
+
+                dc_id = file_id.dc_id
+                try:
+                    pool = await self_cli._ensure_media_pool(dc_id, target_size=6)
+                except Exception:
+                    pool = []
+
+                if not pool:
+                    async for chunk in super().get_file(
+                        file_id, file_size=file_size, limit=limit, offset=offset, progress=progress, progress_args=progress_args
+                    ):
+                        yield chunk
+                    return
+
+                if FileType is not None and file_type == FileType.PHOTO:
+                    location = raw.types.InputPhotoFileLocation(
+                        id=file_id.media_id,
+                        access_hash=file_id.access_hash,
+                        file_reference=file_id.file_reference,
+                        thumb_size=file_id.thumbnail_size,
+                    )
+                else:
+                    location = raw.types.InputDocumentFileLocation(
+                        id=file_id.media_id,
+                        access_hash=file_id.access_hash,
+                        file_reference=file_id.file_reference,
+                        thumb_size=file_id.thumbnail_size,
+                    )
+
+                chunk_size = 1024 * 1024
+                async with self_cli.get_file_semaphore:
+                    r0 = await pool[0].invoke(
+                        raw.functions.upload.GetFile(location=location, offset=0, limit=chunk_size),
+                        sleep_threshold=60,
+                    )
+                    if not isinstance(r0, raw.types.upload.File):
+                        # Release semaphore and fall back cleanly for CDN redirects
                         pass
-                self_cli._media_pool.clear()
+                    else:
+                        chunk0 = r0.bytes
+                        yield chunk0
+                        done_bytes = len(chunk0)
+                        if progress:
+                            res = progress(min(done_bytes, file_size), file_size, *progress_args)
+                            if inspect.isawaitable(res):
+                                await res
+                        if len(chunk0) < chunk_size or done_bytes >= file_size:
+                            return
+
+                        total_chunks = int(math.ceil(file_size / chunk_size))
+                        workers_count = min(12, total_chunks - 1)
+                        max_ahead = 16
+                        next_req = 1
+                        next_yield = 1
+                        eof_idx = None
+                        results: dict[int, bytes] = {}
+                        failures: list[Exception] = []
+                        data_event = asyncio.Event()
+                        space_event = asyncio.Event()
+
+                        async def _dl_worker(w_idx: int):
+                            nonlocal next_req, eof_idx
+                            sess = pool[w_idx % len(pool)]
+                            while True:
+                                if failures or cancelled:
+                                    data_event.set()
+                                    return
+                                if eof_idx is not None and next_req >= eof_idx:
+                                    return
+                                if next_req >= total_chunks:
+                                    return
+                                if next_req - next_yield >= max_ahead:
+                                    space_event.clear()
+                                    if next_req - next_yield >= max_ahead and not (failures or cancelled):
+                                        await space_event.wait()
+                                        continue
+                                idx = next_req
+                                next_req += 1
+                                if idx >= total_chunks or (eof_idx is not None and idx >= eof_idx):
+                                    return
+                                try:
+                                    resp = await sess.invoke(
+                                        raw.functions.upload.GetFile(
+                                            location=location,
+                                            offset=idx * chunk_size,
+                                            limit=chunk_size,
+                                        ),
+                                        sleep_threshold=60,
+                                    )
+                                    if not isinstance(resp, raw.types.upload.File):
+                                        raise RuntimeError("Unexpected non-file response during GetFile")
+                                    b = resp.bytes
+                                    results[idx] = b
+                                    if len(b) < chunk_size and (eof_idx is None or idx + 1 < eof_idx):
+                                        eof_idx = idx + 1
+                                    data_event.set()
+                                except Exception as exc:
+                                    failures.append(exc)
+                                    data_event.set()
+                                    return
+
+                        worker_tasks = [asyncio.create_task(_dl_worker(i)) for i in range(workers_count)]
+                        try:
+                            while next_yield < total_chunks:
+                                if eof_idx is not None and next_yield >= eof_idx:
+                                    break
+                                if cancelled:
+                                    raise pyrogram.StopTransmission()
+                                if failures:
+                                    raise failures[0]
+                                if next_yield not in results:
+                                    data_event.clear()
+                                    if next_yield not in results and not failures and not cancelled:
+                                        if eof_idx is not None and next_yield >= eof_idx:
+                                            break
+                                        await data_event.wait()
+                                    continue
+
+                                chunk = results.pop(next_yield)
+                                next_yield += 1
+                                space_event.set()
+                                if not chunk:
+                                    break
+                                yield chunk
+                                done_bytes += len(chunk)
+                                if progress:
+                                    res = progress(min(done_bytes, file_size), file_size, *progress_args)
+                                    if inspect.isawaitable(res):
+                                        await res
+                        finally:
+                            space_event.set()
+                            for t in worker_tasks:
+                                if not t.done():
+                                    t.cancel()
+                            await asyncio.gather(*worker_tasks, return_exceptions=True)
+                        return
+
+                async for chunk in super().get_file(
+                    file_id, file_size=file_size, limit=limit, offset=offset, progress=progress, progress_args=progress_args
+                ):
+                    yield chunk
 
             async def save_file(self_cli, path, file_id=None, file_part=0, progress=None, progress_args=()):
                 if path is None:
