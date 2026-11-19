@@ -30,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -94,9 +95,21 @@ signal.signal(signal.SIGINT, handle_sig)
 # GENERIC HELPERS
 # ============================================================================
 
+_MASKED_SECRETS = set()
+
+
 def mask_secret(val: str, min_len: int = 5):
     if val and len(val) >= min_len:
+        _MASKED_SECRETS.add(val)
         print(f"::add-mask::{val}", flush=True)
+
+
+def redact_secrets(text: str) -> str:
+    out = str(text or "")
+    for secret in sorted(_MASKED_SECRETS, key=len, reverse=True):
+        if secret in out:
+            out = out.replace(secret, "***")
+    return out
 
 
 def http_json(url: str, data: dict = None, headers: dict = None, method: str = None, timeout: int = 15):
@@ -121,12 +134,20 @@ def http_json(url: str, data: dict = None, headers: dict = None, method: str = N
 
 
 def worker_call(path: str, payload: dict):
-    return http_json(
-        f"{WORKER_URL}{path}",
-        data=payload,
-        headers={"Authorization": f"Bearer {JOB_SECRET}"},
-        timeout=15,
-    )
+    res = {}
+    for attempt in range(3):
+        res = http_json(
+            f"{WORKER_URL}{path}",
+            data=payload,
+            headers={"Authorization": f"Bearer {JOB_SECRET}"},
+            timeout=15,
+        )
+        status = res.get("http_status")
+        if res.get("ok") or (status is not None and 400 <= status < 500):
+            return res
+        if attempt < 2:
+            time.sleep(0.5 * (attempt + 1))
+    return res
 
 
 def tg_call(method: str, payload: dict):
@@ -1715,7 +1736,8 @@ class Mirror:
                 length = int(self.headers.get("Content-Length") or 0)
                 if length:
                     self.rfile.read(length)
-                ok = mirror_ref.refresh_token(force=True)
+                # Refresh in memory without racing rclone's own config rewrite
+                ok = mirror_ref.refresh_token(force=True, write_conf=False)
                 if not ok:
                     self.send_response(500)
                     self.end_headers()
@@ -1778,7 +1800,7 @@ class Mirror:
         os.chmod(tmp, 0o600)
         os.replace(tmp, RCLONE_CONF)
 
-    def refresh_token(self, force: bool = True) -> bool:
+    def refresh_token(self, force: bool = True, write_conf: bool = True) -> bool:
         with self.token_lock:
             res = worker_call("/internal/refresh", {"job_id": JOB_ID, "force": force})
             if res.get("ok") and res.get("accessToken"):
@@ -1786,12 +1808,19 @@ class Mirror:
                 self.token_expiry_ms = res.get("expiry") or None
                 self.token_time = time.time()
                 mask_secret(self.access_token)
-                self.write_rclone_conf()
+                if write_conf:
+                    self.write_rclone_conf()
                 return True
             return False
 
     def ensure_token(self, max_age: float = TOKEN_REFRESH_SECONDS):
-        if time.time() - self.token_time >= max_age:
+        exp_soon = False
+        if self.token_expiry_ms:
+            try:
+                exp_soon = (time.time() * 1000) >= (float(self.token_expiry_ms) - 10 * 60 * 1000)
+            except (TypeError, ValueError):
+                exp_soon = False
+        if exp_soon or (time.time() - self.token_time >= max_age):
             self.refresh_token(force=True)
 
     # ---------------- Drive API ----------------
@@ -1941,82 +1970,157 @@ class Mirror:
     # ---------------- Aria2c ----------------
 
     def start_aria(self):
-        self.aria_proc = subprocess.Popen(
-            [
-                "aria2c",
-                "--enable-rpc=true",
-                "--rpc-listen-all=false",
-                "--rpc-listen-port=6800",
-                "--max-connection-per-server=16",
-                "--split=16",
-                "--min-split-size=1M",
-                "--file-allocation=none",
-                "--continue=true",
-                "--allow-overwrite=true",
-                "--auto-file-renaming=false",
-                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                f"--dir={DL_DIR}",
-                "--quiet=true",
-            ],
-            stdin=subprocess.DEVNULL,
-        )
-        time.sleep(1.0)
+        self.stop_aria()
+        DL_DIR.mkdir(parents=True, exist_ok=True)
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        aria_log = WORK_DIR / "aria2.log"
+        aria_log.unlink(missing_ok=True)
+        log_fp = open(aria_log, "w", encoding="utf-8")
+        try:
+            self.aria_proc = subprocess.Popen(
+                [
+                    "aria2c",
+                    "--enable-rpc=true",
+                    "--rpc-listen-all=false",
+                    "--rpc-listen-port=6800",
+                    "--max-connection-per-server=16",
+                    "--split=16",
+                    "--min-split-size=1M",
+                    "--file-allocation=none",
+                    "--continue=true",
+                    "--allow-overwrite=true",
+                    "--auto-file-renaming=false",
+                    "--connect-timeout=20",
+                    "--timeout=60",
+                    "--max-tries=5",
+                    "--retry-wait=2",
+                    "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                    f"--dir={DL_DIR}",
+                    "--quiet=true",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=log_fp,
+                stderr=subprocess.STDOUT,
+            )
+        finally:
+            log_fp.close()
+
+        deadline = time.time() + 10.0
+        last_err = ""
+        while time.time() < deadline:
+            if self.aria_proc.poll() is not None:
+                err_txt = ""
+                try:
+                    err_txt = aria_log.read_text(encoding="utf-8", errors="ignore")[-400:]
+                except OSError:
+                    pass
+                raise RuntimeError(f"aria2c exited early ({self.aria_proc.returncode}): {err_txt.strip() or 'no output'}")
+            ver = aria2_rpc("aria2.getVersion")
+            if ver.get("result"):
+                return
+            last_err = ver.get("error") or ""
+            time.sleep(0.3)
+        raise RuntimeError(f"aria2c RPC did not become ready: {last_err}")
 
     def stop_aria(self):
         if self.aria_proc:
             try:
                 self.aria_proc.terminate()
+                self.aria_proc.wait(timeout=3)
             except Exception:
-                pass
+                try:
+                    self.aria_proc.kill()
+                except Exception:
+                    pass
+            self.aria_proc = None
 
     def aria_download(self, url: str, dest_dir: Path, out_name: str = None, headers: list = None, label: str = None, user_agent: str = None) -> Path:
-        if not self.aria_proc:
-            self.start_aria()
         dest_dir.mkdir(parents=True, exist_ok=True)
-        opts = {"dir": str(dest_dir)}
-        if out_name:
-            opts["out"] = out_name
-        if headers:
-            opts["header"] = headers
-        if user_agent:
-            opts["user-agent"] = user_agent
-        elif is_sourceforge_url(url):
-            opts["user-agent"] = WGET_UA
-        add_res = aria2_rpc("aria2.addUri", [[url], opts])
-        gid = add_res.get("result")
-        if not gid:
-            raise RuntimeError("Failed to start download in aria2c.")
+        last_exc = None
+        for attempt in range(3):
+            if not self.aria_proc or self.aria_proc.poll() is not None:
+                self.start_aria()
+            opts = {"dir": str(dest_dir)}
+            if out_name:
+                opts["out"] = out_name
+            if headers:
+                opts["header"] = headers
+            if user_agent:
+                opts["user-agent"] = user_agent
+            elif is_sourceforge_url(url):
+                opts["user-agent"] = WGET_UA
+            if attempt > 0:
+                # Fresh retry without Range resume if a previous attempt choked on non-rangeable server
+                opts["continue"] = "false"
+                for p in list(dest_dir.iterdir()):
+                    if p.is_file() and (p.name.endswith(".aria2") or (out_name and p.name == out_name)):
+                        p.unlink(missing_ok=True)
 
-        cur_name = out_name or label or "Downloading..."
-        final_path = None
-        while True:
-            st = (aria2_rpc("aria2.tellStatus", [gid]).get("result")) or {}
-            if st.get("followedBy"):
-                gid = st["followedBy"][0]
-                continue
+            add_res = aria2_rpc("aria2.addUri", [[url], opts])
+            gid = add_res.get("result")
+            if not gid:
+                last_exc = RuntimeError(f"Failed to start download in aria2c: {add_res.get('error') or add_res}")
+                self.stop_aria()
+                if attempt < 2:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                raise last_exc
 
-            status = st.get("status", "active")
-            total_len = int(st.get("totalLength") or 0)
-            done_len = int(st.get("completedLength") or 0)
-            dl_spd = int(st.get("downloadSpeed") or 0)
-            files = st.get("files") or []
-            if files and files[0].get("path"):
-                final_path = Path(files[0]["path"])
-                cur_name = final_path.name
-
-            pct = (100.0 * done_len / total_len) if total_len > 0 else 0.0
-            eta = ((total_len - done_len) / dl_spd) if (dl_spd > 0 and total_len > done_len) else None
+            cur_name = out_name or label or "Downloading..."
+            final_path = None
             try:
-                self.tick(cur_name, "Download..", pct, done_len, total_len, dl_spd, eta, ARIA_ENGINE)
+                while True:
+                    st_res = aria2_rpc("aria2.tellStatus", [gid])
+                    st = st_res.get("result") or {}
+                    if not st:
+                        if self.aria_proc and self.aria_proc.poll() is not None:
+                            raise RuntimeError(f"aria2c crashed during download (code {self.aria_proc.returncode})")
+                        raise RuntimeError(f"aria2c RPC error: {st_res.get('error') or 'empty tellStatus'}")
+                    if st.get("followedBy"):
+                        gid = st["followedBy"][0]
+                        continue
+
+                    status = st.get("status", "active")
+                    total_len = int(st.get("totalLength") or 0)
+                    done_len = int(st.get("completedLength") or 0)
+                    dl_spd = int(st.get("downloadSpeed") or 0)
+                    files = st.get("files") or []
+                    if files and files[0].get("path"):
+                        final_path = Path(files[0]["path"])
+                        cur_name = final_path.name
+
+                    pct = (100.0 * done_len / total_len) if total_len > 0 else 0.0
+                    eta = ((total_len - done_len) / dl_spd) if (dl_spd > 0 and total_len > done_len) else None
+                    try:
+                        self.tick(cur_name, "Download..", pct, done_len, total_len, dl_spd, eta, ARIA_ENGINE)
+                    except InterruptedError:
+                        aria2_rpc("aria2.forceRemove", [gid])
+                        raise
+
+                    if status == "complete":
+                        break
+                    if status in ("error", "removed"):
+                        raise RuntimeError(f"Download failed: {st.get('errorMessage') or 'unknown aria2c error'}")
+                    time.sleep(1.0)
+                last_exc = None
+                break
             except InterruptedError:
-                aria2_rpc("aria2.forceRemove", [gid])
+                raise
+            except Exception as exc:
+                last_exc = exc
+                msg_low = str(exc).lower()
+                is_transient = any(
+                    t in msg_low
+                    for t in ("timed out", "timeout", "connection", "reset", "eof", "aria2c", "502", "503", "504", "429", "range")
+                )
+                if attempt < 2 and is_transient:
+                    aria2_rpc("aria2.forceRemove", [gid])
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
                 raise
 
-            if status == "complete":
-                break
-            if status in ("error", "removed"):
-                raise RuntimeError(f"Download failed: {st.get('errorMessage') or 'unknown aria2c error'}")
-            time.sleep(1.0)
+        if last_exc is not None:
+            raise last_exc
 
         if not final_path or not final_path.exists():
             cands = [p for p in dest_dir.iterdir() if p.is_file() and not p.name.endswith(".aria2")]
@@ -2078,13 +2182,17 @@ class Mirror:
 
     def run_rclone(self, args: list, filename: str, status_text: str, size_hint: float, engine: str = "Rclone Drive"):
         global cancelled
+        if self.access_token:
+            self.ensure_token()
         log_path = WORK_DIR / "rclone.log"
         log_path.unlink(missing_ok=True)
         cmd = ["rclone", *args,
                "--rc", "--rc-addr=127.0.0.1:5572", "--rc-no-auth",
                "--drive-chunk-size=128M", "--transfers=4", "--checkers=8",
+               "--tpslimit=8", "--tpslimit-burst=16",
+               "--timeout=5m", "--contimeout=30s",
                "--drive-stop-on-upload-limit", "--drive-stop-on-download-limit",
-               "--retries=3", "--low-level-retries=10",
+               "--retries=5", "--low-level-retries=20",
                "--log-level=ERROR", f"--log-file={log_path}"]
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
         last = 0.0
@@ -2123,6 +2231,8 @@ class Mirror:
                 tail = log_path.read_text(encoding="utf-8", errors="ignore")[-4000:]
             except OSError:
                 pass
+            if tail.strip():
+                print(redact_secrets(f"[Rclone Error Tail]\n{tail.strip()}"), file=sys.stderr, flush=True)
             last_line = tail.strip().splitlines()[-1] if tail.strip() else ""
             raise RuntimeError(
                 friendly_drive_error(tail) or f"Rclone exited with code {proc.returncode}. {last_line[-200:]}".strip()
@@ -3323,23 +3433,30 @@ class Mirror:
 
             async def _ensure_media_pool(self_cli, dc_id: int, target_size: int = 6) -> list:
                 async with self_cli._media_pool_lock:
-                    pool = self_cli._media_pools.setdefault(dc_id, [])
+                    raw_pool = self_cli._media_pools.setdefault(dc_id, [])
+                    pool = [
+                        s for s in raw_pool
+                        if getattr(s, "is_started", True) and getattr(s, "is_connected", True)
+                    ]
+                    raw_pool[:] = pool
                     if not pool:
                         try:
                             await self_cli.get_session(dc_id)
                         except Exception:
                             pass
-                    while len(pool) < target_size:
+                    attempts = 0
+                    while len(pool) < target_size and attempts < target_size * 2:
+                        attempts += 1
                         try:
                             sess = await self_cli.get_session(dc_id, is_media=True, temporary=True)
                         except TypeError:
                             sess = await self_cli.get_session(dc_id, is_media=True)
-                            if sess not in pool:
+                            if sess is not None and sess not in pool:
                                 pool.append(sess)
                             break
                         except Exception:
                             break
-                        if sess is not None:
+                        if sess is not None and sess not in pool:
                             pool.append(sess)
                     return list(pool)
 
@@ -3447,15 +3564,43 @@ class Mirror:
                                 next_req += 1
                                 if idx >= total_chunks or (eof_idx is not None and idx >= eof_idx):
                                     return
+                                resp = None
+                                last_exc = None
+                                for attempt in range(4):
+                                    if failures or cancelled:
+                                        data_event.set()
+                                        return
+                                    cur_sess = pool[(w_idx + attempt) % len(pool)]
+                                    try:
+                                        resp = await cur_sess.invoke(
+                                            raw.functions.upload.GetFile(
+                                                location=location,
+                                                offset=idx * chunk_size,
+                                                limit=chunk_size,
+                                            ),
+                                            sleep_threshold=60,
+                                        )
+                                        last_exc = None
+                                        break
+                                    except Exception as exc:
+                                        last_exc = exc
+                                        wait_val = getattr(exc, "value", None)
+                                        if wait_val is not None and "flood" in type(exc).__name__.lower():
+                                            await asyncio.sleep(min(int(wait_val) + 1, 120))
+                                            continue
+                                        msg_low = str(exc).lower()
+                                        is_trans = isinstance(exc, (TimeoutError, ConnectionError, OSError, asyncio.TimeoutError)) or any(
+                                            t in msg_low for t in ("timed out", "timeout", "connection", "reset", "eof", "not connected")
+                                        )
+                                        if attempt < 3 and is_trans:
+                                            await asyncio.sleep(1.0 * (attempt + 1))
+                                            continue
+                                        break
+                                if last_exc is not None:
+                                    failures.append(last_exc)
+                                    data_event.set()
+                                    return
                                 try:
-                                    resp = await sess.invoke(
-                                        raw.functions.upload.GetFile(
-                                            location=location,
-                                            offset=idx * chunk_size,
-                                            limit=chunk_size,
-                                        ),
-                                        sleep_threshold=60,
-                                    )
                                     if not isinstance(resp, raw.types.upload.File):
                                         raise RuntimeError("Unexpected non-file response during GetFile")
                                     b = resp.bytes
@@ -3513,7 +3658,7 @@ class Mirror:
                 if path is None:
                     return None
                 if file_id is None and file_part == 0 and isinstance(path, (str, os.PathLike)):
-                    cached = self_cli._preuploaded.pop(str(path), None)
+                    cached = self_cli._preuploaded.get(str(path))
                     if cached is not None:
                         return cached
 
@@ -3562,7 +3707,6 @@ class Mirror:
 
                     async def _chunk_worker(w_idx: int):
                         nonlocal done_bytes
-                        sess = pool[(start_offset + w_idx) % len(pool)]
                         while True:
                             item = await queue.get()
                             if item is None:
@@ -3570,21 +3714,43 @@ class Mirror:
                             if failures or cancelled:
                                 continue
                             part_no, chunk_bytes = item
-                            try:
-                                rpc = raw.functions.upload.SaveBigFilePart(
-                                    file_id=gen_id,
-                                    file_part=part_no,
-                                    file_total_parts=total_parts,
-                                    bytes=chunk_bytes,
-                                )
-                                await sess.invoke(rpc)
-                                done_bytes += len(chunk_bytes)
-                                if progress:
-                                    res = progress(min(done_bytes, file_size), file_size, *progress_args)
-                                    if inspect.isawaitable(res):
-                                        await res
-                            except Exception as exc:
-                                failures.append(exc)
+                            rpc = raw.functions.upload.SaveBigFilePart(
+                                file_id=gen_id,
+                                file_part=part_no,
+                                file_total_parts=total_parts,
+                                bytes=chunk_bytes,
+                            )
+                            last_exc = None
+                            for attempt in range(4):
+                                if failures or cancelled:
+                                    break
+                                sess = pool[(start_offset + w_idx + attempt) % len(pool)]
+                                try:
+                                    await sess.invoke(rpc, sleep_threshold=60)
+                                    last_exc = None
+                                    break
+                                except Exception as exc:
+                                    last_exc = exc
+                                    wait_val = getattr(exc, "value", None)
+                                    if wait_val is not None and "flood" in type(exc).__name__.lower():
+                                        await asyncio.sleep(min(int(wait_val) + 1, 120))
+                                        continue
+                                    msg_low = str(exc).lower()
+                                    is_trans = isinstance(exc, (TimeoutError, ConnectionError, OSError, asyncio.TimeoutError)) or any(
+                                        t in msg_low for t in ("timed out", "timeout", "connection", "reset", "eof", "not connected")
+                                    )
+                                    if attempt < 3 and is_trans:
+                                        await asyncio.sleep(1.0 * (attempt + 1))
+                                        continue
+                                    break
+                            if last_exc is not None:
+                                failures.append(last_exc)
+                                continue
+                            done_bytes += len(chunk_bytes)
+                            if progress:
+                                res = progress(min(done_bytes, file_size), file_size, *progress_args)
+                                if inspect.isawaitable(res):
+                                    await res
 
                     fp = open(path, "rb")
                     worker_tasks = [asyncio.create_task(_chunk_worker(i)) for i in range(workers_count)]
@@ -3597,13 +3763,34 @@ class Mirror:
                             chunk = fp.read(part_size)
                             if not chunk:
                                 break
-                            await queue.put((part_no, chunk))
+                            while True:
+                                if failures or cancelled:
+                                    break
+                                try:
+                                    await asyncio.wait_for(queue.put((part_no, chunk)), timeout=1.0)
+                                    break
+                                except asyncio.TimeoutError:
+                                    continue
                             part_no += 1
                     except Exception as exc:
                         failures.append(exc)
                     finally:
+                        if failures or cancelled:
+                            while not queue.empty():
+                                try:
+                                    queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
                         for _ in worker_tasks:
-                            await queue.put(None)
+                            while True:
+                                try:
+                                    queue.put_nowait(None)
+                                    break
+                                except asyncio.QueueFull:
+                                    try:
+                                        queue.get_nowait()
+                                    except asyncio.QueueEmpty:
+                                        break
                         await asyncio.gather(*worker_tasks, return_exceptions=True)
                         fp.close()
 
@@ -3867,7 +4054,12 @@ class Mirror:
                                 if attempt < 2 and any(t in str(err).lower() for t in ("timed out", "timeout", "connection", "reset", "eof")):
                                     await asyncio.sleep(2 * (attempt + 1))
                                     continue
+                                if "file_part" in str(err).lower() or "media_empty" in str(err).lower():
+                                    app._preuploaded.pop(str(fpath), None)
+                                    if attempt < 2:
+                                        continue
                                 raise
+                        app._preuploaded.pop(str(fpath), None)
                         per_done[file_idx] = sz
                         msg_link = getattr(sent_msg, "link", "") or ""
                         sent_items.append({
@@ -4294,7 +4486,7 @@ class Mirror:
         try:
             self.tick(targets[0].name, "Setting up Kurigram..", 0.0, 0, path_size(targets[0]), 0, None, "Kurigram MTProto", force=True)
             ensure_kurigram_tools()
-            sent_items = asyncio.run(self._kurigram_send_files(targets))
+            sent_items = _run_async_fast(self._kurigram_send_files(targets))
             self.tg_sent += len(sent_items)
         except InterruptedError:
             raise
@@ -4722,6 +4914,11 @@ def main():
         worker_call("/internal/complete", {"job_id": JOB_ID, "status": "cancelled"})
     except Exception as e:
         reason = friendly_drive_error(str(e)) or str(e)
+        print(
+            redact_secrets(f"[Transfer Failed] {reason}\n{traceback.format_exc()}"),
+            file=sys.stderr,
+            flush=True,
+        )
         text = (
             f"<blockquote><b>Transfer Failed</b>\n\n"
             f"<code>{html.escape(display)}</code></blockquote>\n\n"

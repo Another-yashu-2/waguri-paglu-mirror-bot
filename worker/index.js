@@ -17,6 +17,7 @@ export class StateDO {
     if (this.ready) return;
     this.sql.exec('CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL, exp INTEGER)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS leech_del (job_id TEXT PRIMARY KEY, payload TEXT NOT NULL, exp INTEGER NOT NULL)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS chat_msgs (chat_id TEXT NOT NULL, msg_id INTEGER NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (chat_id, msg_id))');
     this.ready = true;
   }
 
@@ -95,6 +96,44 @@ export class StateDO {
         if (jobId) {
           this.sql.exec('DELETE FROM leech_del WHERE job_id = ?', jobId);
           await this.rescheduleAlarm();
+        }
+        return Response.json({ ok: true });
+      }
+    }
+    if (url.pathname === '/chat-msg') {
+      const cutoff = now - 48 * 3600 * 1000;
+      if (request.method === 'GET') {
+        const cid = url.searchParams.get('chat_id') || '';
+        if (!cid) return Response.json({ msgIds: [] });
+        const rows = [...this.sql.exec('SELECT msg_id FROM chat_msgs WHERE chat_id = ? AND ts >= ? ORDER BY msg_id DESC', cid, cutoff)];
+        return Response.json({ msgIds: rows.map(r => Number(r.msg_id)) });
+      }
+      if (request.method === 'POST') {
+        const body = await request.json();
+        const cid = body?.chatId ? String(body.chatId) : '';
+        const ids = Array.isArray(body?.msgIds) ? body.msgIds : [];
+        if (cid && ids.length) {
+          for (const rawId of ids) {
+            const mid = Number(rawId);
+            if (Number.isInteger(mid) && mid > 0) {
+              this.sql.exec('INSERT OR REPLACE INTO chat_msgs (chat_id, msg_id, ts) VALUES (?, ?, ?)', cid, mid, now);
+            }
+          }
+          if (Math.random() < 0.02) {
+            this.sql.exec('DELETE FROM chat_msgs WHERE ts < ?', cutoff);
+          }
+        }
+        return Response.json({ ok: true });
+      }
+      if (request.method === 'DELETE') {
+        const cid = url.searchParams.get('chat_id') || '';
+        const maxId = Number(url.searchParams.get('max_id') || 0);
+        if (cid) {
+          if (maxId > 0) {
+            this.sql.exec('DELETE FROM chat_msgs WHERE chat_id = ? AND msg_id <= ?', cid, maxId);
+          } else {
+            this.sql.exec('DELETE FROM chat_msgs WHERE chat_id = ?', cid);
+          }
         }
         return Response.json({ ok: true });
       }
@@ -2519,6 +2558,8 @@ async function handleTelegramUpdate(update, env) {
   const msg = update.message || update.channel_post;
   if (!msg) return;
 
+  await trackChatMessages(msg.chat.id, [msg.message_id], env);
+
   const chatId = msg.chat.id;
   const chatType = msg.chat.type || (isChannelPost ? 'channel' : 'private');
   const isPrivate = chatType === 'private';
@@ -2639,7 +2680,7 @@ async function handleTelegramUpdate(update, env) {
       await sendMessage(chatId, `<i>Input cancelled.</i>`, env, null, msg.message_id, threadId);
       return;
     }
-    if (cmd && ['/start', '/help', '/login', '/logout', '/ghlogin', '/ghlogout', '/settings'].includes(cmd)) {
+    if (cmd && ['/start', '/help', '/login', '/logout', '/ghlogin', '/ghlogout', '/settings', '/clear'].includes(cmd)) {
       await getStore(env).delete(pKey);
     } else {
       const promptState = JSON.parse(promptRaw);
@@ -2911,6 +2952,34 @@ async function handleTelegramUpdate(update, env) {
 
   if (cmd === '/history') {
     await sendHistory(chatId, userId, null, env, threadId);
+    return;
+  }
+
+  if (cmd === '/clear') {
+    if (isChannel) return;
+    if (isGroup) {
+      const allowedClear = (await isAdmin(userId, env)) || (await isTelegramGroupAdmin(chatId, userId, env));
+      if (!allowedClear) {
+        await sendMessage(chatId, `<i>Only group or bot admins can clear chat messages.</i>`, env, null, msg.message_id, threadId);
+        return;
+      }
+    }
+    const trackedIds = await getTrackedChatMessages(chatId, env);
+    const lastClearRaw = await getStore(env).get(`last_clear_msg_id:${chatId}`);
+    const lastClearId = Number(lastClearRaw || 0);
+    const floorId = Math.max(1, lastClearId > 0 ? lastClearId + 1 : 1, msg.message_id - 249);
+    await deleteChatMessagesBulk(chatId, trackedIds, msg.message_id, floorId, env);
+    await clearTrackedChatMessages(chatId, msg.message_id, env);
+    await getStore(env).put(`last_clear_msg_id:${chatId}`, String(msg.message_id));
+    const ts = formatIstTimestamp(Date.now());
+    await sendMessage(
+      chatId,
+      `<blockquote>🧹 <b>Chat history cleared at</b> <code>${escapeHtml(ts)}</code></blockquote>`,
+      env,
+      null,
+      null,
+      threadId
+    );
     return;
   }
 
@@ -5973,6 +6042,9 @@ async function handleInternalRunner(request, path, env) {
 
   if (path === '/internal/complete') {
     job.status = body.status || 'completed';
+    if (body.error) {
+      job.error = String(body.error).slice(0, 500);
+    }
     if (!job.statsRecorded && !job.isChannel) {
       job.statsRecorded = true;
       const statField = job.status === 'cancelled' ? 'cancelled' : (job.status === 'failed' ? 'failed' : 'succeeded');
@@ -6002,6 +6074,7 @@ async function handleInternalRunner(request, path, env) {
       if (job.dest === 'telegram') {
         const msgIds = Array.isArray(body.leech_msg_ids) ? body.leech_msg_ids.filter(Boolean) : [];
         if (msgIds.length > 0 && job.chatId) {
+          await trackChatMessages(job.chatId, msgIds, env);
           const isPrivateChat = job.chatType === 'private';
           const noticeText = isPrivateChat
             ? `<blockquote><b>⏳ Save Your File(s) — Auto-Delete in 30 Minutes</b></blockquote>\n\n` +
@@ -6326,7 +6399,7 @@ async function sendStartScreen(chatId, userId, username, env, opts = {}) {
     `<code>/leech &lt;link&gt;</code> (<code>/l</code>) — Leech files directly into Telegram (auto-splits &gt; 2 GB)\n\n` +
     `<code>/yt &lt;link&gt;</code> — Download videos / audio / playlists via yt-dlp\n\n` +
     `/setdldir — Browse &amp; select target folder    /ghlogin — Connect GitHub Releases\n\n` +
-    `/tasks — Active transfers    /history — Recent transfers\n\n` +
+    `/tasks — Active transfers    /history — Recent transfers    /clear — Clear chat\n\n` +
     `/settings — Preferences    /help — Full guide    /logout — Unlink Drive`;
 
   await sendMessage(
@@ -6382,6 +6455,7 @@ async function sendHelpScreen(chatId, userId, env, opts = {}) {
     `<b>Status &amp; History</b>\n\n` +
     `/tasks — View or reopen running jobs\n\n` +
     `/history — View recent transfers\n\n` +
+    `/clear — Clear current chat messages (keeps /history intact)\n\n` +
     `<b>Group Storage Rules</b>\n\n` +
     `• Bare links &amp; casual media in groups are ignored — always use <code>/m</code>, <code>/l</code>, or <code>/yt</code>.\n` +
     `• Without <code>/login</code>, group <code>/m</code> files upload to shared temporary Drive storage (public link, auto-deleted after <b>5 days</b>; files ≤ 50 GB can be requested for permanent storage).\n` +
@@ -7738,7 +7812,7 @@ async function postTelegramMessage(method, payload, env) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
-  const data = await res.json();
+  let data = await res.json();
   if (!data?.ok && payload.reply_markup?.inline_keyboard) {
     const hasStyle = payload.reply_markup.inline_keyboard.some(row => row.some(b => b && b.style));
     if (hasStyle) {
@@ -7756,8 +7830,11 @@ async function postTelegramMessage(method, payload, env) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(cleanPayload)
       });
-      return await retryRes.json();
+      data = await retryRes.json();
     }
+  }
+  if (method === 'sendMessage' && data?.ok && data.result?.message_id && payload.chat_id) {
+    await trackChatMessages(payload.chat_id, [data.result.message_id], env);
   }
   return data;
 }
@@ -7788,11 +7865,117 @@ async function editMessage(chatId, messageId, text, env, replyMarkup = null) {
 }
 
 async function deleteMessage(chatId, messageId, env) {
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId, message_id: messageId })
   });
+  return await res.json().catch(() => ({ ok: false }));
+}
+
+async function deleteMessagesBatch(chatId, messageIds, env) {
+  if (!messageIds.length) return { ok: true };
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, message_ids: messageIds })
+  });
+  return await res.json().catch(() => ({ ok: false }));
+}
+
+async function trackChatMessages(chatId, msgIds, env) {
+  if (!env.STATE_DO || !chatId || !Array.isArray(msgIds) || !msgIds.length) return;
+  const stub = env.STATE_DO.get(env.STATE_DO.idFromName('global'));
+  await stub.fetch('https://state.do/chat-msg', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chatId: String(chatId), msgIds })
+  }).catch(() => {});
+}
+
+async function getTrackedChatMessages(chatId, env) {
+  if (!env.STATE_DO || !chatId) return [];
+  try {
+    const stub = env.STATE_DO.get(env.STATE_DO.idFromName('global'));
+    const res = await stub.fetch(`https://state.do/chat-msg?chat_id=${encodeURIComponent(String(chatId))}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data?.msgIds) ? data.msgIds : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+async function clearTrackedChatMessages(chatId, maxId, env) {
+  if (!env.STATE_DO || !chatId) return;
+  const stub = env.STATE_DO.get(env.STATE_DO.idFromName('global'));
+  await stub.fetch(
+    `https://state.do/chat-msg?chat_id=${encodeURIComponent(String(chatId))}&max_id=${encodeURIComponent(String(maxId || 0))}`,
+    { method: 'DELETE' }
+  ).catch(() => {});
+}
+
+async function deleteChatMessagesBulk(chatId, trackedIds, currentMsgId, floorId, env) {
+  const trackedSet = new Set(
+    (Array.isArray(trackedIds) ? trackedIds : []).filter(n => Number.isInteger(n) && n > 0 && n <= currentMsgId)
+  );
+  const allSet = new Set(trackedSet);
+  for (let id = currentMsgId; id >= floorId; id--) {
+    allSet.add(id);
+  }
+  const allIds = [...allSet].sort((a, b) => b - a);
+
+  async function tryDeleteChunk(chunk) {
+    if (!chunk.length) return 0;
+    const res = await deleteMessagesBatch(chatId, chunk, env);
+    if (res?.ok) return chunk.length;
+    if (chunk.length <= 5) {
+      let deleted = 0;
+      for (const id of chunk) {
+        const r = await deleteMessage(chatId, id, env).catch(() => ({ ok: false }));
+        if (r?.ok) deleted += 1;
+      }
+      return deleted;
+    }
+    const mid = Math.ceil(chunk.length / 2);
+    const d1 = await tryDeleteChunk(chunk.slice(0, mid));
+    const d2 = await tryDeleteChunk(chunk.slice(mid));
+    return d1 + d2;
+  }
+
+  let emptySweepStreak = 0;
+  for (let i = 0; i < allIds.length; i += 100) {
+    const chunk = allIds.slice(i, i + 100);
+    const hasTracked = chunk.some(id => trackedSet.has(id));
+    if (!hasTracked && emptySweepStreak >= 1) {
+      continue;
+    }
+    const deleted = await tryDeleteChunk(chunk);
+    if (!hasTracked && deleted === 0) {
+      emptySweepStreak += 1;
+    } else if (deleted > 0) {
+      emptySweepStreak = 0;
+    }
+  }
+}
+
+function formatIstTimestamp(tsMs) {
+  return new Date(tsMs + 19800 * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' IST';
+}
+
+async function isTelegramGroupAdmin(chatId, userId, env) {
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getChatMember`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, user_id: Number(userId) })
+    });
+    const data = await res.json();
+    const st = data?.result?.status || '';
+    return st === 'creator' || st === 'administrator';
+  } catch (_) {
+    return false;
+  }
 }
 
 async function answerCb(cbId, text, showAlert, env) {
