@@ -1211,6 +1211,10 @@ function buildTaskMenuMessage(task) {
     if (gfCount > 0) {
       extras += `\n✓ <b>Gofile:</b> <code>${gfCount} link(s)</code>`;
     }
+    const pdCount = task.items.filter(i => i.type === 'pixeldrain').length;
+    if (pdCount > 0) {
+      extras += `\n✓ <b>Pixeldrain:</b> <code>${pdCount} link(s)</code>`;
+    }
   } else if (task.isYtdl) {
     extras += `\n✓ <b>Media:</b> <code>${escapeHtml(truncate(task.detectedName || 'Media Link', 56))}</code>`;
     if (task.mediaAuthor) {
@@ -1234,6 +1238,17 @@ function buildTaskMenuMessage(task) {
     }
     if (task.isFolder && task.gofileChildrenCount > 0) {
       extras += `\n✓ <b>Items:</b> <code>${task.gofileChildrenCount}</code>`;
+    }
+  } else if (task.isPixeldrainSource) {
+    extras += `\n✓ <b>Source:</b> Pixeldrain ${task.isFolder ? (task.pdKind === 'list' ? 'List' : 'Folder') : 'File'}`;
+    if (task.detectedName) {
+      extras += `\n✓ <b>Name:</b> <code>${escapeHtml(truncate(task.detectedName, 56))}</code>`;
+    }
+    if (task.fileSize > 0) {
+      extras += `\n✓ <b>Size:</b> <code>${fmtBytes(task.fileSize)}</code>`;
+    }
+    if (task.isFolder && task.pdChildrenCount > 0) {
+      extras += `\n✓ <b>Items:</b> <code>${task.pdChildrenCount}</code>`;
     }
   } else if (task.resolvedVia) {
     extras += `\n✓ <b>Extracted:</b> ${escapeHtml(task.resolvedVia)}`;
@@ -3593,6 +3608,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
 
   const hasSourceForge = urls.some(u => isSourceForgeUrl(u));
   const hasGofile = urls.some(u => isGofileUrl(u));
+  const hasPixeldrain = urls.some(u => isPixeldrainUrl(u));
   const isBatchInitial = urls.length > 1;
   const allMediaInitial = forceYtdl || urls.every(u => isMediaSiteUrl(u));
   let checkingMsgId = editExistingMsgId;
@@ -3603,11 +3619,13 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         ? `<blockquote><b>Generating download link...</b>\n\n<i>Fetching direct SourceForge mirror link...</i></blockquote>`
         : hasGofile
           ? `<blockquote><b>Inspecting Gofile...</b>\n\n<i>Reading file/folder metadata from the Gofile API...</i></blockquote>`
-          : isBatchInitial
-            ? `<blockquote><b>Preparing Batch</b>\n\n<i>Queued ${urls.length} links...</i></blockquote>`
-            : allMediaInitial
-              ? `<blockquote><b>Inspecting Media</b>\n\n<i>Fetching title and preparing yt-dlp options...</i></blockquote>`
-              : `<blockquote><b>Inspecting Link</b>\n\n<i>Verifying stream headers and file size...</i></blockquote>`,
+          : hasPixeldrain
+            ? `<blockquote><b>Inspecting Pixeldrain...</b>\n\n<i>Reading file/list metadata from the Pixeldrain API...</i></blockquote>`
+            : isBatchInitial
+              ? `<blockquote><b>Preparing Batch</b>\n\n<i>Queued ${urls.length} links...</i></blockquote>`
+              : allMediaInitial
+                ? `<blockquote><b>Inspecting Media</b>\n\n<i>Fetching title and preparing yt-dlp options...</i></blockquote>`
+                : `<blockquote><b>Inspecting Link</b>\n\n<i>Verifying stream headers and file size...</i></blockquote>`,
       env,
       null,
       replyToMsgId,
@@ -3750,6 +3768,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       const isTgMedia = resolved.kind === 'tg_media';
       const isSfFolder = resolved.kind === 'sf_folder';
       const isGofileSource = resolved.kind === 'gofile';
+      const isPixeldrainSource = resolved.kind === 'pixeldrain';
       const fileUrl = resolved.finalUrl;
 
       let duplicateExists = false;
@@ -3779,14 +3798,16 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
             ? resolved.sfInfo
             : isGofileSource
               ? resolved.gofileInfo
-              : {
-                  type: 'url',
-                  url: fileUrl,
-                  sourceUrl: resolved.sourceUrl || '',
-                  resolvedVia: resolved.resolvedVia || '',
-                  name: verification.fileName,
-                  size: verification.sizeBytes || 0
-                };
+              : isPixeldrainSource
+                ? resolved.pdInfo
+                : {
+                    type: 'url',
+                    url: fileUrl,
+                    sourceUrl: resolved.sourceUrl || '',
+                    resolvedVia: resolved.resolvedVia || '',
+                    name: verification.fileName,
+                    size: verification.sizeBytes || 0
+                  };
 
       task = {
         taskId,
@@ -3810,6 +3831,9 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         isTgMedia,
         isGofileSource,
         gofileChildrenCount: isGofileSource ? (resolved.gofileInfo?.childrenCount || 0) : 0,
+        isPixeldrainSource,
+        pdKind: isPixeldrainSource ? (resolved.pdInfo?.pdKind || 'file') : '',
+        pdChildrenCount: isPixeldrainSource ? (resolved.pdInfo?.childrenCount || 0) : 0,
         resolvedVia: resolved.resolvedVia || '',
         detectedName: verification.fileName,
         customName: '',
@@ -3865,6 +3889,19 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       if (gf) {
         return { type: 'gofile', id: gf.id, url: u, name: guessNameFromUrl(u) };
       }
+      const pd = parsePixeldrainUrl(u);
+      if (pd) {
+        return {
+          type: 'pixeldrain',
+          pdKind: pd.kind,
+          id: pd.id,
+          fsPath: pd.fsPath || '',
+          url: u,
+          dlUrl: pd.dlUrl,
+          fallbackUrl: pd.fallbackUrl,
+          name: guessNameFromUrl(u)
+        };
+      }
       return { type: 'url', url: u, name: guessNameFromUrl(u) };
     });
 
@@ -3892,6 +3929,9 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       isYtdl: batchHasYtdl,
       isGofileSource: items.some(i => i.type === 'gofile'),
       gofileChildrenCount: 0,
+      isPixeldrainSource: items.some(i => i.type === 'pixeldrain'),
+      pdKind: '',
+      pdChildrenCount: 0,
       ytQuality: profile.ytQuality || 'best',
       ytContainer: profile.ytContainer || 'mp4',
       ytSubs: false,
@@ -7164,6 +7204,242 @@ async function inspectGofileLink(info, env) {
   }
 }
 
+const PIXELDRAIN_HOSTS = new Set([
+  'pixeldrain.com',
+  'pixeldrain.net',
+  'pixeldra.in',
+  'pixeldrain.nl',
+  'pixeldrain.biz',
+  'pixeldrain.tech',
+  'pixeldrain.dev'
+]);
+
+function isPixeldrainHost(host) {
+  const h = String(host || '').toLowerCase().replace(/^www\./, '');
+  return PIXELDRAIN_HOSTS.has(h);
+}
+
+function parsePixeldrainUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    const host = u.hostname.toLowerCase().replace(/^www\./, '');
+    if (!isPixeldrainHost(host)) return null;
+    const p = u.pathname;
+    const mFile = p.match(/^\/(?:u|file|api\/file)\/([A-Za-z0-9_-]+)/);
+    if (mFile) {
+      const id = mFile[1];
+      return {
+        kind: 'file',
+        id,
+        fsPath: '',
+        url: u.toString(),
+        dlUrl: `https://pixeldrain.net/api/file/${encodeURIComponent(id)}?download`,
+        fallbackUrl: `https://pixeldrain.com/api/file/${encodeURIComponent(id)}?download`,
+        infoPath: `/api/file/${encodeURIComponent(id)}/info`
+      };
+    }
+    const mList = p.match(/^\/(?:l|api\/list)\/([A-Za-z0-9_-]+)/);
+    if (mList) {
+      const id = mList[1];
+      return {
+        kind: 'list',
+        id,
+        fsPath: '',
+        url: u.toString(),
+        dlUrl: `https://pixeldrain.net/api/list/${encodeURIComponent(id)}/zip`,
+        fallbackUrl: `https://pixeldrain.com/api/list/${encodeURIComponent(id)}/zip`,
+        infoPath: `/api/list/${encodeURIComponent(id)}`
+      };
+    }
+    const mFs = p.match(/^\/(?:d|api\/filesystem)\/([^?#]+)/);
+    if (mFs) {
+      const cleanPath = mFs[1].replace(/^\/+|\/+$/g, '');
+      const bucket = cleanPath.split('/')[0] || '';
+      if (!bucket) return null;
+      const encPath = cleanPath.split('/').map(seg => encodeURIComponent(decodeURIComponent(seg))).join('/');
+      return {
+        kind: 'fs',
+        id: bucket,
+        fsPath: cleanPath,
+        url: u.toString(),
+        dlUrl: `https://pixeldrain.net/api/filesystem/${encPath}?attach`,
+        fallbackUrl: `https://pixeldrain.com/api/filesystem/${encPath}?attach`,
+        infoPath: `/api/filesystem/${encPath}?stat`
+      };
+    }
+  } catch (_) {}
+  return null;
+}
+
+function isPixeldrainUrl(rawUrl) {
+  return !!parsePixeldrainUrl(rawUrl);
+}
+
+async function pixeldrainApiGet(apiPath, env) {
+  const headers = { 'User-Agent': DEFAULT_UA, Accept: 'application/json' };
+  const apiKey = String(env?.PIXELDRAIN_API_KEY || '').trim();
+  if (apiKey) {
+    headers.Authorization = `Basic ${btoa(`:${apiKey}`)}`;
+  }
+  let lastErr = null;
+  for (const base of ['https://pixeldrain.com', 'https://pixeldrain.net']) {
+    try {
+      const res = await fetchWithTimeout(`${base}${apiPath}`, { headers }, 8000);
+      const data = await res.json().catch(() => null);
+      if (res.status >= 500 && base === 'https://pixeldrain.com') continue;
+      return { res, data };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('Pixeldrain API unreachable');
+}
+
+async function inspectPixeldrainLink(pdInfo, env) {
+  try {
+    const { res, data } = await pixeldrainApiGet(pdInfo.infoPath, env);
+    if (res.status === 404 || res.status === 410 || data?.value === 'not_found' || data?.value === 'path_not_found') {
+      return { valid: false, reason: data?.message || 'Pixeldrain file/list was not found or expired.' };
+    }
+    if (res.status === 451 || data?.value === 'unavailable_for_legal_reasons') {
+      return { valid: false, reason: 'Pixeldrain removed this file due to a legal takedown (HTTP 451).' };
+    }
+    if (!res.ok && (!data || data.success === false)) {
+      if (res.status === 401 || res.status === 403 || res.status === 400) {
+        if (['virus_detected_captcha_required', 'permission_denied', 'authentication_required'].includes(data?.value)) {
+          return { valid: false, reason: data?.message || `Pixeldrain access denied (${data?.value}).` };
+        }
+      }
+      throw new Error(data?.message || `HTTP ${res.status}`);
+    }
+
+    if (pdInfo.kind === 'file') {
+      const avail = String(data?.availability || '');
+      if (avail === 'virus_detected_captcha_required' || avail === 'unavailable_for_legal_reasons') {
+        return { valid: false, reason: data?.availability_message || `Pixeldrain blocked download (${avail}).` };
+      }
+      const name = String(data?.name || '').trim() || `pixeldrain_${pdInfo.id}.bin`;
+      const size = Number(data?.size || 0);
+      const viaSuffix = Number(data?.download_speed_limit || 0) > 0 ? ' (Throttled)' : '';
+      return {
+        valid: true,
+        fileName: name,
+        sizeBytes: size,
+        contentType: data?.mime_type || 'application/octet-stream',
+        acceptRanges: true,
+        isFolder: false,
+        resolvedVia: `Pixeldrain API${viaSuffix}`,
+        pdMeta: {
+          type: 'pixeldrain',
+          pdKind: 'file',
+          id: pdInfo.id,
+          fsPath: '',
+          url: pdInfo.url,
+          dlUrl: pdInfo.dlUrl,
+          fallbackUrl: pdInfo.fallbackUrl,
+          name,
+          size,
+          mimeType: data?.mime_type || 'application/octet-stream',
+          sha256: data?.hash_sha256 || '',
+          isFolder: false,
+          childrenCount: 0
+        }
+      };
+    }
+
+    if (pdInfo.kind === 'list') {
+      const files = Array.isArray(data?.files) ? data.files : [];
+      if (!files.length) {
+        return { valid: false, reason: 'This Pixeldrain list contains no files.' };
+      }
+      const totalSize = files.reduce((acc, f) => acc + Number(f?.size || 0), 0);
+      const title = String(data?.title || '').trim() || `Pixeldrain_List_${pdInfo.id}`;
+      return {
+        valid: true,
+        fileName: title,
+        sizeBytes: totalSize,
+        contentType: 'inode/directory',
+        acceptRanges: true,
+        isFolder: true,
+        resolvedVia: 'Pixeldrain List API',
+        pdMeta: {
+          type: 'pixeldrain',
+          pdKind: 'list',
+          id: pdInfo.id,
+          fsPath: '',
+          url: pdInfo.url,
+          dlUrl: pdInfo.dlUrl,
+          fallbackUrl: pdInfo.fallbackUrl,
+          name: title,
+          size: totalSize,
+          isFolder: true,
+          childrenCount: files.length
+        }
+      };
+    }
+
+    // Filesystem node (/d/bucket[/subpath])
+    const pathArr = Array.isArray(data?.path) ? data.path : [];
+    const baseIdx = Number.isInteger(data?.base_index) ? data.base_index : (pathArr.length - 1);
+    const node = pathArr[baseIdx] || data || {};
+    const isDir = node?.type === 'dir';
+    const children = Array.isArray(data?.children) ? data.children : [];
+    const name = String(node?.name || '').trim() || pdInfo.id;
+    const size = isDir
+      ? children.reduce((acc, c) => acc + Number(c?.file_size || 0), 0)
+      : Number(node?.file_size || 0);
+    return {
+      valid: true,
+      fileName: name,
+      sizeBytes: size,
+      contentType: isDir ? 'inode/directory' : (node?.file_type || 'application/octet-stream'),
+      acceptRanges: true,
+      isFolder: isDir,
+      resolvedVia: isDir ? 'Pixeldrain Folder API' : 'Pixeldrain Filesystem API',
+      pdMeta: {
+        type: 'pixeldrain',
+        pdKind: 'fs',
+        id: pdInfo.id,
+        fsPath: pdInfo.fsPath,
+        url: pdInfo.url,
+        dlUrl: pdInfo.dlUrl,
+        fallbackUrl: pdInfo.fallbackUrl,
+        name,
+        size,
+        mimeType: isDir ? 'inode/directory' : (node?.file_type || 'application/octet-stream'),
+        sha256: isDir ? '' : (node?.sha256_sum || ''),
+        isFolder: isDir,
+        childrenCount: isDir ? children.length : 0
+      }
+    };
+  } catch (err) {
+    const guess = pdInfo.kind === 'list' ? `Pixeldrain_List_${pdInfo.id}` : `pixeldrain_${pdInfo.id}`;
+    return {
+      valid: true,
+      fallback: true,
+      fileName: guess,
+      sizeBytes: 0,
+      contentType: pdInfo.kind === 'list' ? 'inode/directory' : 'application/octet-stream',
+      acceptRanges: true,
+      isFolder: pdInfo.kind === 'list',
+      resolvedVia: 'Pixeldrain (Runner Metadata)',
+      pdMeta: {
+        type: 'pixeldrain',
+        pdKind: pdInfo.kind,
+        id: pdInfo.id,
+        fsPath: pdInfo.fsPath || '',
+        url: pdInfo.url,
+        dlUrl: pdInfo.dlUrl,
+        fallbackUrl: pdInfo.fallbackUrl,
+        name: guess,
+        size: 0,
+        isFolder: pdInfo.kind === 'list',
+        childrenCount: 0
+      }
+    };
+  }
+}
+
 function normalizeSourceForgeUrl(rawUrl) {
   try {
     const u = new URL(rawUrl);
@@ -7469,11 +7745,9 @@ function rewriteKnownDirectUrl(rawUrl) {
     const u = new URL(rawUrl);
     const host = u.hostname.toLowerCase().replace(/^www\./, '');
 
-    if (host === 'pixeldrain.com') {
-      const fileM = u.pathname.match(/^\/u\/([a-zA-Z0-9_-]+)/);
-      if (fileM) return { url: `https://pixeldrain.com/api/file/${fileM[1]}?download`, via: 'Pixeldrain' };
-      const listM = u.pathname.match(/^\/l\/([a-zA-Z0-9_-]+)/);
-      if (listM) return { url: `https://pixeldrain.com/api/list/${listM[1]}/zip`, via: 'Pixeldrain List' };
+    const pd = parsePixeldrainUrl(rawUrl);
+    if (pd) {
+      return { url: pd.dlUrl, via: pd.kind === 'list' ? 'Pixeldrain List' : 'Pixeldrain' };
     }
 
     if (host === 'dropbox.com') {
@@ -7734,6 +8008,29 @@ async function resolveAndInspectInput(rawUrl, accessToken, env) {
     };
   }
 
+  const pdInit = parsePixeldrainUrl(rawUrl);
+  if (pdInit) {
+    const pdInsp = await inspectPixeldrainLink(pdInit, env);
+    if (!pdInsp.valid) {
+      return { kind: 'error', reason: pdInsp.reason };
+    }
+    return {
+      kind: 'pixeldrain',
+      pdInfo: pdInsp.pdMeta,
+      verification: {
+        valid: true,
+        fileName: pdInsp.fileName,
+        sizeBytes: pdInsp.sizeBytes || 0,
+        contentType: pdInsp.contentType || 'application/octet-stream',
+        acceptRanges: true,
+        isFolder: !!pdInsp.isFolder
+      },
+      finalUrl: pdInsp.pdMeta?.dlUrl || rawUrl,
+      sourceUrl: rawUrl,
+      resolvedVia: pdInsp.resolvedVia || 'Pixeldrain API'
+    };
+  }
+
   let currentUrl = normalizeSourceForgeUrl(rawUrl);
   const sfInit = isSourceForgeUrl(currentUrl) ? parseSourceForgeProjectPath(currentUrl) : null;
   if (sfInit && sfInit.kind === 'folder') {
@@ -7764,6 +8061,7 @@ async function resolveAndInspectInput(rawUrl, accessToken, env) {
   const visited = new Set();
   const viaChain = [];
   let stickySourceUrl = sfInit?.sourceUrl || '';
+  let preRedirectUrl = '';
   let fetches = 0;
 
   const sfFallbackOrError = async (reason) => {
@@ -7779,6 +8077,29 @@ async function resolveAndInspectInput(rawUrl, accessToken, env) {
         kind: 'ytdl',
         finalUrl: currentUrl,
         resolvedVia: viaChain.join(' → ')
+      };
+    }
+
+    const pdHop = parsePixeldrainUrl(currentUrl);
+    if (pdHop) {
+      const pdInsp = await inspectPixeldrainLink(pdHop, env);
+      if (!pdInsp.valid) {
+        return { kind: 'error', reason: pdInsp.reason };
+      }
+      return {
+        kind: 'pixeldrain',
+        pdInfo: pdInsp.pdMeta,
+        verification: {
+          valid: true,
+          fileName: pdInsp.fileName,
+          sizeBytes: pdInsp.sizeBytes || 0,
+          contentType: pdInsp.contentType || 'application/octet-stream',
+          acceptRanges: true,
+          isFolder: !!pdInsp.isFolder
+        },
+        finalUrl: pdInsp.pdMeta?.dlUrl || currentUrl,
+        sourceUrl: currentUrl,
+        resolvedVia: [...viaChain, pdInsp.resolvedVia || 'Pixeldrain API'].filter(Boolean).join(' → ')
       };
     }
 
@@ -7876,6 +8197,7 @@ async function resolveAndInspectInput(rawUrl, accessToken, env) {
       if (res.status >= 300 && res.status < 400) {
         const loc = res.headers.get('location');
         if (loc) {
+          if (!preRedirectUrl) preRedirectUrl = currentUrl;
           currentUrl = new URL(loc, currentUrl).toString();
           if (!viaChain.includes('Redirect') && !isSourceForgeUrl(currentUrl)) viaChain.push('Redirect');
           continue;
@@ -7895,6 +8217,7 @@ async function resolveAndInspectInput(rawUrl, accessToken, env) {
           controller.abort();
           const loc = res.headers.get('location');
           if (loc) {
+            if (!preRedirectUrl) preRedirectUrl = currentUrl;
             currentUrl = new URL(loc, currentUrl).toString();
             if (!viaChain.includes('Redirect') && !isSourceForgeUrl(currentUrl)) viaChain.push('Redirect');
             continue;
@@ -7915,7 +8238,7 @@ async function resolveAndInspectInput(rawUrl, accessToken, env) {
         kind: 'url',
         verification: meta,
         finalUrl: currentUrl,
-        sourceUrl: '',
+        sourceUrl: (preRedirectUrl && preRedirectUrl !== currentUrl) ? preRedirectUrl : '',
         resolvedVia: viaChain.join(' → ')
       };
     }

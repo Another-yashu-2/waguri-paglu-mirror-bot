@@ -26,6 +26,7 @@ import re
 import shutil
 import signal
 import site
+import socket
 import subprocess
 import sys
 import threading
@@ -46,6 +47,7 @@ TELEGRAM_API_ID = (os.environ.get("TELEGRAM_API_ID") or "").strip()
 TELEGRAM_API_HASH = (os.environ.get("TELEGRAM_API_HASH") or "").strip()
 GITHUB_RUN_ID = os.environ.get("GITHUB_RUN_ID", "")
 YTDL_COOKIES = os.environ.get("YTDL_COOKIES", "")
+PIXELDRAIN_API_KEY = (os.environ.get("PIXELDRAIN_API_KEY") or "").strip()
 
 GITHUB_REPOSITORY = (os.environ.get("GITHUB_REPOSITORY") or "").strip()
 REPO_URL = f"https://github.com/{GITHUB_REPOSITORY}" if GITHUB_REPOSITORY else "https://github.com"
@@ -309,6 +311,8 @@ def friendly_drive_error(text: str):
         return "Drive file not found, or it is not shared with your Google account."
     if "insufficientfilepermissions" in t or "insufficientpermissions" in t:
         return "Your Google account has no permission to access this file."
+    if "websearch/answer/86640" in t or ("we're sorry" in t and "automated queries" in t) or "sending automated queries" in t:
+        return "Google temporarily rate-limited this runner IP (HTTP 429 Sorry). Please retry on a fresh runner."
     if "invalid credentials" in t or "unauthenticated" in t or "token expired" in t:
         return "Google Drive authorization failed. Run /login again."
     return None
@@ -637,17 +641,80 @@ def ua_for_url(raw_url: str) -> str:
     return WGET_UA if is_sourceforge_url(raw_url) else DEFAULT_UA
 
 
-def rewrite_known_direct_url(raw_url: str):
+PIXELDRAIN_HOSTS = {
+    "pixeldrain.com",
+    "pixeldrain.net",
+    "pixeldra.in",
+    "pixeldrain.nl",
+    "pixeldrain.biz",
+    "pixeldrain.tech",
+    "pixeldrain.dev",
+}
+
+
+def is_pixeldrain_host(host: str) -> bool:
+    h = (host or "").split(":")[0].lower().removeprefix("www.")
+    return h in PIXELDRAIN_HOSTS
+
+
+def pixeldrain_auth_headers() -> dict:
+    if not PIXELDRAIN_API_KEY:
+        return {}
+    tok = base64.b64encode(f":{PIXELDRAIN_API_KEY}".encode("utf-8")).decode("ascii")
+    return {"Authorization": f"Basic {tok}"}
+
+
+def parse_pixeldrain_url(raw_url: str):
     try:
         u = urllib.parse.urlparse(raw_url)
-        host = (u.hostname or "").lower().removeprefix("www.")
-        if host == "pixeldrain.com":
-            m_f = re.match(r"^/u/([a-zA-Z0-9_-]+)", u.path)
-            if m_f:
-                return f"https://pixeldrain.com/api/file/{m_f.group(1)}?download"
-            m_l = re.match(r"^/l/([a-zA-Z0-9_-]+)", u.path)
-            if m_l:
-                return f"https://pixeldrain.com/api/list/{m_l.group(1)}/zip"
+        if not is_pixeldrain_host(u.hostname or ""):
+            return None
+        path = u.path or ""
+        m_f = re.match(r"^/(?:u|file|api/file)/([a-zA-Z0-9_-]+)", path)
+        if m_f:
+            fid = m_f.group(1)
+            return {
+                "type": "pixeldrain",
+                "pdKind": "file",
+                "id": fid,
+                "url": raw_url,
+                "dlUrl": f"https://pixeldrain.net/api/file/{fid}?download",
+                "fallbackUrl": f"https://pixeldrain.com/api/file/{fid}?download",
+            }
+        m_l = re.match(r"^/(?:l|api/list)/([a-zA-Z0-9_-]+)", path)
+        if m_l:
+            return {
+                "type": "pixeldrain",
+                "pdKind": "list",
+                "id": m_l.group(1),
+                "url": raw_url,
+            }
+        m_d = re.match(r"^/(?:d|api/filesystem)/(.+)", path)
+        if m_d:
+            fs_path = urllib.parse.unquote(m_d.group(1)).strip("/")
+            if fs_path:
+                tail = fs_path.rsplit("/", 1)[-1]
+                return {
+                    "type": "pixeldrain",
+                    "pdKind": "fs",
+                    "fsPath": fs_path,
+                    "name": tail,
+                    "url": raw_url,
+                }
+    except Exception:
+        pass
+    return None
+
+
+def rewrite_known_direct_url(raw_url: str):
+    try:
+        pd = parse_pixeldrain_url(raw_url)
+        if pd:
+            if pd["pdKind"] == "file":
+                return pd["dlUrl"]
+            if pd["pdKind"] == "list":
+                return f"https://pixeldrain.net/api/list/{pd['id']}/zip"
+        u = urllib.parse.urlparse(raw_url)
         if host == "dropbox.com":
             qs = urllib.parse.parse_qs(u.query, keep_blank_values=True)
             if qs.get("dl") != ["1"]:
@@ -1128,6 +1195,14 @@ def md5_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def resolve_download_url(raw_url: str) -> dict:
     cur = raw_url
     visited = set()
@@ -1139,6 +1214,10 @@ def resolve_download_url(raw_url: str) -> dict:
         gid = gofile_parse_id(cur)
         if gid:
             return {"type": "gofile", "id": gid, "url": cur, "name": gofile_name_from_url(cur)}
+
+        pd = parse_pixeldrain_url(cur)
+        if pd:
+            return pd
 
         gd = parse_drive_url(cur)
         if gd:
@@ -1204,6 +1283,9 @@ def resolve_download_url(raw_url: str) -> dict:
                 gd2 = parse_drive_url(final_url)
                 if gd2:
                     return gd2
+                pd2 = parse_pixeldrain_url(final_url)
+                if pd2:
+                    return pd2
                 cur = final_url
             body = resp.read(262144).decode("utf-8", "ignore")
             blocked = detect_challenge_page(resp.headers, body)
@@ -1725,11 +1807,18 @@ class Mirror:
         self.token_srv = None
         self.token_port = 0
         self.token_lock = threading.Lock()
+        self._tick_lock = threading.Lock()
+        self._tick_event = threading.Event()
+        self._tick_pending = None
+        self._tick_busy = False
+        self._tick_stop = False
+        self._tick_thread = None
 
         for it in self.items:
             mask_secret(it.get("url", ""))
         mask_secret(self.password, min_len=3)
         mask_secret(self.gh_pat, min_len=6)
+        mask_secret(PIXELDRAIN_API_KEY, min_len=6)
 
     # ---------------- Google token handling ----------------
 
@@ -1931,6 +2020,67 @@ class Mirror:
 
     # ---------------- Telemetry ----------------
 
+    def _ensure_tick_worker(self):
+        if not hasattr(self, "_tick_lock"):
+            self._tick_lock = threading.Lock()
+            self._tick_event = threading.Event()
+            self._tick_pending = None
+            self._tick_busy = False
+            self._tick_stop = False
+            self._tick_thread = None
+        with self._tick_lock:
+            if self._tick_stop:
+                return False
+            if self._tick_thread is None or not self._tick_thread.is_alive():
+                t = threading.Thread(target=self._tick_worker_loop, name="mirror-tick", daemon=True)
+                self._tick_thread = t
+                t.start()
+        return True
+
+    def _tick_worker_loop(self):
+        global cancelled
+        while True:
+            with self._tick_lock:
+                if self._tick_stop:
+                    return
+                task = self._tick_pending
+                self._tick_pending = None
+                if task is None:
+                    self._tick_event.clear()
+                    self._tick_busy = False
+                else:
+                    self._tick_busy = True
+            if task is None:
+                self._tick_event.wait(timeout=1.0)
+                continue
+            try:
+                card, need_card, need_sync = task
+                if need_sync:
+                    is_cancelled, synced_msg_id = sync_worker_state(JOB_ID, last_card=card if need_card else None)
+                    if synced_msg_id is not None:
+                        self.message_id = synced_msg_id
+                    if is_cancelled:
+                        cancelled = True
+                if self.message_id and not cancelled:
+                    edit_status(self.chat_id, self.message_id, card, status_keyboard(JOB_ID))
+            except Exception:
+                pass
+            finally:
+                with self._tick_lock:
+                    self._tick_busy = False
+
+    def stop_ticks(self, timeout: float = 3.0):
+        """Stop the background telemetry thread cleanly before sending final status edits."""
+        if not hasattr(self, "_tick_lock"):
+            return
+        with self._tick_lock:
+            self._tick_stop = True
+            self._tick_pending = None
+            t = getattr(self, "_tick_thread", None)
+            self._tick_event.set()
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=timeout)
+
     def tick(self, filename, status_text, pct, done, total, speed, eta, engine, force=False):
         global cancelled
         if cancelled:
@@ -1939,7 +2089,7 @@ class Mirror:
         if not force and now - self.last_tick < TICK_SECONDS:
             return
         self.last_tick = now
-        if self.access_token:
+        if self.access_token and (now - self.token_time >= TOKEN_REFRESH_SECONDS):
             self.ensure_token()
 
         card = build_status_card(
@@ -1958,19 +2108,17 @@ class Mirror:
         )
         status_changed = (status_text != self.last_sync_status)
         need_card = force or status_changed or (now - self.last_card_sync >= 20.0)
-        if need_card or (now - self.last_sync >= 5.0):
+        need_sync = need_card or (now - self.last_sync >= 5.0)
+        if need_sync:
             self.last_sync = now
             self.last_sync_status = status_text
             if need_card:
                 self.last_card_sync = now
-            is_cancelled, synced_msg_id = sync_worker_state(JOB_ID, last_card=card if need_card else None)
-            if synced_msg_id is not None:
-                self.message_id = synced_msg_id
-            if is_cancelled:
-                cancelled = True
-                raise InterruptedError("Cancelled by user")
-        if self.message_id:
-            edit_status(self.chat_id, self.message_id, card, status_keyboard(JOB_ID))
+        if self._ensure_tick_worker():
+            with self._tick_lock:
+                if not self._tick_stop:
+                    self._tick_pending = (card, need_card, need_sync)
+                    self._tick_event.set()
 
     # ---------------- Aria2c ----------------
 
@@ -1990,13 +2138,17 @@ class Mirror:
                     "--rpc-listen-port=6800",
                     "--max-connection-per-server=16",
                     "--split=16",
-                    "--min-split-size=1M",
+                    "--min-split-size=2M",
+                    "--stream-piece-selector=geom",
+                    "--enable-http-keep-alive=true",
+                    "--http-accept-gzip=false",
+                    "--disable-ipv6=true",
                     "--file-allocation=none",
                     "--continue=true",
                     "--allow-overwrite=true",
                     "--auto-file-renaming=false",
-                    "--connect-timeout=20",
-                    "--timeout=60",
+                    "--connect-timeout=15",
+                    "--timeout=45",
                     "--max-tries=5",
                     "--retry-wait=2",
                     "--disk-cache=64M",
@@ -2057,7 +2209,18 @@ class Mirror:
                     p.unlink(missing_ok=True)
                     p.with_name(p.name[: -len(".aria2")]).unlink(missing_ok=True)
 
-    def aria_download(self, url: str, dest_dir: Path, out_name: str = None, headers: list = None, label: str = None, user_agent: str = None) -> Path:
+    def aria_download(
+        self,
+        url: str,
+        dest_dir: Path,
+        out_name: str = None,
+        headers: list = None,
+        label: str = None,
+        user_agent: str = None,
+        max_conn: int = None,
+        split: int = None,
+        min_split: str = None,
+    ) -> Path:
         global cancelled
         dest_dir.mkdir(parents=True, exist_ok=True)
         last_exc = None
@@ -2065,6 +2228,20 @@ class Mirror:
         prev_done_bytes = -1
         resume_name = None
         final_path = None
+        pd_parsed = parse_pixeldrain_url(url)
+        eff_max_conn = max_conn
+        eff_split = split
+        eff_min_split = min_split
+        merged_headers = list(headers or [])
+        if pd_parsed:
+            if eff_max_conn is None:
+                eff_max_conn = 8 if PIXELDRAIN_API_KEY else 4
+            if eff_split is None:
+                eff_split = eff_max_conn
+            if eff_min_split is None:
+                eff_min_split = "1M"
+            if PIXELDRAIN_API_KEY and not any(str(h).lower().startswith("authorization:") for h in merged_headers):
+                merged_headers.extend(f"{k}: {v}" for k, v in pixeldrain_auth_headers().items())
 
         for attempt in range(4):
             if not self.aria_proc or self.aria_proc.poll() is not None:
@@ -2073,8 +2250,14 @@ class Mirror:
             eff_out_name = out_name or (resume_name if not fresh_retry else None)
             if eff_out_name:
                 opts["out"] = eff_out_name
-            if headers:
-                opts["header"] = headers
+            if merged_headers:
+                opts["header"] = merged_headers
+            if eff_max_conn:
+                opts["max-connection-per-server"] = str(eff_max_conn)
+            if eff_split:
+                opts["split"] = str(eff_split)
+            if eff_min_split:
+                opts["min-split-size"] = str(eff_min_split)
             if user_agent:
                 opts["user-agent"] = user_agent
             elif is_sourceforge_url(url):
@@ -2283,8 +2466,10 @@ class Mirror:
         log_path.unlink(missing_ok=True)
         cmd = ["rclone", *args,
                "--rc", "--rc-addr=127.0.0.1:5572", "--rc-no-auth",
-               "--drive-chunk-size=128M", "--transfers=4", "--checkers=8",
-               "--tpslimit=8", "--tpslimit-burst=16",
+               "--drive-chunk-size=128M", "--transfers=6", "--checkers=8",
+               "--drive-pacer-min-sleep=10ms", "--drive-pacer-burst=200",
+               "--bind=0.0.0.0",
+               "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                "--timeout=5m", "--contimeout=30s",
                "--drive-stop-on-upload-limit", "--drive-stop-on-download-limit",
                "--retries=5", "--low-level-retries=20",
@@ -2341,14 +2526,251 @@ class Mirror:
 
     # ---------------- Upload with conflict policy ----------------
 
+    @staticmethod
+    def _is_google_sorry_429(err_text: str) -> bool:
+        t = (err_text or "").lower()
+        return (
+            "websearch/answer/86640" in t
+            or "rate-limited this runner ip" in t
+            or "429 sorry" in t
+            or ("we're sorry" in t and "automated queries" in t)
+            or ("429" in t and ("sorry" in t or "too many requests" in t or "sending automated queries" in t))
+        )
+
+    @staticmethod
+    def _ipv4_https_conn(host: str, port: int = 443, timeout: int = 90) -> http.client.HTTPSConnection:
+        """Create an HTTPSConnection that connects exclusively over IPv4."""
+        class _IPv4HTTPSConnection(http.client.HTTPSConnection):
+            def connect(self):
+                last_err = None
+                for res in socket.getaddrinfo(self.host, self.port, socket.AF_INET, socket.SOCK_STREAM):
+                    af, socktype, proto, _, sa = res
+                    sock = None
+                    try:
+                        sock = socket.socket(af, socktype, proto)
+                        if self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                            sock.settimeout(self.timeout)
+                        if self.source_address:
+                            sock.bind(self.source_address)
+                        sock.connect(sa)
+                        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+                        return
+                    except OSError as exc:
+                        last_err = exc
+                        if sock is not None:
+                            try:
+                                sock.close()
+                            except OSError:
+                                pass
+                raise last_err or OSError(f"Failed IPv4 connect to {self.host}:{self.port}")
+
+        return _IPv4HTTPSConnection(host, port=port, timeout=timeout)
+
+    def _gdrive_open_resumable_session(self, final_name: str, folder_id: str, size: int) -> str:
+        path = "/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true&fields=id,name,mimeType,size,webViewLink"
+        payload = json.dumps({"name": final_name, "parents": [folder_id or "root"]}).encode("utf-8")
+        for attempt in range(5):
+            self.ensure_token()
+            conn = self._ipv4_https_conn("www.googleapis.com", timeout=60)
+            try:
+                conn.request("POST", path, body=payload, headers={
+                    "Authorization": f"Bearer {self.access_token}",
+                    "Content-Type": "application/json; charset=UTF-8",
+                    "X-Upload-Content-Length": str(size),
+                    "X-Upload-Content-Type": "application/octet-stream",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                })
+                resp = conn.getresponse()
+                raw = resp.read(8192)
+                loc = resp.getheader("Location") or resp.getheader("location") or ""
+                if resp.status in (200, 201) and loc:
+                    return loc
+                if resp.status == 401 and attempt < 4:
+                    self.refresh_token()
+                    continue
+                if resp.status in (429, 500, 502, 503, 504) and attempt < 4:
+                    time.sleep(min(30.0, (2 ** attempt) + 0.5))
+                    continue
+                txt = raw.decode("utf-8", "ignore")
+                raise RuntimeError(friendly_drive_error(txt) or f"Drive upload session failed (HTTP {resp.status}): {txt[:200]}")
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        raise RuntimeError("Drive upload session failed after retries.")
+
+    def _gdrive_query_upload_offset(self, session_uri: str, total_size: int):
+        pu = urllib.parse.urlparse(session_uri)
+        req_path = pu.path + (f"?{pu.query}" if pu.query else "")
+        conn = self._ipv4_https_conn(pu.hostname, port=pu.port or 443, timeout=45)
+        try:
+            conn.request("PUT", req_path, body=b"", headers={
+                "Content-Length": "0",
+                "Content-Range": f"bytes */{total_size}",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            })
+            resp = conn.getresponse()
+            raw = resp.read(65536)
+            if resp.status in (200, 201):
+                try:
+                    return total_size, json.loads(raw.decode("utf-8", "ignore"))
+                except Exception:
+                    return total_size, {}
+            if resp.status == 308:
+                rng = resp.getheader("Range") or resp.getheader("range") or ""
+                m = re.match(r"bytes=0-(\d+)", rng)
+                return (int(m.group(1)) + 1) if m else 0, None
+            return None, None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _gdrive_direct_upload_file(self, local: Path, final_name: str, folder_id: str = None, existing_ex: dict = None) -> dict:
+        """Pure-Python IPv4 chunked resumable upload fallback when rclone hits Google 429 Sorry."""
+        global cancelled
+        target_parent = folder_id or self.folder_id or "root"
+        size = local.stat().st_size
+        if existing_ex and existing_ex.get("id"):
+            self.drive("PATCH", f"files/{existing_ex['id']}", {"fields": "id"}, body={"trashed": True})
+        if size == 0:
+            res = self.drive(
+                "POST", "files",
+                {"supportsAllDrives": "true", "fields": "id,name,mimeType,webViewLink,size"},
+                body={"name": final_name, "parents": [target_parent]},
+            )
+            if not res.get("id"):
+                raise RuntimeError(drive_error_text(res, "Drive empty-file upload failed"))
+            return res
+
+        session_uri = self._gdrive_open_resumable_session(final_name, target_parent, size)
+        pu = urllib.parse.urlparse(session_uri)
+        req_path = pu.path + (f"?{pu.query}" if pu.query else "")
+        host = pu.hostname
+        port = pu.port or 443
+        chunk_bytes = 64 * 1024 * 1024  # 64 MiB (multiple of Google's required 256 KiB)
+        sub_bytes = 1024 * 1024
+        offset = 0
+        started = time.time()
+        err_count = 0
+
+        self.tick(final_name, "Uploading..", 0.0, 0, size, 0, None, "Drive Direct IPv4", force=True)
+        with open(local, "rb") as f:
+            while offset < size:
+                if cancelled:
+                    raise InterruptedError("Cancelled by user")
+                f.seek(offset)
+                rem = size - offset
+                cur_len = min(chunk_bytes, rem)
+                conn = self._ipv4_https_conn(host, port=port, timeout=90)
+                try:
+                    conn.putrequest("PUT", req_path)
+                    conn.putheader("Content-Length", str(cur_len))
+                    conn.putheader("Content-Range", f"bytes {offset}-{offset + cur_len - 1}/{size}")
+                    conn.putheader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                    conn.endheaders()
+
+                    sent_in_chunk = 0
+                    while sent_in_chunk < cur_len:
+                        if cancelled:
+                            raise InterruptedError("Cancelled by user")
+                        piece = f.read(min(sub_bytes, cur_len - sent_in_chunk))
+                        if not piece:
+                            break
+                        conn.send(piece)
+                        sent_in_chunk += len(piece)
+                        done_now = offset + sent_in_chunk
+                        elapsed = max(0.001, time.time() - started)
+                        spd = done_now / elapsed
+                        pct = min(100.0, 100.0 * done_now / size)
+                        eta = (size - done_now) / spd if spd > 0 and size > done_now else None
+                        self.tick(final_name, "Uploading..", pct, done_now, size, spd, eta, "Drive Direct IPv4")
+
+                    resp = conn.getresponse()
+                    raw = resp.read(65536)
+                    if resp.status in (200, 201):
+                        data = json.loads(raw.decode("utf-8", "ignore"))
+                        if data.get("id"):
+                            return data
+                        raise RuntimeError("Drive upload completed without returning a file ID.")
+                    if resp.status == 308:
+                        err_count = 0
+                        rng = resp.getheader("Range") or resp.getheader("range") or ""
+                        m = re.match(r"bytes=0-(\d+)", rng)
+                        offset = (int(m.group(1)) + 1) if m else (offset + cur_len)
+                        continue
+                    txt = raw.decode("utf-8", "ignore")
+                    if resp.status == 401 and err_count < 6:
+                        self.refresh_token()
+                        err_count += 1
+                        continue
+                    if resp.status in (408, 429, 500, 502, 503, 504) and err_count < 6:
+                        err_count += 1
+                        time.sleep(min(30.0, (2 ** err_count) + 0.5))
+                        new_off, done_obj = self._gdrive_query_upload_offset(session_uri, size)
+                        if done_obj and done_obj.get("id"):
+                            return done_obj
+                        if new_off is not None:
+                            offset = new_off
+                        continue
+                    raise RuntimeError(friendly_drive_error(txt) or f"Drive direct upload failed (HTTP {resp.status}): {txt[:200]}")
+                except InterruptedError:
+                    raise
+                except (OSError, http.client.HTTPException, TimeoutError) as exc:
+                    err_count += 1
+                    if err_count >= 6:
+                        raise
+                    time.sleep(min(30.0, (2 ** err_count) + 0.5))
+                    new_off, done_obj = self._gdrive_query_upload_offset(session_uri, size)
+                    if done_obj and done_obj.get("id"):
+                        return done_obj
+                    if new_off is not None:
+                        offset = new_off
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        return self.lookup(target_parent, final_name)
+
+    def _gdrive_direct_upload_dir(self, local: Path, target_folder_id: str):
+        folder_cache = {local.resolve(): target_folder_id}
+        for root_str, dirs, files in os.walk(local):
+            root_path = Path(root_str).resolve()
+            parent_id = folder_cache[root_path]
+            for dname in sorted(dirs):
+                sub_path = (root_path / dname).resolve()
+                ex_d = self.lookup(parent_id, dname)
+                if ex_d and ex_d.get("mimeType") == FOLDER_MIME:
+                    folder_cache[sub_path] = ex_d["id"]
+                else:
+                    folder_cache[sub_path] = self.create_folder(parent_id, dname)
+            for fname in sorted(files):
+                fpath = root_path / fname
+                ex_f = self.lookup(parent_id, fname) if self.conflict == "overwrite" else None
+                self._gdrive_direct_upload_file(fpath, fname, folder_id=parent_id, existing_ex=ex_f)
+
     def upload_file(self, local: Path) -> dict:
         name = local.name
         size = path_size(local)
         action, final, ex = self.resolve_conflict(self.folder_id, name, False)
         if action == "skip":
             return self.finalize(ex, name, size, False, status="skipped")
-        self.run_rclone(["copyto", str(local), remote_path(self.folder_id) + final], final, "Uploading..", size)
-        f = self.lookup(self.folder_id, final)
+        try:
+            self.run_rclone(["copyto", str(local), remote_path(self.folder_id) + final], final, "Uploading..", size)
+            f = self.lookup(self.folder_id, final)
+        except RuntimeError as exc:
+            if not self._is_google_sorry_429(str(exc)):
+                raise
+            print("[Drive Fallback] Switching to IPv4 resumable upload after Google 429.", flush=True)
+            f = self._gdrive_direct_upload_file(
+                local,
+                final,
+                folder_id=self.folder_id,
+                existing_ex=ex if action == "overwrite" else None,
+            )
         return self.finalize(f, final, size, False)
 
     def upload_dir(self, local: Path) -> dict:
@@ -2361,7 +2783,13 @@ class Mirror:
             target = ex["id"]
         else:
             target = self.create_folder(self.folder_id, final)
-        self.run_rclone(["copy", str(local), remote_path(target)], final, "Uploading..", size)
+        try:
+            self.run_rclone(["copy", str(local), remote_path(target)], final, "Uploading..", size)
+        except RuntimeError as exc:
+            if not self._is_google_sorry_429(str(exc)):
+                raise
+            print("[Drive Fallback] Switching folder upload to IPv4 resumable upload after Google 429.", flush=True)
+            self._gdrive_direct_upload_dir(local, target)
         return self.finalize({"id": target, "name": final, "mimeType": FOLDER_MIME}, final, size, True)
 
     # ---------------- Gofile (per-task guest account) ----------------
@@ -2842,10 +3270,13 @@ class Mirror:
                 opts["external_downloader"] = {"http": "aria2c", "https": "aria2c"}
                 opts["external_downloader_args"] = {
                     "aria2c": [
-                        "-x", "16", "-s", "16", "-k", "1M",
+                        "-x", "16", "-s", "16", "-k", "2M",
+                        "--stream-piece-selector=geom",
+                        "--enable-http-keep-alive=true",
+                        "--disable-ipv6=true",
                         "--file-allocation=none",
                         "--max-tries=5", "--retry-wait=2",
-                        "--connect-timeout=15", "--timeout=30",
+                        "--connect-timeout=15", "--timeout=45",
                         "--summary-interval=0",
                     ]
                 }
@@ -2990,7 +3421,7 @@ class Mirror:
         return bundle
 
     def resolve_item(self, item: dict) -> dict:
-        if item.get("_resolved") or item.get("type") in ("gdrive", "ytdl", "tg_media", "sf_folder", "gofile"):
+        if item.get("_resolved") or item.get("type") in ("gdrive", "ytdl", "tg_media", "sf_folder", "gofile", "pixeldrain"):
             return item
         target = item.get("sourceUrl") or item.get("url") or ""
         if not target:
@@ -3004,6 +3435,12 @@ class Mirror:
                 "name": item.get("name") or gofile_name_from_url(target),
                 "_resolved": True,
             }
+        pd = parse_pixeldrain_url(target)
+        if pd:
+            if item.get("name") and not pd.get("name"):
+                pd["name"] = item["name"]
+            pd["_resolved"] = True
+            return pd
         tg = parse_telegram_post_url(target)
         if tg:
             tg["_resolved"] = True
@@ -3015,7 +3452,7 @@ class Mirror:
             return item
         try:
             resolved = resolve_download_url(target)
-            if resolved.get("type") in ("gdrive", "tg_media", "gofile"):
+            if resolved.get("type") in ("gdrive", "tg_media", "gofile", "pixeldrain"):
                 resolved["_resolved"] = True
                 return resolved
             if resolved.get("url"):
@@ -3117,7 +3554,7 @@ class Mirror:
             done = 0
             started = time.time()
             with open(out_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=1024 * 256):
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
                     if cancelled:
                         raise InterruptedError("Cancelled by user")
                     if not chunk:
@@ -3493,11 +3930,330 @@ class Mirror:
         ensure_kurigram_tools()
         return _run_async_fast(self._kurigram_download_item(item, dest_dir))
 
+    # ---------------- Pixeldrain sources ----------------
+
+    @staticmethod
+    def _pixeldrain_safe_name(raw_name: str, default_name: str) -> str:
+        clean = re.sub(r'[/\\?%*:|"<>]', "_", str(raw_name or "")).strip()
+        return default_name if clean in ("", ".", "..") else clean
+
+    @staticmethod
+    def _pixeldrain_encode_fs_path(fs_path: str) -> str:
+        return "/".join(urllib.parse.quote(seg, safe="") for seg in str(fs_path or "").strip("/").split("/") if seg)
+
+    @staticmethod
+    def _pixeldrain_format_ratelimit(headers: dict) -> str:
+        low = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+        rem = low.get("x-ratelimit-remaining")
+        lim = low.get("x-ratelimit-limit")
+        rst = low.get("x-ratelimit-reset")
+        if rem is None and lim is None:
+            return ""
+        parts = []
+        if rem is not None and lim is not None:
+            parts.append(f"remaining {rem}/{lim} MB")
+        elif rem is not None:
+            parts.append(f"remaining {rem} MB")
+        if rst:
+            try:
+                sec = int(float(rst)) - int(time.time())
+                if sec > 0:
+                    parts.append(f"resets in {fmt_dur(sec)}")
+            except Exception:
+                pass
+        return f" ({', '.join(parts)})" if parts else ""
+
+    def _pixeldrain_api(self, api_path: str, timeout: int = 20) -> dict:
+        last_err = {}
+        for host in ("pixeldrain.net", "pixeldrain.com"):
+            url = f"https://{host}/api/{api_path.lstrip('/')}"
+            req = urllib.request.Request(
+                url,
+                headers={
+                    **pixeldrain_auth_headers(),
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                    "Accept": "application/json",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    hdrs = {str(k).lower(): v for k, v in resp.headers.items()}
+                    data = json.loads(resp.read().decode("utf-8", "ignore") or "{}")
+                    if isinstance(data, dict):
+                        data["_http_status"] = resp.status
+                        data["_headers"] = hdrs
+                        if data.get("success") is not False:
+                            return data
+                        last_err = data
+            except urllib.error.HTTPError as e:
+                try:
+                    hdrs = {str(k).lower(): v for k, v in (e.headers.items() if e.headers else [])}
+                    parsed = {}
+                    try:
+                        parsed = json.loads(e.read().decode("utf-8", "ignore") or "{}")
+                    except Exception:
+                        pass
+                    last_err = parsed if isinstance(parsed, dict) else {}
+                    last_err["_http_status"] = e.code
+                    last_err["_headers"] = hdrs
+                    last_err.setdefault("error", str(e))
+                    if e.code in (404, 410, 451):
+                        return last_err
+                finally:
+                    e.close()
+            except Exception as e:
+                last_err = {"_http_status": 0, "error": str(e)}
+        return last_err
+
+    def _pixeldrain_explain_download_failure(self, dl_url: str, last_exc: Exception) -> str:
+        req = urllib.request.Request(
+            dl_url,
+            headers={
+                **pixeldrain_auth_headers(),
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Range": "bytes=0-1023",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=12):
+                return str(last_exc)
+        except urllib.error.HTTPError as e:
+            try:
+                hdrs = {str(k).lower(): v for k, v in (e.headers.items() if e.headers else [])}
+                quota = self._pixeldrain_format_ratelimit(hdrs)
+                body = {}
+                try:
+                    body = json.loads(e.read(8192).decode("utf-8", "ignore") or "{}")
+                except Exception:
+                    pass
+                val = str(body.get("value") or "").lower()
+                msg = str(body.get("message") or "").strip()
+                if "rate_limit" in val or "limit" in msg.lower() or e.code == 429:
+                    detail = msg or "Pixeldrain IP transfer limit reached."
+                    return f"Pixeldrain rate limit (HTTP {e.code}): {detail}{quota}"
+                if e.code in (403, 404, 410, 451):
+                    detail = msg or str(e.reason or f"HTTP {e.code}")
+                    return f"Pixeldrain rejected download (HTTP {e.code}): {detail}{quota}"
+                return f"Pixeldrain download failed (HTTP {e.code}){quota}: {msg or last_exc}"
+            finally:
+                e.close()
+        except Exception:
+            return str(last_exc)
+
+    def _pixeldrain_download_aria_with_fallback(
+        self,
+        primary_url: str,
+        fallback_url: str,
+        dest_dir: Path,
+        out_name: str,
+        size_hint: int = 0,
+        sha256_hint: str = "",
+        label: str = None,
+    ) -> Path:
+        max_conn = 8 if PIXELDRAIN_API_KEY else 4
+        hdrs = [f"{k}: {v}" for k, v in pixeldrain_auth_headers().items()] or None
+        urls = [u for u in (primary_url, fallback_url) if u]
+        if len(urls) == 2 and urls[0] == urls[1]:
+            urls.pop()
+
+        last_exc = RuntimeError("Pixeldrain download failed.")
+        for u in urls:
+            try:
+                out_path = self.aria_download(
+                    u,
+                    dest_dir,
+                    out_name=out_name,
+                    headers=hdrs,
+                    label=label or out_name,
+                    max_conn=max_conn,
+                    split=max_conn,
+                    min_split="1M",
+                )
+                actual_size = out_path.stat().st_size
+                if actual_size <= 65536:
+                    head_txt = out_path.read_bytes()[:4096].decode("utf-8", "ignore")
+                    blocked = detect_challenge_page({}, head_txt)
+                    if blocked:
+                        out_path.unlink(missing_ok=True)
+                        raise RuntimeError(blocked)
+                    if head_txt.lstrip().startswith("{"):
+                        try:
+                            j = json.loads(head_txt)
+                            if isinstance(j, dict) and j.get("success") is False:
+                                out_path.unlink(missing_ok=True)
+                                raise RuntimeError(j.get("message") or j.get("value") or "Pixeldrain returned JSON error")
+                        except ValueError:
+                            pass
+                if size_hint > 0 and actual_size != size_hint:
+                    out_path.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"Pixeldrain size mismatch for {out_path.name}: expected {size_hint} bytes, got {actual_size}"
+                    )
+                if (
+                    sha256_hint
+                    and re.fullmatch(r"[0-9a-f]{64}", sha256_hint.lower())
+                    and actual_size <= 512 * 1024 * 1024
+                    and sha256_file(out_path) != sha256_hint.lower()
+                ):
+                    out_path.unlink(missing_ok=True)
+                    raise RuntimeError(f"Pixeldrain SHA-256 verification failed for {out_path.name}")
+                return out_path
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                target = dest_dir / out_name
+                if target.exists() and not Path(f"{target}.aria2").exists() and target.stat().st_size <= 65536:
+                    target.unlink(missing_ok=True)
+        raise RuntimeError(self._pixeldrain_explain_download_failure(urls[-1], last_exc))
+
+    def _pixeldrain_download_file_entry(
+        self,
+        fid: str,
+        dest_dir: Path,
+        out_name: str = None,
+        size_hint: int = 0,
+        sha256_hint: str = "",
+        label: str = None,
+    ) -> Path:
+        if not out_name or not size_hint:
+            info = self._pixeldrain_api(f"file/{urllib.parse.quote(fid, safe='')}/info")
+            if info.get("_http_status") in (404, 410):
+                raise RuntimeError(info.get("message") or "Pixeldrain file was not found or expired.")
+            if not out_name and info.get("name"):
+                out_name = info["name"]
+            if not size_hint and info.get("size"):
+                size_hint = int(info.get("size") or 0)
+            if not sha256_hint and info.get("hash_sha256"):
+                sha256_hint = str(info.get("hash_sha256") or "")
+
+        safe_name = self._pixeldrain_safe_name(out_name, f"pixeldrain_{fid}")
+        primary = f"https://pixeldrain.net/api/file/{urllib.parse.quote(fid, safe='')}?download"
+        fallback = f"https://pixeldrain.com/api/file/{urllib.parse.quote(fid, safe='')}?download"
+        return self._pixeldrain_download_aria_with_fallback(
+            primary,
+            fallback,
+            dest_dir,
+            safe_name,
+            size_hint=size_hint,
+            sha256_hint=sha256_hint,
+            label=label or safe_name,
+        )
+
+    def _pixeldrain_download_fs_entry(
+        self,
+        fs_path: str,
+        dest_dir: Path,
+        override_name: str = None,
+        node_hint: dict = None,
+        depth: int = 0,
+    ) -> Path:
+        if depth > 16:
+            raise RuntimeError("Pixeldrain folder nesting exceeded 16 levels.")
+        clean_path = str(fs_path or "").strip("/")
+        enc_path = self._pixeldrain_encode_fs_path(clean_path)
+        children = None
+        if node_hint and node_hint.get("type") == "file":
+            node = node_hint
+        else:
+            stat = self._pixeldrain_api(f"filesystem/{enc_path}?stat")
+            if stat.get("success") is False or (stat.get("_http_status") in (403, 404, 410, 451) and not stat.get("path")):
+                raise RuntimeError(stat.get("message") or f"Could not inspect Pixeldrain filesystem path ({stat.get('_http_status')}).")
+            path_nodes = stat.get("path") or []
+            node = path_nodes[-1] if path_nodes else (node_hint or {})
+            children = stat.get("children")
+
+        tail = clean_path.rsplit("/", 1)[-1] or "pixeldrain"
+        cur_name = self._pixeldrain_safe_name(override_name or node.get("name") or tail, "pixeldrain")
+        node_type = node.get("type") or ("dir" if isinstance(children, list) else "file")
+
+        if node_type != "dir" and children is None:
+            size_hint = int(node.get("size") or 0)
+            sha_hint = str(node.get("sha256_sum") or node.get("hash_sha256") or "")
+            primary = f"https://pixeldrain.net/api/filesystem/{enc_path}"
+            fallback = f"https://pixeldrain.com/api/filesystem/{enc_path}"
+            return self._pixeldrain_download_aria_with_fallback(
+                primary,
+                fallback,
+                dest_dir,
+                cur_name,
+                size_hint=size_hint,
+                sha256_hint=sha_hint,
+                label=cur_name,
+            )
+
+        out_dir = dest_dir / cur_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+        seen = {}
+        for child in (children or []):
+            cname_raw = str(child.get("name") or "").strip()
+            if cname_raw in ("", ".", ".."):
+                continue
+            cname = self._pixeldrain_safe_name(cname_raw, "item")
+            low = cname.lower()
+            idx = seen.get(low, 0) + 1
+            seen[low] = idx
+            if idx > 1:
+                p_name = Path(cname)
+                cname = f"{p_name.stem} ({idx}){p_name.suffix}" if child.get("type") != "dir" else f"{cname} ({idx})"
+            child_path = f"{clean_path}/{cname_raw}"
+            self._pixeldrain_download_fs_entry(child_path, out_dir, override_name=cname, node_hint=child, depth=depth + 1)
+        return out_dir
+
+    def pixeldrain_download_item(self, item: dict, dest_dir: Path) -> Path:
+        parsed = parse_pixeldrain_url(item.get("url") or "") or {}
+        pd_kind = item.get("pdKind") or parsed.get("pdKind") or "file"
+        if pd_kind == "fs":
+            fs_path = item.get("fsPath") or parsed.get("fsPath") or ""
+            return self._pixeldrain_download_fs_entry(fs_path, dest_dir, override_name=self.single_name())
+        if pd_kind == "list":
+            lid = str(item.get("id") or parsed.get("id") or "")
+            data = self._pixeldrain_api(f"list/{urllib.parse.quote(lid, safe='')}")
+            files = data.get("files") or []
+            if not files:
+                raise RuntimeError(data.get("message") or "Pixeldrain list contains no files or is unavailable.")
+            folder_name = self._pixeldrain_safe_name(self.single_name() or data.get("title") or item.get("name"), f"pixeldrain_{lid}")
+            list_dir = dest_dir / folder_name
+            list_dir.mkdir(parents=True, exist_ok=True)
+            seen = {}
+            for idx_f, entry in enumerate(files, 1):
+                fid = str(entry.get("id") or "").strip()
+                if not fid:
+                    continue
+                fname = self._pixeldrain_safe_name(entry.get("name"), f"file_{idx_f}_{fid}")
+                low = fname.lower()
+                cnt = seen.get(low, 0) + 1
+                seen[low] = cnt
+                if cnt > 1:
+                    p_name = Path(fname)
+                    fname = f"{p_name.stem} ({cnt}){p_name.suffix}"
+                self._pixeldrain_download_file_entry(
+                    fid,
+                    list_dir,
+                    out_name=fname,
+                    size_hint=int(entry.get("size") or 0),
+                    sha256_hint=str(entry.get("hash_sha256") or ""),
+                    label=f"[{idx_f}/{len(files)}] {fname}",
+                )
+            return list_dir
+
+        fid = str(item.get("id") or parsed.get("id") or "")
+        return self._pixeldrain_download_file_entry(
+            fid,
+            dest_dir,
+            out_name=self.single_name() or item.get("name"),
+            size_hint=int(item.get("size") or 0),
+            sha256_hint=str(item.get("sha256") or ""),
+            label=self.item_label(item),
+        )
+
     def acquire_local(self, item: dict, dest_dir: Path) -> Path:
         """Downloads an item to local disk (used for extract/zip modes, yt-dlp, Telegram media, and URL items)."""
         item = self.resolve_item(item)
         if item.get("type") == "gofile":
             return self.gofile_download_item(item, dest_dir)
+        if item.get("type") == "pixeldrain":
+            return self.pixeldrain_download_item(item, dest_dir)
         if item.get("type") == "sf_folder":
             return self.sf_folder_download(item, dest_dir)
         if item.get("type") == "tg_media":
@@ -4985,6 +5741,7 @@ def main():
     mask_secret(BOT_TOKEN)
     mask_secret(TELEGRAM_API_ID)
     mask_secret(TELEGRAM_API_HASH)
+    mask_secret(PIXELDRAIN_API_KEY, min_len=6)
 
     init_res = worker_call("/internal/job", {"job_id": JOB_ID, "run_id": GITHUB_RUN_ID})
     if not init_res.get("ok"):
@@ -5001,8 +5758,10 @@ def main():
 
     try:
         results = m.run()
+        m.stop_ticks()
         m.report(results)
     except InterruptedError:
+        m.stop_ticks()
         text = (
             f"<blockquote><b>Task Cancelled</b>\n\n"
             f"<code>{html.escape(display)}</code></blockquote>\n\n"
@@ -5014,6 +5773,7 @@ def main():
         finish_status(m.chat_id, m.message_id, text, thread_id=m.thread_id)
         worker_call("/internal/complete", {"job_id": JOB_ID, "status": "cancelled"})
     except Exception as e:
+        m.stop_ticks()
         reason = friendly_drive_error(str(e)) or str(e)
         print(
             redact_secrets(f"[Transfer Failed] {reason}\n{traceback.format_exc()}"),
@@ -5037,6 +5797,7 @@ def main():
         })
         sys.exit(1)
     finally:
+        m.stop_ticks()
         m.stop_aria()
         m.stop_token_server()
 

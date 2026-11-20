@@ -9,7 +9,7 @@ on:
 
 jobs:
   mirror:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
       - name: Checkout Runner Scripts
@@ -18,7 +18,14 @@ jobs:
       - name: Install Transfer & Archive Tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 rclone p7zip-full unzip tar curl jq
+          sudo apt-get install -y -qq aria2 p7zip-full unzip tar curl jq
+          if curl -fsSL --retry 2 "https://downloads.rclone.org/rclone-current-linux-amd64.zip" -o /tmp/rclone.zip; then
+            unzip -q -j /tmp/rclone.zip "*/rclone" -d /tmp/rclone_bin
+            sudo install -m 0755 /tmp/rclone_bin/rclone /usr/local/bin/rclone
+            rm -rf /tmp/rclone.zip /tmp/rclone_bin
+          else
+            sudo apt-get install -y -qq rclone
+          fi
 
       - name: Execute Mirror Job
         env:
@@ -29,6 +36,7 @@ jobs:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           YTDL_COOKIES: ${{ secrets.YTDL_COOKIES }}
+          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           python3 runner/mirror_runner.py
