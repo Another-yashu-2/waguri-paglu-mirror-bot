@@ -347,7 +347,12 @@ class SystemMonitor:
                     if ":" not in line:
                         continue
                     iface, data = line.split(":", 1)
-                    if iface.strip() == "lo":
+                    name = iface.strip()
+                    if (
+                        name == "lo"
+                        or name.startswith(("docker", "veth", "br-", "virbr"))
+                        or os.path.exists(f"/sys/class/net/{name}/master")
+                    ):
                         continue
                     fields = data.split()
                     rx += int(fields[0])
@@ -501,9 +506,9 @@ def status_keyboard(job_id: str) -> dict:
     }
 
 
-def aria2_rpc(method: str, params: list = None):
+def aria2_rpc(method: str, params: list = None, timeout: int = 15):
     payload = {"jsonrpc": "2.0", "id": "1", "method": method, "params": params or []}
-    return http_json("http://127.0.0.1:6800/jsonrpc", data=payload, timeout=5)
+    return http_json("http://127.0.0.1:6800/jsonrpc", data=payload, timeout=timeout)
 
 
 def poll_worker_state(job_id: str, last_card: str = None):
@@ -1994,6 +1999,8 @@ class Mirror:
                     "--timeout=60",
                     "--max-tries=5",
                     "--retry-wait=2",
+                    "--disk-cache=64M",
+                    "--auto-save-interval=20",
                     "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                     f"--dir={DL_DIR}",
                     "--quiet=true",
@@ -2015,7 +2022,7 @@ class Mirror:
                 except OSError:
                     pass
                 raise RuntimeError(f"aria2c exited early ({self.aria_proc.returncode}): {err_txt.strip() or 'no output'}")
-            ver = aria2_rpc("aria2.getVersion")
+            ver = aria2_rpc("aria2.getVersion", timeout=2)
             if ver.get("result"):
                 return
             last_err = ver.get("error") or ""
@@ -2034,48 +2041,105 @@ class Mirror:
                     pass
             self.aria_proc = None
 
+    @staticmethod
+    def _unlink_aria_target(dest_dir: Path, out_name: str = None, final_path: Path = None):
+        targets = []
+        if final_path is not None:
+            targets.append(final_path)
+        if out_name:
+            targets.append(dest_dir / out_name)
+        for t in targets:
+            t.unlink(missing_ok=True)
+            Path(f"{t}.aria2").unlink(missing_ok=True)
+        if not targets and dest_dir.exists():
+            for p in list(dest_dir.iterdir()):
+                if p.is_file() and p.name.endswith(".aria2"):
+                    p.unlink(missing_ok=True)
+                    p.with_name(p.name[: -len(".aria2")]).unlink(missing_ok=True)
+
     def aria_download(self, url: str, dest_dir: Path, out_name: str = None, headers: list = None, label: str = None, user_agent: str = None) -> Path:
+        global cancelled
         dest_dir.mkdir(parents=True, exist_ok=True)
         last_exc = None
-        for attempt in range(3):
+        fresh_retry = False
+        prev_done_bytes = -1
+        resume_name = None
+        final_path = None
+
+        for attempt in range(4):
             if not self.aria_proc or self.aria_proc.poll() is not None:
                 self.start_aria()
             opts = {"dir": str(dest_dir)}
-            if out_name:
-                opts["out"] = out_name
+            eff_out_name = out_name or (resume_name if not fresh_retry else None)
+            if eff_out_name:
+                opts["out"] = eff_out_name
             if headers:
                 opts["header"] = headers
             if user_agent:
                 opts["user-agent"] = user_agent
             elif is_sourceforge_url(url):
                 opts["user-agent"] = WGET_UA
-            if attempt > 0:
-                # Fresh retry without Range resume if a previous attempt choked on non-rangeable server
+
+            if fresh_retry:
+                # Clear partial state only when range resume is rejected or stalled with zero progress
                 opts["continue"] = "false"
-                for p in list(dest_dir.iterdir()):
-                    if p.is_file() and (p.name.endswith(".aria2") or (out_name and p.name == out_name)):
-                        p.unlink(missing_ok=True)
+                self._unlink_aria_target(dest_dir, out_name=out_name or resume_name, final_path=final_path)
+                fresh_retry = False
+                resume_name = None
+            elif attempt > 0:
+                target_check = final_path or (dest_dir / eff_out_name if eff_out_name else None)
+                if target_check and target_check.exists() and not Path(f"{target_check}.aria2").exists():
+                    target_check.unlink(missing_ok=True)
 
             add_res = aria2_rpc("aria2.addUri", [[url], opts])
             gid = add_res.get("result")
             if not gid:
                 last_exc = RuntimeError(f"Failed to start download in aria2c: {add_res.get('error') or add_res}")
                 self.stop_aria()
-                if attempt < 2:
+                if attempt < 3:
                     time.sleep(1.0 * (attempt + 1))
                     continue
                 raise last_exc
 
-            cur_name = out_name or label or "Downloading..."
+            cur_name = eff_out_name or label or "Downloading..."
             final_path = None
+            attempt_done = 0
+            rpc_fail_count = 0
+            rpc_fail_since = None
+            last_worker_poll = time.time()
             try:
                 while True:
+                    if cancelled:
+                        aria2_rpc("aria2.forceRemove", [gid], timeout=3)
+                        raise InterruptedError("Cancelled by user")
                     st_res = aria2_rpc("aria2.tellStatus", [gid])
                     st = st_res.get("result") or {}
                     if not st:
                         if self.aria_proc and self.aria_proc.poll() is not None:
                             raise RuntimeError(f"aria2c crashed during download (code {self.aria_proc.returncode})")
-                        raise RuntimeError(f"aria2c RPC error: {st_res.get('error') or 'empty tellStatus'}")
+                        rpc_err = st_res.get("error")
+                        if isinstance(rpc_err, dict):
+                            raise RuntimeError(f"aria2c RPC error: {rpc_err.get('message') or rpc_err}")
+                        rpc_fail_count += 1
+                        now = time.time()
+                        if rpc_fail_since is None:
+                            rpc_fail_since = now
+                        if now - last_worker_poll >= 10.0:
+                            last_worker_poll = now
+                            is_c, synced_id = sync_worker_state(JOB_ID)
+                            if synced_id is not None:
+                                self.message_id = synced_id
+                            if is_c:
+                                cancelled = True
+                                aria2_rpc("aria2.forceRemove", [gid], timeout=3)
+                                raise InterruptedError("Cancelled by user")
+                        if rpc_fail_count >= 5 or (now - rpc_fail_since) >= 75.0:
+                            raise RuntimeError(f"aria2c RPC error ({rpc_fail_count}x): {rpc_err or 'empty tellStatus'}")
+                        time.sleep(min(4.0, 1.0 + 0.5 * rpc_fail_count))
+                        continue
+
+                    rpc_fail_count = 0
+                    rpc_fail_since = None
                     if st.get("followedBy"):
                         gid = st["followedBy"][0]
                         continue
@@ -2083,24 +2147,30 @@ class Mirror:
                     status = st.get("status", "active")
                     total_len = int(st.get("totalLength") or 0)
                     done_len = int(st.get("completedLength") or 0)
+                    attempt_done = max(attempt_done, done_len)
                     dl_spd = int(st.get("downloadSpeed") or 0)
                     files = st.get("files") or []
                     if files and files[0].get("path"):
                         final_path = Path(files[0]["path"])
                         cur_name = final_path.name
+                        if not out_name and Path(f"{final_path}.aria2").exists():
+                            resume_name = final_path.name
 
                     pct = (100.0 * done_len / total_len) if total_len > 0 else 0.0
                     eta = ((total_len - done_len) / dl_spd) if (dl_spd > 0 and total_len > done_len) else None
                     try:
                         self.tick(cur_name, "Download..", pct, done_len, total_len, dl_spd, eta, ARIA_ENGINE)
                     except InterruptedError:
-                        aria2_rpc("aria2.forceRemove", [gid])
+                        aria2_rpc("aria2.forceRemove", [gid], timeout=3)
                         raise
 
                     if status == "complete":
                         break
                     if status in ("error", "removed"):
-                        raise RuntimeError(f"Download failed: {st.get('errorMessage') or 'unknown aria2c error'}")
+                        err_code = str(st.get("errorCode") or "").strip()
+                        err_msg = str(st.get("errorMessage") or "").strip() or "unknown aria2c error"
+                        code_tag = f" [code {err_code}]" if err_code else ""
+                        raise RuntimeError(f"Download failed{code_tag}: {err_msg}")
                     time.sleep(1.0)
                 last_exc = None
                 break
@@ -2109,12 +2179,37 @@ class Mirror:
             except Exception as exc:
                 last_exc = exc
                 msg_low = str(exc).lower()
+                is_rpc_or_crash = ("aria2c rpc error" in msg_low) or ("aria2c crashed" in msg_low)
+                is_range_err = any(
+                    t in msg_low
+                    for t in ("416", "range", "cannot resume", "mismatch", "[code 18]", "[code 19]", "[code 20]")
+                )
                 is_transient = any(
                     t in msg_low
-                    for t in ("timed out", "timeout", "connection", "reset", "eof", "aria2c", "502", "503", "504", "429", "range")
+                    for t in (
+                        "timed out", "timeout", "connection", "reset", "eof", "aria2c",
+                        "broken pipe", "ssl", "tls", "network", "temporarily",
+                        "500", "502", "503", "504", "429", "416", "range",
+                        "[code 2]", "[code 6]", "[code 29]",
+                    )
                 )
-                if attempt < 2 and is_transient:
-                    aria2_rpc("aria2.forceRemove", [gid])
+                made_no_progress = (
+                    (not is_rpc_or_crash)
+                    and attempt >= 2
+                    and prev_done_bytes > 0
+                    and attempt_done <= prev_done_bytes
+                )
+                prev_done_bytes = max(prev_done_bytes, attempt_done)
+                if attempt < 3 and is_transient:
+                    if is_rpc_or_crash:
+                        # Restart daemon cleanly when RPC wedged or aria2c exited so no zombie GID remains
+                        self.stop_aria()
+                    else:
+                        rm_res = aria2_rpc("aria2.forceRemove", [gid], timeout=3)
+                        if not rm_res.get("result"):
+                            self.stop_aria()
+                    if is_range_err or made_no_progress:
+                        fresh_retry = True
                     time.sleep(2.0 * (attempt + 1))
                     continue
                 raise
@@ -2197,6 +2292,10 @@ class Mirror:
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
         last = 0.0
         last_bytes = 0.0
+        last_total = float(size_hint or 0)
+        last_spd = 0.0
+        last_eta = None
+        last_pct = 0.0
         try:
             while proc.poll() is None:
                 if cancelled:
@@ -2204,18 +2303,19 @@ class Mirror:
                 now = time.time()
                 if now - last >= TICK_SECONDS:
                     last = now
-                    st = http_json("http://127.0.0.1:5572/core/stats", data={}, timeout=3)
-                    done = float(st.get("bytes") or 0)
-                    last_bytes = max(last_bytes, done)
-                    total = float(st.get("totalBytes") or size_hint or 0)
-                    spd = float(st.get("speed") or 0)
-                    eta = st.get("eta")
-                    if total > 0:
-                        pct = 100.0 * done / total
-                    else:
-                        tt = float(st.get("totalTransfers") or 0)
-                        pct = (100.0 * float(st.get("transfers") or 0) / tt) if tt > 0 else 0.0
-                    self.tick(filename, status_text, min(100.0, pct), done, total, spd, eta, engine, force=True)
+                    st = http_json("http://127.0.0.1:5572/core/stats", data={}, timeout=8)
+                    if st.get("ok") is not False and ("bytes" in st or "totalTransfers" in st):
+                        done = float(st.get("bytes") or 0)
+                        last_bytes = max(last_bytes, done)
+                        last_total = float(st.get("totalBytes") or size_hint or 0)
+                        last_spd = float(st.get("speed") or 0)
+                        last_eta = st.get("eta")
+                        if last_total > 0:
+                            last_pct = 100.0 * last_bytes / last_total
+                        else:
+                            tt = float(st.get("totalTransfers") or 0)
+                            last_pct = (100.0 * float(st.get("transfers") or 0) / tt) if tt > 0 else 0.0
+                    self.tick(filename, status_text, min(100.0, last_pct), last_bytes, last_total, last_spd, last_eta, engine, force=True)
                 time.sleep(1.0)
         except InterruptedError:
             proc.terminate()
@@ -2730,6 +2830,7 @@ class Mirror:
                 "fragment_retries": 10,
                 "file_access_retries": 5,
                 "extractor_retries": 5,
+                "socket_timeout": 30,
                 "quiet": True,
                 "no_warnings": True,
                 "noprogress": True,
