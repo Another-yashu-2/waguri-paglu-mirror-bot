@@ -673,7 +673,17 @@ async function makeDrivePublic(accessToken, fileId) {
 async function openFolderBrowser(chatId, userId, folderId, editMsgId = null, returnTaskId = null, env, page = 0, threadId = null) {
   const accessToken = await getValidAccessToken(userId, env);
   if (!accessToken) {
-    await sendMessage(chatId, `Please connect your Google Drive first using /login.`, env, null, null, threadId);
+    const authUrl = await createOAuthUrl(chatId, userId, String(userId), env);
+    const text =
+      `<blockquote><b>Google Drive Not Connected</b></blockquote>\n\n` +
+      `Connect (or re-authorize) your Google Drive account to browse folders:`;
+    const rows = [[{ text: '▸ Connect Google Drive', url: authUrl, style: 'primary' }]];
+    if (returnTaskId) {
+      rows.push([{ text: '⛔ Cancel', callback_data: `tm_back:${returnTaskId}`, style: 'danger' }]);
+    } else if (editMsgId) {
+      rows.push([{ text: '↩ Back', callback_data: 'cfg_back', style: 'primary' }]);
+    }
+    await editOrSendMessage(chatId, editMsgId, text, env, { inline_keyboard: rows }, null, threadId);
     return;
   }
 
@@ -995,10 +1005,19 @@ async function renderGhRepoBrowserPage(chatId, userId, browserState, page, editM
 }
 
 async function sendGhLoginScreen(chatId, userId, env, opts = {}) {
-  const { editMsgId = null, replyToMsgId = null, threadId = null, isGroup = false } = opts;
+  const {
+    editMsgId = null,
+    replyToMsgId = null,
+    threadId = null,
+    isGroup = false,
+    returnTaskId = null,
+    backCallback = null,
+    errorText = ''
+  } = opts;
   const stored = await getUserProfile(userId, env);
   const connected = hasGithubAuth(stored);
 
+  const errBlock = errorText ? `\n\n⚠️ ${errorText}` : '';
   const permText =
     `<blockquote><b>GitHub Release Authentication</b></blockquote>\n\n` +
     (connected
@@ -1010,8 +1029,9 @@ async function sendGhLoginScreen(chatId, userId, env, opts = {}) {
         `<b>Required Token Permissions:</b>\n` +
         `• <b>Classic PAT:</b> check <code>repo</code> (public &amp; private) or <code>public_repo</code> (public only)\n` +
         `• <b>Fine-grained PAT:</b> select repo(s) → <b>Contents: Read &amp; Write</b> + <b>Metadata: Read</b>\n\n` +
-        `<b>Send/paste your GitHub PAT now</b> (or /cancel):` +
-        (isGroup ? `\n<i>Your PAT message will be deleted immediately after verification. DM is recommended for privacy.</i>` : ''));
+        `<b>Send/paste your GitHub PAT below:</b>` +
+        (isGroup ? `\n<i>Your PAT message will be deleted immediately after verification. DM is recommended for privacy.</i>` : '')) +
+    errBlock;
 
   const kbRows = [
     [
@@ -1025,19 +1045,21 @@ async function sendGhLoginScreen(chatId, userId, env, opts = {}) {
       { text: '🔌 Disconnect GitHub', callback_data: 'gh_login_disconnect', style: 'danger' }
     ]);
   }
+  if (returnTaskId) {
+    kbRows.push([{ text: '⛔ Cancel', callback_data: `tm_back:${returnTaskId}`, style: 'danger' }]);
+  } else if (backCallback) {
+    kbRows.push([{ text: '↩ Back', callback_data: backCallback, style: 'primary' }]);
+  } else {
+    kbRows.push([{ text: '⛔ Cancel', callback_data: 'gh_login_cancel', style: 'danger' }]);
+  }
   const kb = { inline_keyboard: kbRows };
 
-  let targetMsgId = editMsgId;
-  if (editMsgId) {
-    await editMessage(chatId, editMsgId, permText, env, kb);
-  } else {
-    const sent = await sendMessage(chatId, permText, env, kb, replyToMsgId, threadId);
-    targetMsgId = sent?.result?.message_id || null;
-  }
+  const out = await editOrSendMessage(chatId, editMsgId, permText, env, kb, replyToMsgId, threadId);
+  const targetMsgId = out.msgId;
 
   await getStore(env).put(
     promptKey(chatId, userId),
-    JSON.stringify({ type: 'gh_pat', menuMsgId: targetMsgId, threadId }),
+    JSON.stringify({ type: 'gh_pat', menuMsgId: targetMsgId, threadId, returnTaskId, backCallback }),
     { expirationTtl: 600 }
   );
 }
@@ -1060,7 +1082,7 @@ async function openGhReleaseWizard(task, step, env, editMsgIdOverride = null) {
   if (step === 'tag') {
     await getStore(env).put(
       pKey,
-      JSON.stringify({ type: 'gh_rel_tag', taskId: tid, threadId: task.threadId || null }),
+      JSON.stringify({ type: 'gh_rel_tag', taskId: tid, menuMsgId: msgId, threadId: task.threadId || null }),
       { expirationTtl: 1800 }
     );
     const text =
@@ -1072,7 +1094,7 @@ async function openGhReleaseWizard(task, step, env, editMsgIdOverride = null) {
     const kb = {
       inline_keyboard: [
         [{ text: `⚡ Use Auto Tag (${autoTag})`, callback_data: `ghrel_auto:${tid}:tag`, style: 'success' }],
-        [{ text: '↩ Back to Task Options', callback_data: `tm_back:${tid}`, style: 'primary' }]
+        [{ text: '⛔ Cancel', callback_data: `tm_back:${tid}`, style: 'danger' }]
       ]
     };
     await editMessage(chatId, msgId, text, env, kb);
@@ -1082,7 +1104,7 @@ async function openGhReleaseWizard(task, step, env, editMsgIdOverride = null) {
   if (step === 'title') {
     await getStore(env).put(
       pKey,
-      JSON.stringify({ type: 'gh_rel_title', taskId: tid, threadId: task.threadId || null }),
+      JSON.stringify({ type: 'gh_rel_title', taskId: tid, menuMsgId: msgId, threadId: task.threadId || null }),
       { expirationTtl: 1800 }
     );
     const text =
@@ -1094,7 +1116,10 @@ async function openGhReleaseWizard(task, step, env, editMsgIdOverride = null) {
     const kb = {
       inline_keyboard: [
         [{ text: '⚡ Use Default Title', callback_data: `ghrel_auto:${tid}:title`, style: 'success' }],
-        [{ text: '↩ Back to Tag', callback_data: `ghrel_step:${tid}:tag`, style: 'primary' }]
+        [
+          { text: '↩ Back to Tag', callback_data: `ghrel_step:${tid}:tag`, style: 'primary' },
+          { text: '⛔ Cancel', callback_data: `tm_back:${tid}`, style: 'danger' }
+        ]
       ]
     };
     await editMessage(chatId, msgId, text, env, kb);
@@ -1104,7 +1129,7 @@ async function openGhReleaseWizard(task, step, env, editMsgIdOverride = null) {
   if (step === 'notes') {
     await getStore(env).put(
       pKey,
-      JSON.stringify({ type: 'gh_rel_notes', taskId: tid, threadId: task.threadId || null }),
+      JSON.stringify({ type: 'gh_rel_notes', taskId: tid, menuMsgId: msgId, threadId: task.threadId || null }),
       { expirationTtl: 1800 }
     );
     const text =
@@ -1119,7 +1144,10 @@ async function openGhReleaseWizard(task, step, env, editMsgIdOverride = null) {
           { text: '⏭ Skip Description', callback_data: `ghrel_auto:${tid}:skipnotes`, style: 'primary' },
           { text: '✨ Auto-Generate Notes', callback_data: `ghrel_auto:${tid}:gennotes`, style: 'primary' }
         ],
-        [{ text: '↩ Back to Title', callback_data: `ghrel_step:${tid}:title`, style: 'primary' }]
+        [
+          { text: '↩ Back to Title', callback_data: `ghrel_step:${tid}:title`, style: 'primary' },
+          { text: '⛔ Cancel', callback_data: `tm_back:${tid}`, style: 'danger' }
+        ]
       ]
     };
     await editMessage(chatId, msgId, text, env, kb);
@@ -1545,6 +1573,196 @@ function promptKey(chatId, userId) {
   return `prompt:${chatId}:${userId}`;
 }
 
+async function clearMatchingPrompt(chatId, userId, env, matchFn = null) {
+  const pKey = promptKey(chatId, userId);
+  if (!matchFn) {
+    await getStore(env).delete(pKey);
+    return;
+  }
+  const raw = await getStore(env).get(pKey);
+  if (!raw) return;
+  try {
+    const parsed = JSON.parse(raw);
+    if (matchFn(parsed)) await getStore(env).delete(pKey);
+  } catch (_) {
+    await getStore(env).delete(pKey);
+  }
+}
+
+const TASK_PROMPT_ACTIONS = {
+  tm_ren: { type: 'rename', toast: 'Send new file name' },
+  tm_sel: { type: 'select_filter', toast: 'Send extension filter' },
+  tm_pass: { type: 'archive_password', toast: 'Send archive password' },
+  tm_ytslang: { type: 'yt_sublang', toast: 'Send subtitle language' },
+  tm_ytplitems: { type: 'yt_plitems', toast: 'Send playlist range' },
+  tm_yttrim: { type: 'yt_trim', toast: 'Send trim range' }
+};
+
+const TASK_PROMPT_TYPES = new Set(Object.values(TASK_PROMPT_ACTIONS).map(v => v.type));
+
+function buildTaskPromptView(type, task, errorText = '') {
+  const tid = task.taskId;
+  let title = '';
+  let currentLine = '';
+  let body = '';
+
+  if (type === 'rename') {
+    title = task.batch && task.mode === 'zip' ? 'ZIP Filename' : 'Rename File';
+    currentLine = `<code>${escapeHtml(task.customName || task.detectedName)}</code>`;
+    body = `Send the new filename (including extension) below:`;
+  } else if (type === 'select_filter') {
+    title = 'Archive Extension Filter';
+    currentLine = task.selectFilter ? `Current  ·  <code>${escapeHtml(task.selectFilter)}</code>` : '';
+    body = `Send comma-separated extensions to keep when extracting (e.g. <code>.mkv, .mp4, .srt</code>) or send <code>all</code>:`;
+  } else if (type === 'archive_password') {
+    title = 'Archive Password';
+    currentLine = task.archivePassword ? `Status  ·  <code>Set (hidden)</code>` : '';
+    body =
+      `Send the password to ${task.mode === 'zip' ? 'encrypt the ZIP' : 'extract the archive'}, or send <code>clear</code> to remove.\n\n` +
+      `<i>Your password message will be deleted immediately after saving.</i>`;
+  } else if (type === 'yt_sublang') {
+    title = 'Subtitle Language';
+    currentLine = `Current  ·  <code>${escapeHtml(task.ytSubLang || 'en')}</code>`;
+    body = `Send language code(s) (e.g. <code>en</code>, <code>en,hi</code>, <code>all</code>):`;
+  } else if (type === 'yt_plitems') {
+    title = 'Playlist Items';
+    currentLine = task.ytPlaylistItems ? `Current  ·  <code>${escapeHtml(task.ytPlaylistItems)}</code>` : '';
+    body = `Send item indices/ranges (e.g. <code>1-5</code> or <code>1,3,7-10</code>), or send <code>clear</code> for all:`;
+  } else if (type === 'yt_trim') {
+    title = 'Trim / Clip Section';
+    currentLine = task.ytTrim ? `Current  ·  <code>${escapeHtml(task.ytTrim)}</code>` : '';
+    body = `Send start and end timestamps (e.g. <code>00:30-02:15</code> or <code>1:05:00-1:10:00</code>), or send <code>clear</code> to remove:`;
+  }
+
+  const header = currentLine
+    ? `<blockquote><b>${title}</b>\n\n${currentLine}</blockquote>`
+    : `<blockquote><b>${title}</b></blockquote>`;
+  const errBlock = errorText ? `\n\n⚠️ ${errorText}` : '';
+  return {
+    text: `${header}\n\n${body}${errBlock}`,
+    kb: { inline_keyboard: [[{ text: '⛔ Cancel', callback_data: `tm_back:${tid}`, style: 'danger' }]] }
+  };
+}
+
+function buildMkdirPromptView(parentName, returnTaskId, errorText = '') {
+  const errBlock = errorText ? `\n\n⚠️ ${errorText}` : '';
+  const rows = [];
+  if (returnTaskId) {
+    rows.push([{ text: '↩ Back to Folders', callback_data: 'fb_mkdir_cancel', style: 'primary' }]);
+    rows.push([{ text: '⛔ Cancel', callback_data: `fb_back:${returnTaskId}`, style: 'danger' }]);
+  } else {
+    rows.push([{ text: '⛔ Cancel', callback_data: 'fb_mkdir_cancel', style: 'danger' }]);
+  }
+  return {
+    text:
+      `<blockquote><b>New Folder</b>\n\nParent  ·  <code>${escapeHtml(parentName || 'My Drive')}</code></blockquote>\n\n` +
+      `Send the folder name below:${errBlock}`,
+    kb: { inline_keyboard: rows }
+  };
+}
+
+function buildGhRepoManualView(returnTaskId, errorText = '') {
+  const errBlock = errorText ? `\n\n⚠️ ${errorText}` : '';
+  const rows = [];
+  if (returnTaskId) {
+    rows.push([{ text: '↩ Back to Repos', callback_data: 'ghr_manual_cancel', style: 'primary' }]);
+    rows.push([{ text: '⛔ Cancel', callback_data: `ghr_back:${returnTaskId}`, style: 'danger' }]);
+  } else {
+    rows.push([{ text: '⛔ Cancel', callback_data: 'ghr_manual_cancel', style: 'danger' }]);
+  }
+  return {
+    text:
+      `<blockquote><b>Enter GitHub Repository</b></blockquote>\n\n` +
+      `Send <code>owner/repo</code> (e.g. <code>Another-yashu-2/releases</code>) below:${errBlock}`,
+    kb: { inline_keyboard: rows }
+  };
+}
+
+async function restoreTaskMenuScreen(chatId, taskId, fallbackMsgId, threadId, env) {
+  const tRaw = await getStore(env).get(`task:${taskId}`);
+  if (!tRaw) {
+    await editOrSendMessage(chatId, fallbackMsgId, `<blockquote><b>Task Session Expired</b></blockquote>`, env, null, null, threadId);
+    return null;
+  }
+  const task = JSON.parse(tRaw);
+  const out = await editOrSendMessage(
+    chatId,
+    task.menuMsgId || fallbackMsgId,
+    buildTaskMenuMessage(task),
+    env,
+    buildTaskMenuKeyboard(task),
+    null,
+    task.threadId || threadId
+  );
+  if (!out.edited && out.msgId) {
+    task.menuMsgId = out.msgId;
+    await getStore(env).put(`task:${task.taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
+  }
+  return task;
+}
+
+async function restorePromptScreen(chatId, userId, pState, env, fallbackThreadId = null) {
+  if (!pState) {
+    await sendMessage(chatId, `<i>Input cancelled.</i>`, env, null, null, fallbackThreadId);
+    return;
+  }
+  const threadId = pState.threadId || fallbackThreadId || null;
+  if (TASK_PROMPT_TYPES.has(pState.type) || String(pState.type || '').startsWith('gh_rel_')) {
+    await restoreTaskMenuScreen(chatId, pState.taskId, pState.menuMsgId, threadId, env);
+    return;
+  }
+  if (pState.type === 'mkdir') {
+    const bRaw = await getStore(env).get(`browser:${userId}`);
+    if (bRaw && pState.browserMsgId) {
+      const bState = JSON.parse(bRaw);
+      await renderFolderBrowserPage(chatId, userId, bState, bState.page || 0, pState.browserMsgId, env);
+      return;
+    }
+    if (pState.returnTaskId) {
+      await restoreTaskMenuScreen(chatId, pState.returnTaskId, pState.browserMsgId, threadId, env);
+      return;
+    }
+  }
+  if (pState.type === 'gh_repo_manual') {
+    const gRaw = await getStore(env).get(`ghbrowser:${userId}`);
+    if (gRaw && pState.browserMsgId) {
+      const gState = JSON.parse(gRaw);
+      await renderGhRepoBrowserPage(chatId, userId, gState, gState.page || 0, pState.browserMsgId, env);
+      return;
+    }
+    if (pState.returnTaskId) {
+      await restoreTaskMenuScreen(chatId, pState.returnTaskId, pState.browserMsgId, threadId, env);
+      return;
+    }
+  }
+  if (pState.type === 'gh_pat') {
+    if (pState.returnTaskId) {
+      await restoreTaskMenuScreen(chatId, pState.returnTaskId, pState.menuMsgId, threadId, env);
+      return;
+    }
+    if (pState.backCallback === 'cfg_back' && pState.menuMsgId) {
+      const stored = await getUserProfile(userId, env);
+      await sendSettingsMenu(chatId, userId, getEffectiveProfile(userId, stored), pState.menuMsgId, env, threadId);
+      return;
+    }
+    if (pState.menuMsgId) {
+      await editMessage(chatId, pState.menuMsgId, `<blockquote><b>GitHub Authentication Cancelled</b></blockquote>\n\nRun /ghlogin anytime to connect.`, env);
+      return;
+    }
+  }
+  if (pState.type === 'add_admin_id' && pState.menuMsgId) {
+    const panel = await buildOwnerAdminPanel('admins', env);
+    await editMessage(chatId, pState.menuMsgId, panel.text, env, panel.kb);
+    return;
+  }
+  if (pState.type === 'status_user' && pState.menuMsgId) {
+    const ov = await buildOwnerStatusOverview(env);
+    await editMessage(chatId, pState.menuMsgId, ov.text, env, ov.kb);
+    return;
+  }
+  await sendMessage(chatId, `<i>Input cancelled.</i>`, env, null, null, threadId);
+}
+
 async function getAdminsMap(env) {
   const raw = await getStore(env).get('auth:admins');
   if (!raw) return {};
@@ -1961,7 +2179,7 @@ async function buildUserStatusReport(rawInput, actorObj, env) {
   return { ok: true, text };
 }
 
-async function sendOwnerStatusOverview(chatId, env, replyToMsgId = null, threadId = null) {
+async function buildOwnerStatusOverview(env) {
   const admins = await getAdminsMap(env);
   const pending = await getPendingAdminsMap(env);
   const adminCount = Object.keys(admins).length;
@@ -1979,6 +2197,11 @@ async function sendOwnerStatusOverview(chatId, env, replyToMsgId = null, threadI
       [{ text: '📋 View Active Tasks', callback_data: 'st_active_tasks' }]
     ]
   };
+  return { text, kb };
+}
+
+async function sendOwnerStatusOverview(chatId, env, replyToMsgId = null, threadId = null) {
+  const { text, kb } = await buildOwnerStatusOverview(env);
   await sendMessage(chatId, text, env, kb, replyToMsgId, threadId);
 }
 
@@ -2676,11 +2899,14 @@ async function handleTelegramUpdate(update, env) {
   const promptRaw = await getStore(env).get(pKey);
   if (promptRaw && !directMedia && (text || msg.forward_from)) {
     if (cmd === '/cancel') {
+      let pState = null;
+      try { pState = JSON.parse(promptRaw); } catch (_) {}
       await getStore(env).delete(pKey);
-      await sendMessage(chatId, `<i>Input cancelled.</i>`, env, null, msg.message_id, threadId);
+      await deleteMessage(chatId, msg.message_id, env).catch(() => {});
+      await restorePromptScreen(chatId, userId, pState, env, threadId);
       return;
     }
-    if (cmd && ['/start', '/help', '/login', '/logout', '/ghlogin', '/ghlogout', '/settings', '/clear'].includes(cmd)) {
+    if (cmd && ['/start', '/help', '/login', '/logout', '/ghlogin', '/ghlogout', '/settings', '/clear', '/setdldir', '/status', '/admin', '/admins', '/tasks', '/history'].includes(cmd)) {
       await getStore(env).delete(pKey);
     } else {
       const promptState = JSON.parse(promptRaw);
@@ -3753,31 +3979,62 @@ async function canControlRecord(rec, userId, env) {
 async function handleUserPromptInput(chatId, userId, text, promptState, msgId, env, threadId = null, msgObj = null) {
   if (promptState.type === 'add_admin_id') {
     if (!isOwner(userId, env)) return;
+    await deleteMessage(chatId, msgId, env).catch(() => {});
     const res = await addAdminByInput(text, msgObj?.forward_from || null, env);
     if (!res.ok) {
-      await sendMessage(chatId, res.error, env, null, msgId, threadId);
+      if (promptState.menuMsgId) {
+        await getStore(env).put(promptKey(chatId, userId), JSON.stringify(promptState), { expirationTtl: 600 });
+        await editOrSendMessage(
+          chatId,
+          promptState.menuMsgId,
+          `<blockquote><b>Add Admin</b></blockquote>\n\nSend the user's <code>@username</code>, numeric User ID (e.g. <code>123456789</code>), or forward a message from them:\n\n⚠️ ${res.error}`,
+          env,
+          { inline_keyboard: [[{ text: '⛔ Cancel', callback_data: 'adm_panel:admins', style: 'danger' }]] },
+          null,
+          threadId
+        );
+      } else {
+        await sendMessage(chatId, res.error, env, null, null, threadId);
+      }
       return;
     }
     if (res.mode === 'id') {
-      await sendMessage(chatId, `✓ Admin <b>${escapeHtml(res.label)}</b> (<code>${escapeHtml(res.userId)}</code>) added.`, env, null, msgId, threadId);
       await sendMessage(res.userId, `<blockquote><b>Admin Access Granted</b>\n\nYou are now an Admin. Send /start to use the bot.</blockquote>`, env).catch(() => {});
-    } else {
-      await sendMessage(
-        chatId,
-        `✓ Pre-approved Admin <b>${escapeHtml(res.label)}</b>.\n\n<i>They will automatically get Admin access as soon as they message the bot.</i>`,
-        env,
-        null,
-        msgId,
-        threadId
-      );
     }
+    const notice = res.mode === 'id'
+      ? `✓ Admin <b>${escapeHtml(res.label)}</b> (<code>${escapeHtml(res.userId)}</code>) added.\n\n`
+      : `✓ Pre-approved Admin <b>${escapeHtml(res.label)}</b> (<i>activates on first DM</i>).\n\n`;
+    const panel = await buildOwnerAdminPanel('admins', env);
+    await editOrSendMessage(chatId, promptState.menuMsgId, `${notice}${panel.text}`, env, panel.kb, null, threadId);
     return;
   }
 
   if (promptState.type === 'status_user') {
     if (!isOwner(userId, env)) return;
+    await deleteMessage(chatId, msgId, env).catch(() => {});
     const rep = await buildUserStatusReport(text, msgObj?.forward_from || null, env);
-    await sendMessage(chatId, rep.ok ? rep.text : rep.error, env, null, msgId, threadId);
+    if (!rep.ok && promptState.menuMsgId) {
+      await getStore(env).put(promptKey(chatId, userId), JSON.stringify(promptState), { expirationTtl: 600 });
+      await editOrSendMessage(
+        chatId,
+        promptState.menuMsgId,
+        `<blockquote><b>Check User Status</b></blockquote>\n\nSend the user's <code>@username</code>, numeric User ID, or forward a message from them:\n\n⚠️ ${rep.error}`,
+        env,
+        { inline_keyboard: [[{ text: '⛔ Cancel', callback_data: 'st_panel', style: 'danger' }]] },
+        null,
+        threadId
+      );
+      return;
+    }
+    await editOrSendMessage(
+      chatId,
+      promptState.menuMsgId,
+      rep.ok ? rep.text : rep.error,
+      env,
+      { inline_keyboard: [[{ text: '↩ Back', callback_data: 'st_panel', style: 'primary' }]] },
+      null,
+      threadId
+    );
     return;
   }
 
@@ -3786,126 +4043,99 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
     return;
   }
 
-  if (promptState.type === 'rename') {
+  if (TASK_PROMPT_TYPES.has(promptState.type)) {
+    await deleteMessage(chatId, msgId, env).catch(() => {});
     const raw = await getStore(env).get(`task:${promptState.taskId}`);
     if (!raw) {
-      await sendMessage(chatId, `<i>Task session expired.</i>`, env, null, msgId, threadId);
+      await editOrSendMessage(chatId, promptState.menuMsgId, `<blockquote><b>Task Session Expired</b></blockquote>`, env, null, null, threadId);
       return;
     }
     const task = JSON.parse(raw);
-    task.customName = text.replace(/[/\\?%*:|"<>]/g, '_').trim();
-    if (!task.batch && task.customName && task.dest !== 'gofile') {
-      const accessToken = await getValidAccessToken(task.credUserId || userId, env);
-      if (accessToken) {
-        const existing = await findDriveExisting(accessToken, task.folderId || 'root', task.customName);
-        task.duplicateExists = existing.length > 0;
-      }
-    }
-    await getStore(env).put(`task:${task.taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
-
-    if (task.menuMsgId) {
-      await editMessage(chatId, task.menuMsgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
-    }
-    await sendMessage(chatId, `Renamed  ·  <code>${escapeHtml(task.customName)}</code>`, env, null, msgId, threadId);
-    return;
-  }
-
-  if (promptState.type === 'select_filter') {
-    const raw = await getStore(env).get(`task:${promptState.taskId}`);
-    if (!raw) return;
-    const task = JSON.parse(raw);
-    task.selectFilter = text.toLowerCase() === 'all' ? '' : text.trim();
-    await getStore(env).put(`task:${task.taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
-
-    if (task.menuMsgId) {
-      await editMessage(chatId, task.menuMsgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
-    }
-    await sendMessage(
-      chatId,
-      task.selectFilter
-        ? `Extension Filter  ·  <code>${escapeHtml(task.selectFilter)}</code>`
-        : `Filter Cleared  ·  All extracted files will be uploaded.`,
-      env,
-      null,
-      msgId,
-      threadId
-    );
-    return;
-  }
-
-  if (promptState.type === 'archive_password') {
-    const raw = await getStore(env).get(`task:${promptState.taskId}`);
-    if (!raw) {
-      await sendMessage(chatId, `<i>Task session expired.</i>`, env, null, msgId, threadId);
-      return;
-    }
-    const task = JSON.parse(raw);
-    const clear = text.toLowerCase() === 'clear' || text.toLowerCase() === 'none';
-    task.archivePassword = clear ? '' : text;
-    await getStore(env).put(`task:${task.taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
-    await deleteMessage(chatId, msgId, env);
-
-    if (task.menuMsgId) {
-      await editMessage(chatId, task.menuMsgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
-    }
-    await sendMessage(
-      chatId,
-      clear ? `Archive Password  ·  Cleared` : `Archive Password  ·  <code>Set (hidden)</code>`,
-      env,
-      null,
-      null,
-      threadId
-    );
-    return;
-  }
-
-  if (promptState.type === 'yt_sublang' || promptState.type === 'yt_plitems' || promptState.type === 'yt_trim') {
-    const raw = await getStore(env).get(`task:${promptState.taskId}`);
-    if (!raw) {
-      await sendMessage(chatId, `<i>Task session expired.</i>`, env, null, msgId, threadId);
-      return;
-    }
-    const task = JSON.parse(raw);
+    const targetMsgId = task.menuMsgId || promptState.menuMsgId || null;
     const val = text.trim();
     const clear = val.toLowerCase() === 'clear' || val.toLowerCase() === 'none';
-    let notice = '';
 
-    if (promptState.type === 'yt_sublang') {
+    const failTaskPrompt = async errMsg => {
+      await getStore(env).put(
+        promptKey(chatId, userId),
+        JSON.stringify({ ...promptState, menuMsgId: targetMsgId }),
+        { expirationTtl: 600 }
+      );
+      const view = buildTaskPromptView(promptState.type, task, errMsg);
+      const out = await editOrSendMessage(chatId, targetMsgId, view.text, env, view.kb, null, task.threadId || threadId);
+      if (!out.edited && out.msgId && out.msgId !== task.menuMsgId) {
+        task.menuMsgId = out.msgId;
+        await getStore(env).put(`task:${task.taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
+      }
+    };
+
+    if (promptState.type === 'rename') {
+      const cleanName = text.replace(/[/\\?%*:|"<>]/g, '_').trim();
+      if (!cleanName) {
+        await failTaskPrompt('Filename cannot be empty.');
+        return;
+      }
+      task.customName = cleanName;
+      if (!task.batch && task.customName && task.dest === 'gdrive') {
+        const accessToken = await getValidAccessToken(task.credUserId || userId, env);
+        if (accessToken) {
+          const existing = await findDriveExisting(accessToken, task.folderId || 'root', task.customName);
+          task.duplicateExists = existing.length > 0;
+        }
+      }
+    } else if (promptState.type === 'select_filter') {
+      task.selectFilter = val.toLowerCase() === 'all' ? '' : val;
+    } else if (promptState.type === 'archive_password') {
+      task.archivePassword = clear ? '' : text;
+    } else if (promptState.type === 'yt_sublang') {
       task.ytSubLang = clear ? 'en' : val.replace(/\s+/g, '');
-      notice = `Subtitle Language  ·  <code>${escapeHtml(task.ytSubLang)}</code>`;
     } else if (promptState.type === 'yt_plitems') {
       task.ytPlaylistItems = clear ? '' : val.replace(/\s+/g, '');
-      notice = task.ytPlaylistItems
-        ? `Playlist Items  ·  <code>${escapeHtml(task.ytPlaylistItems)}</code>`
-        : `Playlist Items  ·  All items`;
     } else if (promptState.type === 'yt_trim') {
       if (clear) {
         task.ytTrim = '';
-        notice = `Trim Range  ·  Cleared`;
       } else if (!/^\d{1,2}(?::\d{1,2}){0,2}-\d{1,2}(?::\d{1,2}){0,2}$/.test(val)) {
-        await sendMessage(chatId, `Invalid format. Use <code>MM:SS-MM:SS</code> or <code>HH:MM:SS-HH:MM:SS</code> (e.g. <code>00:30-02:15</code>).`, env, null, msgId, threadId);
+        await failTaskPrompt('Invalid format. Use <code>MM:SS-MM:SS</code> or <code>HH:MM:SS-HH:MM:SS</code> (e.g. <code>00:30-02:15</code>).');
         return;
       } else {
         task.ytTrim = val;
-        notice = `Trim Range  ·  <code>${escapeHtml(task.ytTrim)}</code>`;
       }
     }
 
+    const out = await editOrSendMessage(
+      chatId,
+      targetMsgId,
+      buildTaskMenuMessage(task),
+      env,
+      buildTaskMenuKeyboard(task),
+      null,
+      task.threadId || threadId
+    );
+    if (!out.edited && out.msgId) task.menuMsgId = out.msgId;
     await getStore(env).put(`task:${task.taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
-    if (task.menuMsgId) {
-      await editMessage(chatId, task.menuMsgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
-    }
-    await sendMessage(chatId, notice, env, null, msgId, threadId);
     return;
   }
 
   if (promptState.type === 'mkdir') {
-    const accessToken = await getValidAccessToken(userId, env);
-    if (!accessToken) {
-      await sendMessage(chatId, `Please run /login first.`, env, null, msgId, threadId);
+    await deleteMessage(chatId, msgId, env).catch(() => {});
+    const failMkdir = async (errMsg, retryable = true) => {
+      if (retryable) {
+        await getStore(env).put(promptKey(chatId, userId), JSON.stringify(promptState), { expirationTtl: 600 });
+      }
+      const view = buildMkdirPromptView(promptState.parentName || 'My Drive', promptState.returnTaskId, errMsg);
+      await editOrSendMessage(chatId, promptState.browserMsgId, view.text, env, view.kb, null, promptState.threadId || threadId);
+    };
+
+    const newFolderName = text.trim();
+    if (!newFolderName) {
+      await failMkdir('Folder name cannot be empty.');
       return;
     }
-    const newFolderName = text.trim();
+    const accessToken = await getValidAccessToken(userId, env);
+    if (!accessToken) {
+      await failMkdir('Google Drive session expired. Run /login first.', false);
+      return;
+    }
     const parentId = promptState.parentId || 'root';
     const createRes = await fetch('https://www.googleapis.com/drive/v3/files?fields=id,name', {
       method: 'POST',
@@ -3921,27 +4151,25 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
     });
 
     if (!createRes.ok) {
-      await sendMessage(chatId, `Error  ·  Could not create folder on Google Drive.`, env, null, msgId, threadId);
+      await failMkdir('Could not create folder on Google Drive. Try another name.');
       return;
     }
     const created = await createRes.json();
-    await openFolderBrowser(chatId, userId, created.id, promptState.browserMsgId || null, promptState.returnTaskId || null, env, 0, threadId);
+    await openFolderBrowser(chatId, userId, created.id, promptState.browserMsgId || null, promptState.returnTaskId || null, env, 0, promptState.threadId || threadId);
     return;
   }
 
   if (promptState.type === 'gh_pat') {
-    await deleteMessage(chatId, msgId, env);
+    await deleteMessage(chatId, msgId, env).catch(() => {});
     const ver = await verifyGithubPat(text);
     if (!ver.ok) {
-      await getStore(env).put(promptKey(chatId, userId), JSON.stringify(promptState), { expirationTtl: 600 });
-      await sendMessage(
-        chatId,
-        `<blockquote><b>GitHub Verification Failed</b></blockquote>\n\n${ver.error}\n\n<i>Send a valid PAT to retry, or /cancel.</i>`,
-        env,
-        null,
-        null,
-        threadId
-      );
+      await sendGhLoginScreen(chatId, userId, env, {
+        editMsgId: promptState.menuMsgId || null,
+        returnTaskId: promptState.returnTaskId || null,
+        backCallback: promptState.backCallback || null,
+        threadId: promptState.threadId || threadId,
+        errorText: ver.error
+      });
       return;
     }
 
@@ -3958,6 +4186,24 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
     }
     await saveUserProfile(userId, profile, env);
 
+    if (promptState.returnTaskId) {
+      const tRaw = await getStore(env).get(`task:${promptState.returnTaskId}`);
+      if (tRaw) {
+        const task = JSON.parse(tRaw);
+        task.hasGithub = true;
+        task.ghUser = profile.ghUser;
+        if (!task.ghRepo) task.ghRepo = profile.ghRepo || '';
+        if (task.dest === 'ghrelease') task.folderName = task.ghRepo || 'GitHub Release';
+        await getStore(env).put(`task:${task.taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
+        if (!task.ghRepo) {
+          await openGhRepoBrowser(chatId, userId, promptState.menuMsgId || task.menuMsgId, task.taskId, env, 0, promptState.threadId || threadId);
+          return;
+        }
+        await restoreTaskMenuScreen(chatId, task.taskId, promptState.menuMsgId, promptState.threadId || threadId, env);
+        return;
+      }
+    }
+
     const doneText =
       `<blockquote><b>GitHub Connected ✓</b>\n\n` +
       `Account  ·  <b>@${escapeHtml(profile.ghUser)}</b></blockquote>\n\n` +
@@ -3965,41 +4211,45 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
       `Writable Repos  ·  <code>${ver.repos.length}</code>\n` +
       `Default Repo  ·  <code>${escapeHtml(profile.ghRepo || 'Not selected yet')}</code>\n\n` +
       `<i>You can now pick <b>GitHub Release</b> as destination when mirroring files!</i>`;
-    const kb = {
-      inline_keyboard: [[
-        { text: '📦 Select Default Repo', callback_data: 'gh_login_repo', style: 'success' },
-        { text: '🔌 Disconnect', callback_data: 'gh_login_disconnect', style: 'danger' }
-      ]]
-    };
-    if (promptState.menuMsgId) {
-      await editMessage(chatId, promptState.menuMsgId, doneText, env, kb).catch(async () => {
-        await sendMessage(chatId, doneText, env, kb, null, threadId);
-      });
-    } else {
-      await sendMessage(chatId, doneText, env, kb, null, threadId);
+    const kbRows = [[
+      { text: '📦 Select Default Repo', callback_data: 'gh_login_repo', style: 'success' },
+      { text: '🔌 Disconnect', callback_data: 'gh_login_disconnect', style: 'danger' }
+    ]];
+    if (promptState.backCallback) {
+      kbRows.push([{ text: '↩ Back', callback_data: promptState.backCallback, style: 'primary' }]);
     }
+    await editOrSendMessage(chatId, promptState.menuMsgId, doneText, env, { inline_keyboard: kbRows }, null, promptState.threadId || threadId);
     return;
   }
 
   if (promptState.type === 'gh_repo_manual') {
+    await deleteMessage(chatId, msgId, env).catch(() => {});
+    const failRepo = async (errMsg, retryable = true) => {
+      if (retryable) {
+        await getStore(env).put(promptKey(chatId, userId), JSON.stringify(promptState), { expirationTtl: 600 });
+      }
+      const view = buildGhRepoManualView(promptState.returnTaskId, errMsg);
+      await editOrSendMessage(chatId, promptState.browserMsgId, view.text, env, view.kb, null, promptState.threadId || threadId);
+    };
+
     const repoInput = text.trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/i, '').replace(/^\/+|\/+$/g, '');
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repoInput)) {
-      await sendMessage(chatId, `Invalid format. Send <code>owner/repo</code> (e.g. <code>octocat/hello-world</code>).`, env, null, msgId, threadId);
+      await failRepo('Invalid format. Send <code>owner/repo</code> (e.g. <code>octocat/hello-world</code>).');
       return;
     }
     const profile = await getUserProfile(userId, env);
     if (!hasGithubAuth(profile)) {
-      await sendMessage(chatId, `Please run /ghlogin first.`, env, null, msgId, threadId);
+      await failRepo('GitHub not connected. Run /ghlogin first.', false);
       return;
     }
     const rRes = await fetch(`https://api.github.com/repos/${repoInput}`, { headers: ghHeaders(profile.ghPat) });
     if (!rRes.ok) {
-      await sendMessage(chatId, `Could not access <code>${escapeHtml(repoInput)}</code> (HTTP ${rRes.status}). Check repo spelling &amp; token permissions.`, env, null, msgId, threadId);
+      await failRepo(`Could not access <code>${escapeHtml(repoInput)}</code> (HTTP ${rRes.status}). Check repo spelling &amp; token permissions.`);
       return;
     }
     const rJson = await rRes.json();
     if (!rJson.permissions || (!rJson.permissions.push && !rJson.permissions.maintain && !rJson.permissions.admin)) {
-      await sendMessage(chatId, `No push/release permission on <code>${escapeHtml(repoInput)}</code>.`, env, null, msgId, threadId);
+      await failRepo(`No push/release permission on <code>${escapeHtml(repoInput)}</code>.`);
       return;
     }
     profile.ghRepo = rJson.full_name || repoInput;
@@ -4013,23 +4263,43 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
         task.hasGithub = true;
         task.ghUser = profile.ghUser;
         task.ghRepo = profile.ghRepo;
+        task.folderId = '';
         task.folderName = profile.ghRepo;
+        task.share = false;
+        task.duplicateExists = false;
+        const out = await editOrSendMessage(
+          chatId,
+          promptState.browserMsgId || task.menuMsgId,
+          buildTaskMenuMessage(task),
+          env,
+          buildTaskMenuKeyboard(task),
+          null,
+          task.threadId || promptState.threadId || threadId
+        );
+        if (!out.edited && out.msgId) task.menuMsgId = out.msgId;
         await getStore(env).put(`task:${task.taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
-        if (promptState.browserMsgId) {
-          await editMessage(chatId, promptState.browserMsgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
-        }
-        await sendMessage(chatId, `Selected Repo  ·  <code>${escapeHtml(profile.ghRepo)}</code>`, env, null, msgId, threadId);
         return;
       }
     }
-    await sendMessage(chatId, `Default GitHub Repo updated  ·  <code>${escapeHtml(profile.ghRepo)}</code>`, env, null, msgId, threadId);
+    await editOrSendMessage(
+      chatId,
+      promptState.browserMsgId,
+      `<blockquote><b>Default GitHub Repository Updated</b></blockquote>\n\n` +
+        `Repository  ·  <code>${escapeHtml(profile.ghRepo)}</code>\n\n` +
+        `Change anytime  ·  /ghlogin`,
+      env,
+      null,
+      null,
+      promptState.threadId || threadId
+    );
     return;
   }
 
   if (promptState.type === 'gh_rel_tag' || promptState.type === 'gh_rel_title' || promptState.type === 'gh_rel_notes') {
+    await deleteMessage(chatId, msgId, env).catch(() => {});
     const raw = await getStore(env).get(`task:${promptState.taskId}`);
     if (!raw) {
-      await sendMessage(chatId, `<i>Task session expired.</i>`, env, null, msgId, threadId);
+      await editOrSendMessage(chatId, promptState.menuMsgId, `<blockquote><b>Task Session Expired</b></blockquote>`, env, null, null, threadId);
       return;
     }
     const task = JSON.parse(raw);
@@ -4039,7 +4309,7 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
     if (promptState.type === 'gh_rel_tag') {
       const cleanTag = val.replace(/\s+/g, '-').slice(0, 128);
       if (!cleanTag) {
-        await openGhReleaseWizard(task, 'tag', env);
+        await openGhReleaseWizard(task, 'tag', env, promptState.menuMsgId);
         return;
       }
       task.ghTag = cleanTag;
@@ -4055,8 +4325,7 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
     }
 
     await getStore(env).put(`task:${task.taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
-    await deleteMessage(chatId, msgId, env).catch(() => {});
-    await openGhReleaseWizard(task, nextStep, env);
+    await openGhReleaseWizard(task, nextStep, env, promptState.menuMsgId);
     return;
   }
 }
@@ -4241,25 +4510,30 @@ async function handleCallbackQuery(cb, env) {
       return;
     }
     if (data === 'adm_close') {
+      await clearMatchingPrompt(chatId, userId, env, p => p.type === 'add_admin_id');
       await deleteMessage(chatId, msgId, env);
       await answerCb(cb.id, 'Closed', false, env);
       return;
     }
     if (data === 'adm_add') {
-      await getStore(env).put(promptKey(chatId, userId), JSON.stringify({ type: 'add_admin_id' }), { expirationTtl: 600 });
+      await getStore(env).put(
+        promptKey(chatId, userId),
+        JSON.stringify({ type: 'add_admin_id', menuMsgId: msgId, threadId: threadId || null }),
+        { expirationTtl: 600 }
+      );
       await answerCb(cb.id, 'Send @username or ID', false, env);
-      await sendMessage(
+      await editMessage(
         chatId,
+        msgId,
         `<blockquote><b>Add Admin</b></blockquote>\n\n` +
-          `Send the user's <code>@username</code>, numeric User ID (e.g. <code>123456789</code>), or forward a message from them — or /cancel:`,
+          `Send the user's <code>@username</code>, numeric User ID (e.g. <code>123456789</code>), or forward a message from them:`,
         env,
-        null,
-        null,
-        threadId
+        { inline_keyboard: [[{ text: '⛔ Cancel', callback_data: 'adm_panel:admins', style: 'danger' }]] }
       );
       return;
     }
     if (data.startsWith('adm_panel:')) {
+      await clearMatchingPrompt(chatId, userId, env, p => p.type === 'add_admin_id');
       const tab = data.split(':')[1];
       const panel = await buildOwnerAdminPanel(tab, env);
       await editMessage(chatId, msgId, panel.text, env, panel.kb);
@@ -4298,22 +4572,32 @@ async function handleCallbackQuery(cb, env) {
     }
   }
 
-  if (data === 'st_user_prompt' || data === 'st_active_tasks') {
+  if (data === 'st_user_prompt' || data === 'st_active_tasks' || data === 'st_panel') {
     if (!isOwner(userId, env)) {
       await answerCb(cb.id, 'Owner only.', true, env);
       return;
     }
+    if (data === 'st_panel') {
+      await clearMatchingPrompt(chatId, userId, env, p => p.type === 'status_user');
+      const ov = await buildOwnerStatusOverview(env);
+      await editMessage(chatId, msgId, ov.text, env, ov.kb);
+      await answerCb(cb.id, '', false, env);
+      return;
+    }
     if (data === 'st_user_prompt') {
-      await getStore(env).put(promptKey(chatId, userId), JSON.stringify({ type: 'status_user' }), { expirationTtl: 600 });
+      await getStore(env).put(
+        promptKey(chatId, userId),
+        JSON.stringify({ type: 'status_user', menuMsgId: msgId, threadId: threadId || null }),
+        { expirationTtl: 600 }
+      );
       await answerCb(cb.id, 'Send @username or ID', false, env);
-      await sendMessage(
+      await editMessage(
         chatId,
+        msgId,
         `<blockquote><b>Check User Status</b></blockquote>\n\n` +
-          `Send the user's <code>@username</code>, numeric User ID, or forward a message from them — or /cancel:`,
+          `Send the user's <code>@username</code>, numeric User ID, or forward a message from them:`,
         env,
-        null,
-        null,
-        threadId
+        { inline_keyboard: [[{ text: '⛔ Cancel', callback_data: 'st_panel', style: 'danger' }]] }
       );
       return;
     }
@@ -4539,13 +4823,14 @@ async function handleCallbackQuery(cb, env) {
 
   if (data.startsWith('fb_')) {
     const bRaw = await getStore(env).get(`browser:${userId}`);
-    if (!bRaw && data !== 'fb_close') {
+    if (!bRaw && data !== 'fb_close' && !data.startsWith('fb_back:')) {
       await answerCb(cb.id, 'Session expired. Run /setdldir again.', true, env);
       return;
     }
     const bState = bRaw ? JSON.parse(bRaw) : null;
 
     if (data === 'fb_close') {
+      await clearMatchingPrompt(chatId, userId, env, p => p.type === 'mkdir');
       await deleteMessage(chatId, msgId, env);
       await answerCb(cb.id, 'Closed', false, env);
       return;
@@ -4590,21 +4875,22 @@ async function handleCallbackQuery(cb, env) {
         JSON.stringify({
           type: 'mkdir',
           parentId: bState.currentId,
+          parentName: bState.currentName,
           browserMsgId: msgId,
-          returnTaskId: bState.returnTaskId
+          returnTaskId: bState.returnTaskId,
+          threadId: bState.threadId || threadId || null
         }),
         { expirationTtl: 600 }
       );
       await answerCb(cb.id, 'Send new folder name', false, env);
-      await sendMessage(
-        chatId,
-        `<blockquote><b>New Folder</b>\n\nParent  ·  <code>${escapeHtml(bState.currentName)}</code></blockquote>\n\n` +
-          `Send the folder name now, or /cancel:`,
-        env,
-        null,
-        null,
-        bState.threadId || threadId
-      );
+      const view = buildMkdirPromptView(bState.currentName, bState.returnTaskId);
+      await editMessage(chatId, msgId, view.text, env, view.kb);
+      return;
+    }
+    if (data === 'fb_mkdir_cancel') {
+      await clearMatchingPrompt(chatId, userId, env, p => p.type === 'mkdir');
+      await answerCb(cb.id, 'Cancelled', false, env);
+      await renderFolderBrowserPage(chatId, userId, bState, bState.page || 0, msgId, env);
       return;
     }
     if (data === 'fb_sel') {
@@ -4654,6 +4940,7 @@ async function handleCallbackQuery(cb, env) {
     }
     if (data.startsWith('fb_back:')) {
       const tid = data.split(':')[1];
+      await clearMatchingPrompt(chatId, userId, env, p => p.returnTaskId === tid || p.taskId === tid || p.browserMsgId === msgId);
       const tRaw = await getStore(env).get(`task:${tid}`);
       if (tRaw) {
         const task = JSON.parse(tRaw);
@@ -4664,6 +4951,13 @@ async function handleCallbackQuery(cb, env) {
       await answerCb(cb.id, 'Returned to task', false, env);
       return;
     }
+  }
+
+  if (data === 'gh_login_cancel') {
+    await clearMatchingPrompt(chatId, userId, env, p => p.type === 'gh_pat');
+    await answerCb(cb.id, 'Cancelled', false, env);
+    await editMessage(chatId, msgId, `<blockquote><b>GitHub Authentication Cancelled</b></blockquote>\n\nRun /ghlogin anytime to connect.`, env);
+    return;
   }
 
   if (data === 'gh_login_repo') {
@@ -4695,17 +4989,18 @@ async function handleCallbackQuery(cb, env) {
 
   if (data.startsWith('ghr_')) {
     const raw = await getStore(env).get(`ghbrowser:${userId}`);
-    if (!raw) {
+    if (!raw && data !== 'ghr_close' && !data.startsWith('ghr_back:')) {
       await answerCb(cb.id, 'Repository picker expired. Open Select Repo again.', true, env);
       return;
     }
-    const gState = JSON.parse(raw);
+    const gState = raw ? JSON.parse(raw) : null;
 
     if (data === 'ghr_noop') {
       await answerCb(cb.id, '', false, env);
       return;
     }
     if (data === 'ghr_close') {
+      await clearMatchingPrompt(chatId, userId, env, p => p.type === 'gh_repo_manual');
       await getStore(env).delete(`ghbrowser:${userId}`);
       await deleteMessage(chatId, msgId, env);
       await answerCb(cb.id, 'Closed', false, env);
@@ -4723,19 +5018,20 @@ async function handleCallbackQuery(cb, env) {
         JSON.stringify({
           type: 'gh_repo_manual',
           browserMsgId: msgId,
-          returnTaskId: gState.returnTaskId
+          returnTaskId: gState.returnTaskId,
+          threadId: gState.threadId || threadId || null
         }),
         { expirationTtl: 600 }
       );
       await answerCb(cb.id, 'Send owner/repo', false, env);
-      await sendMessage(
-        chatId,
-        `<blockquote><b>Type Repository</b></blockquote>\n\nSend <code>owner/repo</code> (e.g. <code>Another-yashu-2/releases</code>), or /cancel:`,
-        env,
-        null,
-        null,
-        gState.threadId || threadId
-      );
+      const view = buildGhRepoManualView(gState.returnTaskId);
+      await editMessage(chatId, msgId, view.text, env, view.kb);
+      return;
+    }
+    if (data === 'ghr_manual_cancel') {
+      await clearMatchingPrompt(chatId, userId, env, p => p.type === 'gh_repo_manual');
+      await answerCb(cb.id, 'Cancelled', false, env);
+      await renderGhRepoBrowserPage(chatId, userId, gState, gState.page || 0, msgId, env);
       return;
     }
     if (data.startsWith('ghr_sel:')) {
@@ -4785,6 +5081,7 @@ async function handleCallbackQuery(cb, env) {
     }
     if (data.startsWith('ghr_back:')) {
       const tid = data.split(':')[1];
+      await clearMatchingPrompt(chatId, userId, env, p => p.returnTaskId === tid || p.taskId === tid || p.browserMsgId === msgId);
       const tRaw = await getStore(env).get(`task:${tid}`);
       if (tRaw) {
         const task = JSON.parse(tRaw);
@@ -4920,6 +5217,7 @@ async function handleCallbackQuery(cb, env) {
     task.menuMsgId = msgId;
 
     if (action === 'tm_cancel') {
+      await clearMatchingPrompt(chatId, userId, env, p => p.taskId === tid || p.returnTaskId === tid || p.menuMsgId === msgId);
       await getStore(env).delete(`task:${tid}`);
       if (!task.isChannel) {
         await bumpUserStats(task.userId || userId, { cancelled: 1 }, {}, env);
@@ -4930,8 +5228,29 @@ async function handleCallbackQuery(cb, env) {
     }
 
     if (action === 'tm_back') {
+      await clearMatchingPrompt(chatId, userId, env, p => p.taskId === tid || p.returnTaskId === tid || p.menuMsgId === msgId || p.browserMsgId === msgId);
+      await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
       await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
       await answerCb(cb.id, 'Updated', false, env);
+      return;
+    }
+
+    const promptSpec = TASK_PROMPT_ACTIONS[action];
+    if (promptSpec) {
+      await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+      await getStore(env).put(
+        promptKey(chatId, userId),
+        JSON.stringify({
+          type: promptSpec.type,
+          taskId: tid,
+          menuMsgId: msgId,
+          threadId: task.threadId || threadId || null
+        }),
+        { expirationTtl: 600 }
+      );
+      const view = buildTaskPromptView(promptSpec.type, task);
+      await answerCb(cb.id, promptSpec.toast, false, env);
+      await editMessage(chatId, msgId, view.text, env, view.kb);
       return;
     }
 
@@ -4967,25 +5286,6 @@ async function handleCallbackQuery(cb, env) {
       return;
     }
 
-    if (action === 'tm_ytslang') {
-      await getStore(env).put(
-        promptKey(chatId, userId),
-        JSON.stringify({ type: 'yt_sublang', taskId: tid }),
-        { expirationTtl: 600 }
-      );
-      await answerCb(cb.id, 'Send subtitle language', false, env);
-      await sendMessage(
-        chatId,
-        `<blockquote><b>Subtitle Language</b>\n\nCurrent  ·  <code>${escapeHtml(task.ytSubLang || 'en')}</code></blockquote>\n\n` +
-          `Send language code(s) (e.g. <code>en</code>, <code>en,hi</code>, <code>all</code>), or /cancel:`,
-        env,
-        null,
-        null,
-        task.threadId || threadId
-      );
-      return;
-    }
-
     if (action === 'tm_ytmeta') {
       task.ytMeta = task.ytMeta === false;
       await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
@@ -5007,44 +5307,6 @@ async function handleCallbackQuery(cb, env) {
       await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
       await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
       await answerCb(cb.id, `Playlist: ${task.ytPlaylist === 'all' ? 'All Items' : 'Single Video'}`, false, env);
-      return;
-    }
-
-    if (action === 'tm_ytplitems') {
-      await getStore(env).put(
-        promptKey(chatId, userId),
-        JSON.stringify({ type: 'yt_plitems', taskId: tid }),
-        { expirationTtl: 600 }
-      );
-      await answerCb(cb.id, 'Send playlist range', false, env);
-      await sendMessage(
-        chatId,
-        `<blockquote><b>Playlist Items</b></blockquote>\n\n` +
-          `Send item indices/ranges (e.g. <code>1-5</code> or <code>1,3,7-10</code>), <code>clear</code> for all, or /cancel:`,
-        env,
-        null,
-        null,
-        task.threadId || threadId
-      );
-      return;
-    }
-
-    if (action === 'tm_yttrim') {
-      await getStore(env).put(
-        promptKey(chatId, userId),
-        JSON.stringify({ type: 'yt_trim', taskId: tid }),
-        { expirationTtl: 600 }
-      );
-      await answerCb(cb.id, 'Send trim range', false, env);
-      await sendMessage(
-        chatId,
-        `<blockquote><b>Trim / Clip Section</b></blockquote>\n\n` +
-          `Send start and end timestamps (e.g. <code>00:30-02:15</code> or <code>1:05:00-1:10:00</code>), <code>clear</code> to remove, or /cancel:`,
-        env,
-        null,
-        null,
-        task.threadId || threadId
-      );
       return;
     }
 
@@ -5088,64 +5350,6 @@ async function handleCallbackQuery(cb, env) {
       await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
       await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
       await answerCb(cb.id, `Duplicate: ${conflictLabel(arg)}`, false, env);
-      return;
-    }
-
-    if (action === 'tm_ren') {
-      await getStore(env).put(
-        promptKey(chatId, userId),
-        JSON.stringify({ type: 'rename', taskId: tid }),
-        { expirationTtl: 600 }
-      );
-      await answerCb(cb.id, 'Send new file name', false, env);
-      await sendMessage(
-        chatId,
-        `<blockquote><b>Rename File</b>\n\n<code>${escapeHtml(task.customName || task.detectedName)}</code></blockquote>\n\n` +
-          `Send the new filename (including extension), or /cancel:`,
-        env,
-        null,
-        null,
-        task.threadId || threadId
-      );
-      return;
-    }
-
-    if (action === 'tm_sel') {
-      await getStore(env).put(
-        promptKey(chatId, userId),
-        JSON.stringify({ type: 'select_filter', taskId: tid }),
-        { expirationTtl: 600 }
-      );
-      await answerCb(cb.id, 'Send extension filter', false, env);
-      await sendMessage(
-        chatId,
-        `<blockquote><b>Archive Extension Filter</b></blockquote>\n\n` +
-          `Send comma-separated extensions to keep when extracting (e.g. <code>.mkv, .mp4, .srt</code>) or send <code>all</code>:`,
-        env,
-        null,
-        null,
-        task.threadId || threadId
-      );
-      return;
-    }
-
-    if (action === 'tm_pass') {
-      await getStore(env).put(
-        promptKey(chatId, userId),
-        JSON.stringify({ type: 'archive_password', taskId: tid }),
-        { expirationTtl: 600 }
-      );
-      await answerCb(cb.id, 'Send archive password', false, env);
-      await sendMessage(
-        chatId,
-        `<blockquote><b>Archive Password</b></blockquote>\n\n` +
-          `Send the password to ${task.mode === 'zip' ? 'encrypt the ZIP' : 'extract the archive'}, send <code>clear</code> to remove, or /cancel.\n\n` +
-          `<i>Your password message will be deleted immediately after saving.</i>`,
-        env,
-        null,
-        null,
-        task.threadId || threadId
-      );
       return;
     }
 
@@ -5237,8 +5441,13 @@ async function handleCallbackQuery(cb, env) {
     if (action === 'tm_ghrepo') {
       const profile = await getUserProfile(userId, env);
       if (!hasGithubAuth(profile)) {
-        await answerCb(cb.id, 'Connect GitHub first with /ghlogin', true, env);
-        await sendGhLoginScreen(chatId, userId, env, { threadId: task.threadId || threadId, isGroup: task.chatType !== 'private' });
+        await answerCb(cb.id, 'Connect GitHub first with /ghlogin', false, env);
+        await sendGhLoginScreen(chatId, userId, env, {
+          editMsgId: msgId,
+          returnTaskId: tid,
+          threadId: task.threadId || threadId,
+          isGroup: task.chatType !== 'private'
+        });
         return;
       }
       await answerCb(cb.id, 'Loading GitHub Repositories', false, env);
@@ -5252,13 +5461,17 @@ async function handleCallbackQuery(cb, env) {
         const uname = cb.from.username || cb.from.first_name || 'User';
         const authUrl = await createOAuthUrl(chatId, userId, uname, env);
         await answerCb(cb.id, 'Connect Google Drive first', false, env);
-        await sendMessage(
+        await editMessage(
           chatId,
-          `Connect your Google Drive account to choose a Drive folder.`,
+          msgId,
+          `<blockquote><b>Google Drive Not Connected</b></blockquote>\n\nConnect your Google Drive account to choose a Drive folder:`,
           env,
-          { inline_keyboard: [[{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }]] },
-          null,
-          task.threadId || threadId
+          {
+            inline_keyboard: [
+              [{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }],
+              [{ text: '⛔ Cancel', callback_data: `tm_back:${tid}`, style: 'danger' }]
+            ]
+          }
         );
         return;
       }
@@ -5290,6 +5503,7 @@ async function handleCallbackQuery(cb, env) {
     }
 
     if (action === 'tm_nobtn') {
+      await clearMatchingPrompt(chatId, userId, env, p => p.taskId === tid || p.returnTaskId === tid || p.menuMsgId === msgId);
       const stored = await getUserProfile(userId, env);
       const profile = getEffectiveProfile(userId, stored);
       profile.buttonMode = false;
@@ -5300,11 +5514,17 @@ async function handleCallbackQuery(cb, env) {
     }
 
     if (action === 'tm_start') {
+      await clearMatchingPrompt(chatId, userId, env, p => p.taskId === tid || p.returnTaskId === tid || p.menuMsgId === msgId);
       if (task.dest === 'ghrelease') {
         const ghProfile = await getUserProfile(userId, env);
         if (!hasGithubAuth(ghProfile)) {
-          await answerCb(cb.id, 'Connect GitHub first with /ghlogin', true, env);
-          await sendGhLoginScreen(chatId, userId, env, { threadId: task.threadId || threadId, isGroup: task.chatType !== 'private' });
+          await answerCb(cb.id, 'Connect GitHub first with /ghlogin', false, env);
+          await sendGhLoginScreen(chatId, userId, env, {
+            editMsgId: msgId,
+            returnTaskId: tid,
+            threadId: task.threadId || threadId,
+            isGroup: task.chatType !== 'private'
+          });
           return;
         }
         task.ghUser = ghProfile.ghUser;
@@ -5420,8 +5640,8 @@ async function handleCallbackQuery(cb, env) {
     }
     if (data === 'cfg_ghrepo') {
       if (!hasGithubAuth(stored)) {
-        await answerCb(cb.id, 'Connect GitHub first with /ghlogin', true, env);
-        await sendGhLoginScreen(chatId, userId, env, { threadId });
+        await answerCb(cb.id, 'Connect GitHub first with /ghlogin', false, env);
+        await sendGhLoginScreen(chatId, userId, env, { editMsgId: msgId, backCallback: 'cfg_back', threadId });
         return;
       }
       await answerCb(cb.id, 'Loading GitHub repositories...', false, env);
@@ -5485,6 +5705,7 @@ async function handleCallbackQuery(cb, env) {
       return;
     }
     if (data === 'cfg_back') {
+      await clearMatchingPrompt(chatId, userId, env, p => p.backCallback === 'cfg_back' || p.menuMsgId === msgId);
       await answerCb(cb.id, 'Preferences', false, env);
       await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
       return;
@@ -5547,13 +5768,17 @@ async function handleCallbackQuery(cb, env) {
         const uname = cb.from.username || cb.from.first_name || 'User';
         const authUrl = await createOAuthUrl(chatId, userId, uname, env);
         await answerCb(cb.id, 'Connect Google Drive first', false, env);
-        await sendMessage(
+        await editMessage(
           chatId,
-          `Connect your Google Drive account first to browse Drive folders.`,
+          msgId,
+          `<blockquote><b>Google Drive Not Connected</b></blockquote>\n\nConnect your Google Drive account first to browse Drive folders:`,
           env,
-          { inline_keyboard: [[{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }]] },
-          null,
-          threadId
+          {
+            inline_keyboard: [
+              [{ text: '▸  Connect Google Drive', url: authUrl, style: 'primary' }],
+              [{ text: '↩ Back', callback_data: 'cfg_back', style: 'primary' }]
+            ]
+          }
         );
         return;
       }
@@ -7862,6 +8087,17 @@ async function editMessage(chatId, messageId, text, env, replyMarkup = null) {
   };
   if (replyMarkup) payload.reply_markup = replyMarkup;
   return await postTelegramMessage('editMessageText', payload, env);
+}
+
+async function editOrSendMessage(chatId, editMsgId, text, env, replyMarkup = null, replyToMsgId = null, threadId = null) {
+  if (editMsgId) {
+    const res = await editMessage(chatId, editMsgId, text, env, replyMarkup);
+    if (res?.ok || String(res?.description || '').includes('message is not modified')) {
+      return { msgId: editMsgId, edited: true, res };
+    }
+  }
+  const sent = await sendMessage(chatId, text, env, replyMarkup, replyToMsgId, threadId);
+  return { msgId: sent?.result?.message_id || null, edited: false, res: sent };
 }
 
 async function deleteMessage(chatId, messageId, env) {
