@@ -1045,7 +1045,12 @@ async function sendGhLoginScreen(chatId, userId, env, opts = {}) {
       { text: '🔌 Disconnect GitHub', callback_data: 'gh_login_disconnect', style: 'danger' }
     ]);
   }
-  if (returnTaskId) {
+  if (returnTaskId && backCallback) {
+    kbRows.push([
+      { text: '↩ Back', callback_data: backCallback, style: 'primary' },
+      { text: '⛔ Cancel', callback_data: `tm_back:${returnTaskId}`, style: 'danger' }
+    ]);
+  } else if (returnTaskId) {
     kbRows.push([{ text: '⛔ Cancel', callback_data: `tm_back:${returnTaskId}`, style: 'danger' }]);
   } else if (backCallback) {
     kbRows.push([{ text: '↩ Back', callback_data: backCallback, style: 'primary' }]);
@@ -1552,6 +1557,157 @@ function buildConflictMenu(task) {
     ]
   };
   return { text, kb };
+}
+
+function destDisplayLabel(dest, isSharedGc = false) {
+  if (dest === 'ghrelease') return 'GitHub Release';
+  if (dest === 'telegram') return 'Telegram (Leech)';
+  if (dest === 'gofile') return 'Gofile (Temp)';
+  return isSharedGc ? 'GC Shared Drive (5d)' : 'Google Drive';
+}
+
+function buildDestMenuView({
+  currentDest,
+  hasDrive,
+  canUseSharedGc = false,
+  driveFolderName = 'My Drive',
+  hasGh,
+  ghUser = '',
+  ghRepo = '',
+  onSelectPrefix,
+  backCallback,
+  title = 'Choose Destination'
+}) {
+  const mark = (d, label) => (currentDest === d ? `✓ ${label}` : label);
+  const driveLabel = hasDrive
+    ? '☁️ Google Drive'
+    : canUseSharedGc
+      ? '☁️ GC Drive (5d)'
+      : '☁️ Google Drive (Login)';
+  const ghLabel = hasGh ? '🐙 GitHub Release' : '🐙 GitHub (Login)';
+
+  const driveSummary = hasDrive
+    ? `Folder: <code>${escapeHtml(driveFolderName || 'My Drive')}</code>`
+    : canUseSharedGc
+      ? `Shared 5-day temp: <code>${escapeHtml(driveFolderName || GC_TEMP_FOLDER_NAME)}</code>`
+      : '<i>Connect via /login</i>';
+  const ghSummary = hasGh
+    ? `<code>@${escapeHtml(ghUser || 'connected')}</code> · ${ghRepo ? `<code>${escapeHtml(ghRepo)}</code>` : '<i>no repo selected</i>'}`
+    : '<i>Connect via /ghlogin</i>';
+
+  const curLabel = destDisplayLabel(currentDest, !hasDrive && canUseSharedGc && currentDest === 'gdrive');
+  const text =
+    `<blockquote><b>${escapeHtml(title)}</b></blockquote>\n\n` +
+    `Current  ·  <b>${escapeHtml(curLabel)}</b>\n\n` +
+    `• <b>Google Drive</b> — ${driveSummary}\n` +
+    `• <b>Telegram (Leech)</b> — Direct to chat (auto-split ≥ 2 GB)\n` +
+    `• <b>Gofile (Temp)</b> — Guest link (no login needed)\n` +
+    `• <b>GitHub Release</b> — ${ghSummary}`;
+
+  const kb = {
+    inline_keyboard: [
+      [
+        {
+          text: mark('gdrive', driveLabel),
+          callback_data: `${onSelectPrefix}gdrive`,
+          style: currentDest === 'gdrive' ? 'success' : 'primary'
+        },
+        {
+          text: mark('telegram', '📤 Telegram (Leech)'),
+          callback_data: `${onSelectPrefix}telegram`,
+          style: currentDest === 'telegram' ? 'success' : 'primary'
+        }
+      ],
+      [
+        {
+          text: mark('gofile', '☁️ Gofile (Temp)'),
+          callback_data: `${onSelectPrefix}gofile`,
+          style: currentDest === 'gofile' ? 'success' : 'primary'
+        },
+        {
+          text: mark('ghrelease', ghLabel),
+          callback_data: `${onSelectPrefix}ghrelease`,
+          style: currentDest === 'ghrelease' ? 'success' : 'primary'
+        }
+      ],
+      [{ text: '↩ Back', callback_data: backCallback, style: 'primary' }]
+    ]
+  };
+  return { text, kb };
+}
+
+function buildGdriveConfirmView({
+  folderName,
+  duplicateExists = false,
+  isSharedGcTemp = false,
+  isSettings = false,
+  authUrl = '',
+  confirmCallback,
+  changeCallback,
+  backCallback
+}) {
+  const cleanFolder = escapeHtml(folderName || 'My Drive');
+  const rows = [];
+  let body;
+  if (isSharedGcTemp) {
+    body =
+      `<blockquote><b>Shared Group Drive Selected</b></blockquote>\n\n` +
+      `Selected Folder  ·  📁 <b>${cleanFolder}</b> <i>(5-Day Temp)</i>\n\n` +
+      `Upload to this shared group folder, or connect your personal Google Drive?`;
+    rows.push([{ text: '✅ Use Shared GC Folder', callback_data: confirmCallback, style: 'success' }]);
+    if (authUrl) {
+      rows.push([{ text: '▸ Connect Personal Drive', url: authUrl, style: 'primary' }]);
+    }
+  } else {
+    const promptLine = isSettings
+      ? `Is <b>${cleanFolder}</b> the default folder you want to use?`
+      : `Is <b>${cleanFolder}</b> the folder you want to upload to?`;
+    const dupLine = !isSettings && duplicateExists
+      ? `\n\n⚠ <i>A file with the same name already exists in this folder.</i>`
+      : '';
+    body =
+      `<blockquote><b>Google Drive Destination</b></blockquote>\n\n` +
+      `Selected Folder  ·  📁 <b>${cleanFolder}</b>\n\n` +
+      `${promptLine}${dupLine}`;
+    rows.push([{ text: '✅ Yes, Use This Folder', callback_data: confirmCallback, style: 'success' }]);
+    rows.push([{ text: '📂 Change Folder', callback_data: changeCallback, style: 'primary' }]);
+  }
+  rows.push([{ text: '↩ Back to Destinations', callback_data: backCallback }]);
+  return { text: body, kb: { inline_keyboard: rows } };
+}
+
+function buildGhReleaseConfirmView({
+  ghUser,
+  ghRepo,
+  isSettings = false,
+  confirmCallback,
+  changeCallback,
+  backCallback
+}) {
+  const hasRepo = Boolean(ghRepo);
+  const rows = [];
+  let text;
+  if (hasRepo) {
+    const promptLine = isSettings
+      ? `Is <code>${escapeHtml(ghRepo)}</code> the default repository you want to use?`
+      : `Is <code>${escapeHtml(ghRepo)}</code> the repository you want to publish this release to?`;
+    text =
+      `<blockquote><b>GitHub Release Destination</b></blockquote>\n\n` +
+      `Account  ·  <code>@${escapeHtml(ghUser || 'connected')}</code>\n` +
+      `Selected Repo  ·  📦 <code>${escapeHtml(ghRepo)}</code>\n\n` +
+      promptLine;
+    rows.push([{ text: '✅ Yes, Use This Repo', callback_data: confirmCallback, style: 'success' }]);
+    rows.push([{ text: '📦 Change Repo', callback_data: changeCallback, style: 'primary' }]);
+  } else {
+    text =
+      `<blockquote><b>GitHub Release Destination</b></blockquote>\n\n` +
+      `Account  ·  <code>@${escapeHtml(ghUser || 'connected')}</code>\n` +
+      `Selected Repo  ·  <i>None selected yet</i>\n\n` +
+      `Select a repository below before continuing:`;
+    rows.push([{ text: '📦 Select Repository', callback_data: changeCallback, style: 'success' }]);
+  }
+  rows.push([{ text: '↩ Back to Destinations', callback_data: backCallback }]);
+  return { text, kb: { inline_keyboard: rows } };
 }
 
 // ============================================================================
@@ -4233,10 +4389,29 @@ async function handleUserPromptInput(chatId, userId, text, promptState, msgId, e
         task.hasGithub = true;
         task.ghUser = profile.ghUser;
         if (!task.ghRepo) task.ghRepo = profile.ghRepo || '';
-        if (task.dest === 'ghrelease') task.folderName = task.ghRepo || 'GitHub Release';
+        const pickedFromDest = String(promptState.backCallback || '').startsWith('tm_dest:');
+        if (pickedFromDest || task.dest === 'ghrelease') {
+          task.dest = 'ghrelease';
+          task.isSharedGcTemp = false;
+          task.folderId = '';
+          task.folderName = task.ghRepo || 'GitHub Release';
+          task.share = false;
+          task.duplicateExists = false;
+        }
         await getStore(env).put(`task:${task.taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
         if (!task.ghRepo) {
           await openGhRepoBrowser(chatId, userId, promptState.menuMsgId || task.menuMsgId, task.taskId, env, 0, promptState.threadId || threadId);
+          return;
+        }
+        if (pickedFromDest) {
+          const view = buildGhReleaseConfirmView({
+            ghUser: task.ghUser,
+            ghRepo: task.ghRepo,
+            confirmCallback: `tm_back:${task.taskId}`,
+            changeCallback: `tm_ghrepo:${task.taskId}`,
+            backCallback: `tm_dest:${task.taskId}`
+          });
+          await editOrSendMessage(chatId, promptState.menuMsgId || task.menuMsgId, view.text, env, view.kb, null, promptState.threadId || threadId);
           return;
         }
         await restoreTaskMenuScreen(chatId, task.taskId, promptState.menuMsgId, promptState.threadId || threadId, env);
@@ -5402,33 +5577,75 @@ async function handleCallbackQuery(cb, env) {
     }
 
     if (action === 'tm_dest') {
+      await clearMatchingPrompt(chatId, userId, env, p => p.taskId === tid || p.returnTaskId === tid || p.menuMsgId === msgId || p.browserMsgId === msgId);
+      const profile = await getUserProfile(userId, env);
+      const userHasDrive = hasDriveAuth(profile);
+      const userHasGh = hasGithubAuth(profile);
+      const canUseSharedGc = !!(task.chatType && task.chatType !== 'private' && task.driveFolderId && !userHasDrive);
+      const driveName = userHasDrive
+        ? (task.driveFolderName || profile?.folderName || 'My Drive')
+        : (task.driveFolderName || task.folderName || GC_TEMP_FOLDER_NAME);
+      const view = buildDestMenuView({
+        currentDest: task.dest || 'gdrive',
+        hasDrive: userHasDrive,
+        canUseSharedGc,
+        driveFolderName: driveName,
+        hasGh: userHasGh,
+        ghUser: profile?.ghUser || task.ghUser || '',
+        ghRepo: task.ghRepo || profile?.ghRepo || '',
+        onSelectPrefix: `tm_destset:${tid}:`,
+        backCallback: `tm_back:${tid}`,
+        title: 'Choose Destination'
+      });
+      await editMessage(chatId, msgId, view.text, env, view.kb);
+      await answerCb(cb.id, 'Choose Destination', false, env);
+      return;
+    }
+
+    if (action === 'tm_destset' && ['gdrive', 'gofile', 'telegram', 'ghrelease'].includes(arg)) {
       const profile = await getUserProfile(userId, env);
       const canUseSharedGc = !!(task.chatType && task.chatType !== 'private' && task.driveFolderId && !hasDriveAuth(profile));
       const userHasDrive = hasDriveAuth(profile);
       const userHasGh = hasGithubAuth(profile);
 
-      const destOrder = [];
-      if (userHasDrive || canUseSharedGc) destOrder.push('gdrive');
-      destOrder.push('gofile', 'telegram');
-      if (userHasGh) destOrder.push('ghrelease');
-
-      const curIdx = destOrder.indexOf(task.dest);
-      const nextDest = destOrder[(curIdx + 1) % destOrder.length];
-
-      if (nextDest === 'gdrive') {
+      if (arg === 'gdrive') {
+        if (!userHasDrive && !canUseSharedGc) {
+          const uname = cb.from.username || cb.from.first_name || 'User';
+          const authUrl = await createOAuthUrl(chatId, userId, uname, env);
+          await answerCb(cb.id, 'Connect Google Drive first', false, env);
+          await editMessage(
+            chatId,
+            msgId,
+            `<blockquote><b>Google Drive Not Connected</b></blockquote>\n\nConnect your Google Drive account to upload to Google Drive:`,
+            env,
+            {
+              inline_keyboard: [
+                [{ text: '▸ Connect Google Drive', url: authUrl, style: 'primary' }],
+                [{ text: '↩ Back to Destinations', callback_data: `tm_dest:${tid}`, style: 'primary' }]
+              ]
+            }
+          );
+          return;
+        }
         task.dest = 'gdrive';
+        let authUrl = '';
         if (canUseSharedGc) {
           task.isSharedGcTemp = true;
           task.hasDrive = false;
           task.folderId = task.driveFolderId;
           task.folderName = task.driveFolderName || GC_TEMP_FOLDER_NAME;
           task.share = true;
+          task.duplicateExists = false;
+          const uname = cb.from.username || cb.from.first_name || 'User';
+          authUrl = await createOAuthUrl(chatId, userId, uname, env);
         } else {
           task.hasDrive = true;
           task.isSharedGcTemp = false;
           task.credUserId = String(userId);
           task.folderId = task.driveFolderId || profile?.folderId || 'root';
           task.folderName = task.driveFolderName || profile?.folderName || 'My Drive';
+          task.driveFolderId = task.folderId;
+          task.driveFolderName = task.folderName;
           if (!task.batch) {
             const accessToken = await getValidAccessToken(userId, env);
             if (accessToken) {
@@ -5437,23 +5654,37 @@ async function handleCallbackQuery(cb, env) {
             }
           }
         }
-      } else if (nextDest === 'gofile') {
-        task.dest = 'gofile';
-        task.isSharedGcTemp = false;
+        await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+        const view = buildGdriveConfirmView({
+          folderName: task.folderName,
+          duplicateExists: task.duplicateExists,
+          isSharedGcTemp: task.isSharedGcTemp,
+          authUrl,
+          confirmCallback: `tm_back:${tid}`,
+          changeCallback: `tm_dir:${tid}`,
+          backCallback: `tm_dest:${tid}`
+        });
+        await editMessage(chatId, msgId, view.text, env, view.kb);
+        await answerCb(cb.id, `Destination: ${task.isSharedGcTemp ? 'GC Drive (5d)' : 'Google Drive'}`, false, env);
+        return;
+      }
+
+      if (arg === 'ghrelease') {
+        if (!userHasGh) {
+          await answerCb(cb.id, 'Connect GitHub first', false, env);
+          await sendGhLoginScreen(chatId, userId, env, {
+            editMsgId: msgId,
+            returnTaskId: tid,
+            backCallback: `tm_dest:${tid}`,
+            threadId: task.threadId || threadId,
+            isGroup: task.chatType !== 'private'
+          });
+          return;
+        }
         if (userHasDrive && task.folderId && task.folderId !== '') {
           task.driveFolderId = task.folderId;
           task.driveFolderName = task.folderName || profile?.folderName || 'My Drive';
         }
-        task.folderId = '';
-        task.folderName = 'Gofile (Guest)';
-        task.duplicateExists = false;
-      } else if (nextDest === 'telegram') {
-        task.dest = 'telegram';
-        task.isSharedGcTemp = false;
-        task.folderId = '';
-        task.folderName = 'Telegram (Leech)';
-        task.duplicateExists = false;
-      } else if (nextDest === 'ghrelease') {
         task.dest = 'ghrelease';
         task.isSharedGcTemp = false;
         task.hasGithub = true;
@@ -5463,18 +5694,39 @@ async function handleCallbackQuery(cb, env) {
         task.folderName = task.ghRepo || 'GitHub Release';
         task.share = false;
         task.duplicateExists = false;
+        await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+        const view = buildGhReleaseConfirmView({
+          ghUser: task.ghUser,
+          ghRepo: task.ghRepo,
+          confirmCallback: `tm_back:${tid}`,
+          changeCallback: `tm_ghrepo:${tid}`,
+          backCallback: `tm_dest:${tid}`
+        });
+        await editMessage(chatId, msgId, view.text, env, view.kb);
+        await answerCb(cb.id, 'Destination: GitHub Release', false, env);
+        return;
       }
 
+      if (userHasDrive && task.folderId && task.folderId !== '') {
+        task.driveFolderId = task.folderId;
+        task.driveFolderName = task.folderName || profile?.folderName || 'My Drive';
+      }
+      if (arg === 'gofile') {
+        task.dest = 'gofile';
+        task.isSharedGcTemp = false;
+        task.folderId = '';
+        task.folderName = 'Gofile (Guest)';
+        task.duplicateExists = false;
+      } else if (arg === 'telegram') {
+        task.dest = 'telegram';
+        task.isSharedGcTemp = false;
+        task.folderId = '';
+        task.folderName = 'Telegram (Leech)';
+        task.duplicateExists = false;
+      }
       await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
       await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
-      const destToast = task.dest === 'ghrelease'
-        ? 'GitHub Release'
-        : task.dest === 'telegram'
-          ? 'Telegram (Leech)'
-          : task.dest === 'gofile'
-            ? 'Gofile (Temp)'
-            : (task.isSharedGcTemp ? 'GC Drive (5d)' : 'Google Drive');
-      await answerCb(cb.id, `Destination: ${destToast}`, false, env);
+      await answerCb(cb.id, `Destination: ${arg === 'telegram' ? 'Telegram (Leech)' : 'Gofile (Temp)'}`, false, env);
       return;
     }
 
@@ -5662,21 +5914,86 @@ async function handleCallbackQuery(cb, env) {
     const stored = await getUserProfile(userId, env);
     const profile = getEffectiveProfile(userId, stored);
     if (data === 'cfg_toggle_dest') {
-      const order = [];
-      if (hasDriveAuth(stored)) order.push('gdrive');
-      order.push('gofile', 'telegram');
-      if (hasGithubAuth(stored)) order.push('ghrelease');
-      const curIdx = order.indexOf(profile.defaultDest);
-      profile.defaultDest = order[(curIdx + 1) % order.length];
-      await saveUserProfile(userId, profile, env);
-      const label = profile.defaultDest === 'ghrelease'
-        ? 'GitHub Release'
-        : profile.defaultDest === 'telegram'
-          ? 'Telegram (Leech)'
-          : (profile.defaultDest === 'gofile' ? 'Gofile (Temp)' : 'Google Drive');
-      await answerCb(cb.id, `Default Dest: ${label}`, false, env);
-      await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
+      await clearMatchingPrompt(chatId, userId, env, p => p.backCallback === 'cfg_toggle_dest' || p.menuMsgId === msgId);
+      const userHasDrive = hasDriveAuth(stored);
+      const userHasGh = hasGithubAuth(stored);
+      const view = buildDestMenuView({
+        currentDest: profile.defaultDest || 'gofile',
+        hasDrive: userHasDrive,
+        canUseSharedGc: false,
+        driveFolderName: profile.folderName || 'My Drive',
+        hasGh: userHasGh,
+        ghUser: profile.ghUser || '',
+        ghRepo: profile.ghRepo || '',
+        onSelectPrefix: 'cfg_destset:',
+        backCallback: 'cfg_back',
+        title: 'Choose Default Destination'
+      });
+      await editMessage(chatId, msgId, view.text, env, view.kb);
+      await answerCb(cb.id, 'Default Destination', false, env);
       return;
+    }
+    if (data.startsWith('cfg_destset:')) {
+      const val = data.split(':')[1];
+      if (val === 'gdrive') {
+        if (!hasDriveAuth(stored)) {
+          const uname = cb.from.username || cb.from.first_name || 'User';
+          const authUrl = await createOAuthUrl(chatId, userId, uname, env);
+          await answerCb(cb.id, 'Connect Google Drive first', false, env);
+          await editMessage(
+            chatId,
+            msgId,
+            `<blockquote><b>Google Drive Not Connected</b></blockquote>\n\nConnect your Google Drive account to use Google Drive as your default destination:`,
+            env,
+            {
+              inline_keyboard: [
+                [{ text: '▸ Connect Google Drive', url: authUrl, style: 'primary' }],
+                [{ text: '↩ Back to Destinations', callback_data: 'cfg_toggle_dest', style: 'primary' }]
+              ]
+            }
+          );
+          return;
+        }
+        profile.defaultDest = 'gdrive';
+        await saveUserProfile(userId, profile, env);
+        const view = buildGdriveConfirmView({
+          folderName: profile.folderName || 'My Drive',
+          isSettings: true,
+          confirmCallback: 'cfg_back',
+          changeCallback: 'cfg_dir',
+          backCallback: 'cfg_toggle_dest'
+        });
+        await editMessage(chatId, msgId, view.text, env, view.kb);
+        await answerCb(cb.id, 'Default Dest: Google Drive', false, env);
+        return;
+      }
+      if (val === 'ghrelease') {
+        if (!hasGithubAuth(stored)) {
+          await answerCb(cb.id, 'Connect GitHub first', false, env);
+          await sendGhLoginScreen(chatId, userId, env, { editMsgId: msgId, backCallback: 'cfg_toggle_dest', threadId });
+          return;
+        }
+        profile.defaultDest = 'ghrelease';
+        await saveUserProfile(userId, profile, env);
+        const view = buildGhReleaseConfirmView({
+          ghUser: profile.ghUser,
+          ghRepo: profile.ghRepo,
+          isSettings: true,
+          confirmCallback: 'cfg_back',
+          changeCallback: 'cfg_ghrepo',
+          backCallback: 'cfg_toggle_dest'
+        });
+        await editMessage(chatId, msgId, view.text, env, view.kb);
+        await answerCb(cb.id, 'Default Dest: GitHub Release', false, env);
+        return;
+      }
+      if (val === 'gofile' || val === 'telegram') {
+        profile.defaultDest = val;
+        await saveUserProfile(userId, profile, env);
+        await answerCb(cb.id, `Default Dest: ${val === 'telegram' ? 'Telegram (Leech)' : 'Gofile (Temp)'}`, false, env);
+        await sendSettingsMenu(chatId, userId, profile, msgId, env, threadId);
+        return;
+      }
     }
     if (data === 'cfg_ghrepo') {
       if (!hasGithubAuth(stored)) {
