@@ -1269,10 +1269,6 @@ function buildTaskMenuMessage(task) {
       extras += `\n✓ <b>Playlist:</b> All${task.ytPlaylistItems ? ` (<code>${escapeHtml(task.ytPlaylistItems)}</code>)` : ''}`;
     }
     if (task.ytTrim) extras += `\n✓ <b>Trim:</b> <code>${escapeHtml(task.ytTrim)}</code>`;
-    if (task.ytLive) {
-      const fromStr = task.ytLiveFrom === 'start' ? 'Stream Start' : 'Live Edge (Now)';
-      extras += `\n✓ <b>Live Stream:</b> <code>ON · ${fromStr} · Auto 5h Parts + Merge</code>`;
-    }
   }
   if (task.customName) {
     extras += `\n✓ <b>Rename:</b> <code>${escapeHtml(task.customName)}</code>`;
@@ -1468,10 +1464,6 @@ function buildTaskMenuKeyboard(task) {
     } else if (task.mode === 'zip') {
       rows.push([{ text: passLabel, callback_data: `tm_pass:${tid}` }]);
     }
-    const liveBtnText = task.ytLive
-      ? `🔴 Live: ON (${task.ytLiveFrom === 'start' ? 'Start' : 'Now'} · 5h Parts + Merge)`
-      : '🔴 Live Stream (5h Parts + Merge)';
-    rows.push([{ text: liveBtnText, callback_data: `tm_ytlive:${tid}`, style: task.ytLive ? 'success' : undefined }]);
   } else {
     rows.push([
       { text: extLabel, callback_data: `tm_ext:${tid}` },
@@ -1536,33 +1528,6 @@ function buildYtdlQualityMenu(task) {
       [btn('1080', '1080p'), btn('720', '720p'), btn('480', '480p')],
       [btn('360', '360p'), btn('mp3', 'MP3 Audio'), btn('m4a', 'M4A Audio')],
       [btn('opus', 'Opus Audio'), btn('flac', 'FLAC Audio')],
-      [{ text: '↩ Back', callback_data: `tm_back:${tid}`, style: 'primary' }]
-    ]
-  };
-  return { text, kb };
-}
-
-function buildYtdlLiveMenu(task) {
-  const tid = task.taskId;
-  const isOn = !!task.ytLive;
-  const fromMode = task.ytLiveFrom === 'start' ? 'start' : 'now';
-  const text =
-    `<blockquote><b>Live Stream Capture (Auto 5h Parts + Combine)</b></blockquote>\n\n` +
-    `Status  ·  <b>${isOn ? 'ON' : 'OFF'}</b>\n` +
-    `Start From  ·  <code>${fromMode === 'start' ? 'Stream Start (--live-from-start)' : 'Live Edge (Now)'}</code>\n\n` +
-    `<i>Duration is fetched automatically. Recordings split safely into 5-hour parts (<code>bv*+ba/best</code>) until the stream ends, then merge back into one original file (on Google Drive / Gofile).</i>`;
-  const kb = {
-    inline_keyboard: [
-      [{
-        text: isOn ? '🔴 Live Capture: ON (Tap to Disable)' : '⚪ Live Capture: OFF (Tap to Enable)',
-        callback_data: `tm_ytlive_tog:${tid}`,
-        style: isOn ? 'success' : 'primary'
-      }],
-      [{
-        text: fromMode === 'start' ? '⏪ Start: From Beginning' : '▶️ Start: Live Edge (Now)',
-        callback_data: `tm_ytlive_from:${tid}`,
-        style: 'primary'
-      }],
       [{ text: '↩ Back', callback_data: `tm_back:${tid}`, style: 'primary' }]
     ]
   };
@@ -3924,8 +3889,6 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         ytPlaylist: isPlaylistUrl(ytdlUrl) ? 'all' : 'single',
         ytPlaylistItems: '',
         ytTrim: '',
-        ytLive: false,
-        ytLiveFrom: 'now',
         detectedName: detectedTitle,
         customName: '',
         fileSize: 0,
@@ -4134,9 +4097,6 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       ytPlaylist: 'single',
       ytPlaylistItems: '',
       ytTrim: '',
-      ytLive: false,
-      ytLiveFrom: 'now',
-      ytLiveHours: 24,
       detectedName: `Batch (${items.length} links)`,
       customName: '',
       fileSize: 0,
@@ -5565,32 +5525,6 @@ async function handleCallbackQuery(cb, env) {
       return;
     }
 
-    if (action === 'tm_ytlive') {
-      const { text, kb } = buildYtdlLiveMenu(task);
-      await editMessage(chatId, msgId, text, env, kb);
-      await answerCb(cb.id, 'Live Stream Options', false, env);
-      return;
-    }
-
-    if (action === 'tm_ytlive_tog') {
-      task.ytLive = !task.ytLive;
-      await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
-      const { text, kb } = buildYtdlLiveMenu(task);
-      await editMessage(chatId, msgId, text, env, kb);
-      await answerCb(cb.id, `Live Capture: ${task.ytLive ? 'ON' : 'OFF'}`, false, env);
-      return;
-    }
-
-    if (action === 'tm_ytlive_from') {
-      task.ytLive = true;
-      task.ytLiveFrom = task.ytLiveFrom === 'start' ? 'now' : 'start';
-      await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
-      const { text, kb } = buildYtdlLiveMenu(task);
-      await editMessage(chatId, msgId, text, env, kb);
-      await answerCb(cb.id, `Start: ${task.ytLiveFrom === 'start' ? 'Stream Start' : 'Live Edge (Now)'}`, false, env);
-      return;
-    }
-
     if (action === 'tm_ext') {
       task.mode = task.mode === 'extract' ? 'normal' : 'extract';
       await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
@@ -6410,8 +6344,6 @@ async function launchMirrorTask(task, env) {
     ytPlaylist: task.ytPlaylist || 'single',
     ytPlaylistItems: task.ytPlaylistItems || '',
     ytTrim: task.ytTrim || '',
-    ytLive: !!task.ytLive,
-    ytLiveFrom: task.ytLiveFrom === 'start' ? 'start' : 'now',
     ytLivePart: 1,
     ytLiveParts: [],
     ytLiveCombine: false,
@@ -6809,16 +6741,16 @@ async function handleInternalRunner(request, path, env) {
     const baseTitle = job.customName || job.detectedName || 'Live Stream';
     const statusLabel = mode === 'combine'
       ? `Combining ${allParts.length} Parts..`
-      : `Booting Live Part ${nextPart}..`;
+      : `Booting Part ${nextPart}..`;
     const cardTitle = mode === 'combine'
       ? `${baseTitle} (Merging ${allParts.length} Parts)`
       : `${baseTitle} [Part ${nextPart}]`;
     const partText =
       `<blockquote>📄 <b>Name :</b> <code>${escapeHtml(cardTitle)}</code></blockquote>\n\n` +
       `┌ Status : <a href="${actionsUrl}">${statusLabel}</a>\n` +
-      `├ Mode : <code>#ytdlp #LiveAuto</code>\n` +
+      `├ Mode : <code>#ytdlp #MultiPart</code>\n` +
       `└ ⛔ /cancel_${nextJobId}\n\n` +
-      `<i>${mode === 'combine' ? 'Downloading all 5h parts and combining into final original file…' : 'Continuing next 5h recording part automatically…'}</i>`;
+      `<i>${mode === 'combine' ? 'Downloading all 5h parts and combining into final original file…' : 'Downloading next 5h part automatically…'}</i>`;
 
     const sent = await sendMessage(
       job.chatId,

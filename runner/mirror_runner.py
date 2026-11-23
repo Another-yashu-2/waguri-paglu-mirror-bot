@@ -3135,7 +3135,8 @@ class Mirror:
     def single_name(self):
         return self.custom_name if (self.custom_name and not self.batch) else None
 
-    def _ytdl_live_probe(self, url: str, cookie_path) -> dict:
+    def _ytdl_probe_meta(self, url: str) -> dict:
+        cookie_path = prepare_ytdl_cookiefile()
         try:
             import yt_dlp
             opts = {
@@ -3155,11 +3156,14 @@ class Mirror:
                 "title": str(info.get("title") or "").strip(),
             }
         except Exception:
-            return {"is_live": True, "duration": 0, "title": ""}
+            return {"is_live": False, "duration": 0, "title": ""}
+        finally:
+            if cookie_path:
+                cookie_path.unlink(missing_ok=True)
 
-    def _ytdl_live_download(self, url: str, dest_dir: Path, yt_dir: Path) -> Path:
+    def _ytdl_sliced_download(self, url: str, dest_dir: Path, yt_dir: Path, meta: dict) -> Path:
         global cancelled
-        LIVE_CHUNK_MAX_SEC = 18000  # 5 hours per runner job (leaves ~60m for finalization/upload)
+        SLICE_MAX_SEC = 18000  # 5 hours per runner job
         quality = self.job.get("ytQuality") or "best"
         container = self.job.get("ytContainer") or "mp4"
         is_audio = quality in YT_AUDIO_QUALITIES
@@ -3172,49 +3176,38 @@ class Mirror:
             fmt = ytdl_format_spec(quality, container)
 
         part_num = max(1, int(self.job.get("ytLivePart") or 1))
-        cookie_path = prepare_ytdl_cookiefile()
-        meta = self._ytdl_live_probe(url, cookie_path)
         fetched_dur = int(meta.get("duration") or 0)
-        is_live_now = bool(meta.get("is_live"))
+        slice_start = (part_num - 1) * SLICE_MAX_SEC
+        slice_end = min(fetched_dur, part_num * SLICE_MAX_SEC) if fetched_dur > 0 else (part_num * SLICE_MAX_SEC)
 
-        # Archived / ended >5h stream with known duration: slice exact 5h windows cleanly
-        use_section_slice = (not is_live_now) and (fetched_dur > LIVE_CHUNK_MAX_SEC)
-        slice_start = (part_num - 1) * LIVE_CHUNK_MAX_SEC
-        slice_end = min(fetched_dur, part_num * LIVE_CHUNK_MAX_SEC) if use_section_slice else 0
-        chunk_limit = LIVE_CHUNK_MAX_SEC
+        def _hms(sec: int) -> str:
+            h, rem_s = divmod(max(0, int(sec)), 3600)
+            m, s = divmod(rem_s, 60)
+            return f"{h:02d}:{m:02d}:{s:02d}"
 
+        cookie_path = prepare_ytdl_cookiefile()
         cmd = [
             sys.executable, "-m", "yt_dlp",
             "-f", fmt,
             "--ignore-config", "--no-playlist", "--newline", "--no-colors",
-            "--concurrent-fragments", "8",
+            "--concurrent-fragments", "16",
             "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30",
+            "--download-sections", f"*{_hms(slice_start)}-{_hms(slice_end)}",
+            "--force-keyframes-at-cuts",
             "-o", str(yt_dir / "%(title).120B [%(id)s].%(ext)s"),
         ]
         if is_audio:
             cmd += ["-x", "--audio-format", quality]
         else:
             cmd += ["--merge-output-format", out_ext]
-        def _hms(sec: int) -> str:
-            h, rem_s = divmod(max(0, int(sec)), 3600)
-            m, s = divmod(rem_s, 60)
-            return f"{h:02d}:{m:02d}:{s:02d}"
-
-        if use_section_slice:
-            cmd += [
-                "--download-sections", f"*{_hms(slice_start)}-{_hms(slice_end)}",
-                "--force-keyframes-at-cuts",
-            ]
-        elif self.job.get("ytLiveFrom") == "start":
-            cmd.append("--live-from-start")
         if shutil.which("node"):
             cmd += ["--js-runtimes", "node"]
         if cookie_path:
             cmd += ["--cookies", str(cookie_path)]
         cmd.append(url)
 
-        base_title = self.custom_name or meta.get("title") or self.job.get("detectedName") or "Live Stream"
-        engine_label = f"yt-dlp Live (P{part_num})"
+        base_title = self.custom_name or meta.get("title") or self.job.get("detectedName") or "Media"
+        engine_label = f"yt-dlp Slice (P{part_num})"
         log_tail = []
         proc = subprocess.Popen(
             cmd,
@@ -3239,78 +3232,30 @@ class Mirror:
         reader = threading.Thread(target=drain_output, daemon=True)
         reader.start()
 
-        rec_start = time.time()
         prev_bytes = 0
-        prev_t = rec_start
-        chunk_hit = False
-        elapsed = 0.0
-
-        def stop_pg(sig):
-            try:
-                os.killpg(proc.pid, sig)
-            except ProcessLookupError:
-                pass
-            except Exception:
-                try:
-                    proc.send_signal(sig)
-                except Exception:
-                    pass
-
+        prev_t = time.time()
         try:
             while proc.poll() is None:
                 if cancelled:
-                    stop_pg(signal.SIGINT)
+                    try:
+                        os.killpg(proc.pid, signal.SIGINT)
+                    except Exception:
+                        proc.terminate()
                     try:
                         proc.wait(timeout=10)
                     except Exception:
-                        stop_pg(signal.SIGKILL)
+                        proc.kill()
                     raise InterruptedError("Cancelled by user")
 
                 now = time.time()
-                elapsed = now - rec_start
                 cur_bytes = _ytdir_written_bytes(yt_dir)
                 dt = max(0.001, now - prev_t)
                 spd = max(0.0, (cur_bytes - prev_bytes) / dt)
                 prev_bytes = cur_bytes
                 prev_t = now
-
-                low_disk = shutil.disk_usage("/").free < 4 * 1024**3
-                if (not use_section_slice and elapsed >= chunk_limit) or low_disk:
-                    chunk_hit = True
-                    self.tick(
-                        base_title,
-                        "Finalizing Live Part..",
-                        99.0,
-                        cur_bytes,
-                        cur_bytes,
-                        0,
-                        None,
-                        engine_label,
-                        force=True,
-                    )
-                    stop_pg(signal.SIGINT)
-                    break
-
-                pct = min(99.0, 100.0 * elapsed / max(1, chunk_limit))
-                eta = max(0.0, chunk_limit - elapsed) if not use_section_slice else None
-                status_lbl = (
-                    f"Slice {part_num} ({_hms(slice_start)}-{_hms(slice_end)})"
-                    if use_section_slice
-                    else f"Live Rec P{part_num} ({_hms(int(elapsed))}/{_hms(chunk_limit)})"
-                )
-                self.tick(base_title, status_lbl, pct, cur_bytes, 0, spd, eta, engine_label)
+                status_lbl = f"Part {part_num} ({_hms(slice_start)}-{_hms(slice_end)})"
+                self.tick(base_title, status_lbl, 0.0, cur_bytes, 0, spd, None, engine_label)
                 time.sleep(1.0)
-
-            if proc.poll() is None:
-                try:
-                    proc.wait(timeout=90)
-                except subprocess.TimeoutExpired:
-                    stop_pg(signal.SIGTERM)
-                    try:
-                        proc.wait(timeout=15)
-                    except subprocess.TimeoutExpired:
-                        stop_pg(signal.SIGKILL)
-                        proc.wait(timeout=5)
         finally:
             reader.join(timeout=2)
             if cookie_path:
@@ -3329,33 +3274,13 @@ class Mirror:
             key=lambda p: p.stat().st_size,
             reverse=True,
         )
-
-        if not files:
-            part_files = sorted(
-                [p for p in yt_dir.iterdir() if p.is_file() and p.name.endswith(".part") and p.stat().st_size > 0],
-                key=lambda p: p.stat().st_size,
-                reverse=True,
-            )
-            if part_files:
-                remux_target = yt_dir / f"live_part_{part_num}.{out_ext}"
-                ff_cmd = ["ffmpeg", "-y", "-err_detect", "ignore_err"]
-                for pf in part_files[:2]:
-                    ff_cmd += ["-i", str(pf)]
-                ff_cmd += ["-c", "copy"]
-                if out_ext == "mp4":
-                    ff_cmd += ["-movflags", "+faststart"]
-                ff_cmd.append(str(remux_target))
-                ff_res = subprocess.run(ff_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if ff_res.returncode == 0 and remux_target.exists() and remux_target.stat().st_size > 0:
-                    files = [remux_target]
-
-        if not files:
+        if not files or proc.returncode != 0:
             tail_txt = "\n".join(log_tail[-8:])
-            raise RuntimeError(friendly_ytdl_error(tail_txt) or f"Live stream recording produced no output: {tail_txt[:220]}")
+            raise RuntimeError(friendly_ytdl_error(tail_txt) or f"Sliced download failed (code {proc.returncode}): {tail_txt[:220]}")
 
         out_file = files[0]
-        more_slices = use_section_slice and (slice_end < fetched_dur)
-        needs_part_tag = (part_num > 1) or chunk_hit or more_slices
+        more_slices = fetched_dur > 0 and slice_end < fetched_dur
+        needs_part_tag = (part_num > 1) or more_slices
         custom = self.single_name()
         if custom:
             has_ext = "." in Path(custom).name and len(Path(custom).suffix) <= 10
@@ -3373,7 +3298,7 @@ class Mirror:
             out_file = renamed
 
         if not cancelled:
-            if chunk_hit or more_slices:
+            if more_slices:
                 self._pending_live_chain = {
                     "mode": "record",
                     "next_part": part_num + 1,
@@ -3395,8 +3320,13 @@ class Mirror:
 
         yt_dir = dest_dir / f"yt_{self.idx}"
         yt_dir.mkdir(parents=True, exist_ok=True)
-        if self.job.get("ytLive") and not self.batch:
-            return self._ytdl_live_download(url, dest_dir, yt_dir)
+        part_num = max(1, int(self.job.get("ytLivePart") or 1))
+        pl_mode_pre = self.job.get("ytPlaylist") or "single"
+        trim_pre = (self.job.get("ytTrim") or "").strip()
+        if not self.batch and not trim_pre and pl_mode_pre != "all":
+            meta = self._ytdl_probe_meta(url)
+            if part_num > 1 or (int(meta.get("duration") or 0) > 18000 and not meta.get("is_live")):
+                return self._ytdl_sliced_download(url, dest_dir, yt_dir, meta)
 
         quality = self.job.get("ytQuality") or "best"
         container = self.job.get("ytContainer") or "mp4"
