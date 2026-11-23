@@ -1271,8 +1271,7 @@ function buildTaskMenuMessage(task) {
     if (task.ytTrim) extras += `\n✓ <b>Trim:</b> <code>${escapeHtml(task.ytTrim)}</code>`;
     if (task.ytLive) {
       const fromStr = task.ytLiveFrom === 'start' ? 'Stream Start' : 'Live Edge (Now)';
-      const durStr = Number(task.ytLiveHours) > 0 ? `${task.ytLiveHours}h (5h auto-parts)` : 'Until Ends (5h auto-parts)';
-      extras += `\n✓ <b>Live Stream:</b> <code>ON · ${fromStr} · ${durStr}</code>`;
+      extras += `\n✓ <b>Live Stream:</b> <code>ON · ${fromStr} · Auto 5h Parts + Merge</code>`;
     }
   }
   if (task.customName) {
@@ -1469,10 +1468,9 @@ function buildTaskMenuKeyboard(task) {
     } else if (task.mode === 'zip') {
       rows.push([{ text: passLabel, callback_data: `tm_pass:${tid}` }]);
     }
-    const liveDurLabel = Number(task.ytLiveHours) > 0 ? `${task.ytLiveHours}h` : '∞';
     const liveBtnText = task.ytLive
-      ? `🔴 Live: ON (${task.ytLiveFrom === 'start' ? 'Start' : 'Now'} · ${liveDurLabel})`
-      : '🔴 Live Stream (24h+)';
+      ? `🔴 Live: ON (${task.ytLiveFrom === 'start' ? 'Start' : 'Now'} · 5h Parts + Merge)`
+      : '🔴 Live Stream (5h Parts + Merge)';
     rows.push([{ text: liveBtnText, callback_data: `tm_ytlive:${tid}`, style: task.ytLive ? 'success' : undefined }]);
   } else {
     rows.push([
@@ -1548,19 +1546,11 @@ function buildYtdlLiveMenu(task) {
   const tid = task.taskId;
   const isOn = !!task.ytLive;
   const fromMode = task.ytLiveFrom === 'start' ? 'start' : 'now';
-  const hours = Number.isFinite(Number(task.ytLiveHours)) ? Number(task.ytLiveHours) : 24;
-  const dBtn = (val, label) => ({
-    text: (isOn && hours === val) ? `✓ ${label}` : label,
-    callback_data: `tm_ytlive_dur:${tid}:${val}`,
-    style: (isOn && hours === val) ? 'success' : undefined
-  });
-  const durLabel = hours > 0 ? `${hours}h (auto-split 5h parts)` : 'Until Stream Ends (5h parts)';
   const text =
-    `<blockquote><b>Live Stream Capture (24h+ Supported)</b></blockquote>\n\n` +
+    `<blockquote><b>Live Stream Capture (Auto 5h Parts + Combine)</b></blockquote>\n\n` +
     `Status  ·  <b>${isOn ? 'ON' : 'OFF'}</b>\n` +
-    `Start From  ·  <code>${fromMode === 'start' ? 'Stream Start (--live-from-start)' : 'Live Edge (Now)'}</code>\n` +
-    `Duration  ·  <code>${durLabel}</code>\n\n` +
-    `<i>Uses <code>bv*+ba/best</code> merged to MP4/MKV. Streams longer than 5 hours automatically finalize, upload each 5-hour part, and continue on the next runner seamlessly.</i>`;
+    `Start From  ·  <code>${fromMode === 'start' ? 'Stream Start (--live-from-start)' : 'Live Edge (Now)'}</code>\n\n` +
+    `<i>Duration is fetched automatically. Recordings split safely into 5-hour parts (<code>bv*+ba/best</code>) until the stream ends, then merge back into one original file (on Google Drive / Gofile).</i>`;
   const kb = {
     inline_keyboard: [
       [{
@@ -1573,8 +1563,6 @@ function buildYtdlLiveMenu(task) {
         callback_data: `tm_ytlive_from:${tid}`,
         style: 'primary'
       }],
-      [dBtn(2, '2h'), dBtn(5, '5h'), dBtn(12, '12h'), dBtn(24, '24h')],
-      [dBtn(36, '36h'), dBtn(48, '48h'), dBtn(0, '∞ Until Ends')],
       [{ text: '↩ Back', callback_data: `tm_back:${tid}`, style: 'primary' }]
     ]
   };
@@ -3938,7 +3926,6 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         ytTrim: '',
         ytLive: false,
         ytLiveFrom: 'now',
-        ytLiveHours: 24,
         detectedName: detectedTitle,
         customName: '',
         fileSize: 0,
@@ -5587,7 +5574,6 @@ async function handleCallbackQuery(cb, env) {
 
     if (action === 'tm_ytlive_tog') {
       task.ytLive = !task.ytLive;
-      if (task.ytLive && task.ytLiveHours === undefined) task.ytLiveHours = 24;
       await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
       const { text, kb } = buildYtdlLiveMenu(task);
       await editMessage(chatId, msgId, text, env, kb);
@@ -5602,16 +5588,6 @@ async function handleCallbackQuery(cb, env) {
       const { text, kb } = buildYtdlLiveMenu(task);
       await editMessage(chatId, msgId, text, env, kb);
       await answerCb(cb.id, `Start: ${task.ytLiveFrom === 'start' ? 'Stream Start' : 'Live Edge (Now)'}`, false, env);
-      return;
-    }
-
-    if (action === 'tm_ytlive_dur' && ['0', '2', '5', '12', '24', '36', '48'].includes(arg)) {
-      task.ytLive = true;
-      task.ytLiveHours = parseInt(arg, 10);
-      await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
-      const { text, kb } = buildYtdlLiveMenu(task);
-      await editMessage(chatId, msgId, text, env, kb);
-      await answerCb(cb.id, task.ytLiveHours > 0 ? `Live Duration: ${task.ytLiveHours}h` : 'Live Duration: Until Ends', false, env);
       return;
     }
 
@@ -6436,10 +6412,9 @@ async function launchMirrorTask(task, env) {
     ytTrim: task.ytTrim || '',
     ytLive: !!task.ytLive,
     ytLiveFrom: task.ytLiveFrom === 'start' ? 'start' : 'now',
-    ytLiveHours: Number.isFinite(Number(task.ytLiveHours)) ? Number(task.ytLiveHours) : 24,
     ytLivePart: 1,
-    ytLiveTotalSec: (Number(task.ytLiveHours) || 0) > 0 ? Number(task.ytLiveHours) * 3600 : 0,
-    ytLiveRemainingSec: (Number(task.ytLiveHours) || 0) > 0 ? Number(task.ytLiveHours) * 3600 : 0,
+    ytLiveParts: [],
+    ytLiveCombine: false,
     status: 'booting',
     cancelled: false,
     createdAt: Date.now()
@@ -6823,17 +6798,27 @@ async function handleInternalRunner(request, path, env) {
     if (job.cancelled || job.status === 'cancelled' || job.status === 'failed') {
       return jsonResponse({ ok: false, error: 'Task cancelled or stopped' }, 409);
     }
+    const mode = body.mode === 'combine' ? 'combine' : 'record';
     const nextPart = Math.max(2, parseInt(body.next_part || 2, 10) || 2);
-    const remainingSec = Math.max(0, parseInt(body.remaining_sec || 0, 10) || 0);
+    const prevParts = Array.isArray(job.ytLiveParts) ? job.ytLiveParts : [];
+    const uploadedPart = body.uploaded_part && typeof body.uploaded_part === 'object' ? body.uploaded_part : null;
+    const allParts = uploadedPart ? [...prevParts, uploadedPart] : prevParts;
+
     const nextJobId = crypto.randomUUID().replace(/-/g, '').slice(0, 12);
     const actionsUrl = getActionsUrl(env) || 'https://github.com';
     const baseTitle = job.customName || job.detectedName || 'Live Stream';
+    const statusLabel = mode === 'combine'
+      ? `Combining ${allParts.length} Parts..`
+      : `Booting Live Part ${nextPart}..`;
+    const cardTitle = mode === 'combine'
+      ? `${baseTitle} (Merging ${allParts.length} Parts)`
+      : `${baseTitle} [Part ${nextPart}]`;
     const partText =
-      `<blockquote>📄 <b>Name :</b> <code>${escapeHtml(baseTitle)} [Part ${nextPart}]</code></blockquote>\n\n` +
-      `┌ Status : <a href="${actionsUrl}">Booting Live Part ${nextPart}..</a>\n` +
-      `├ Mode : <code>#ytdlp #Live24h</code>\n` +
+      `<blockquote>📄 <b>Name :</b> <code>${escapeHtml(cardTitle)}</code></blockquote>\n\n` +
+      `┌ Status : <a href="${actionsUrl}">${statusLabel}</a>\n` +
+      `├ Mode : <code>#ytdlp #LiveAuto</code>\n` +
       `└ ⛔ /cancel_${nextJobId}\n\n` +
-      `<i>Continuing automatically from live edge…</i>`;
+      `<i>${mode === 'combine' ? 'Downloading all 5h parts and combining into final original file…' : 'Continuing next 5h recording part automatically…'}</i>`;
 
     const sent = await sendMessage(
       job.chatId,
@@ -6857,8 +6842,9 @@ async function handleInternalRunner(request, path, env) {
       messageId: nextMsgId,
       ytLive: true,
       ytLiveFrom: 'now',
-      ytLivePart: nextPart,
-      ytLiveRemainingSec: remainingSec,
+      ytLivePart: mode === 'combine' ? allParts.length : nextPart,
+      ytLiveParts: allParts,
+      ytLiveCombine: mode === 'combine',
       lastCardHtml: '',
       statsRecorded: false,
       status: 'booting',
@@ -6875,13 +6861,13 @@ async function handleInternalRunner(request, path, env) {
         await editMessage(
           job.chatId,
           nextMsgId,
-          `<blockquote><b>Live Chain Error</b>\n\nCould not dispatch Part ${nextPart}.</blockquote>`,
+          `<blockquote><b>Live Chain Error</b>\n\nCould not dispatch ${mode === 'combine' ? 'combine job' : `Part ${nextPart}`}.</blockquote>`,
           env
         );
       }
-      return jsonResponse({ ok: false, error: 'Could not dispatch next live part' }, 502);
+      return jsonResponse({ ok: false, error: 'Could not dispatch next live job' }, 502);
     }
-    return jsonResponse({ ok: true, next_job_id: nextJobId });
+    return jsonResponse({ ok: true, next_job_id: nextJobId, mode });
   }
 
   return jsonResponse({ ok: false, error: 'Unknown path' }, 404);

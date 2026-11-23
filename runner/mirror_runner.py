@@ -3135,9 +3135,31 @@ class Mirror:
     def single_name(self):
         return self.custom_name if (self.custom_name and not self.batch) else None
 
+    def _ytdl_live_probe(self, url: str, cookie_path) -> dict:
+        try:
+            import yt_dlp
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "ignore_config": True,
+                "socket_timeout": 20,
+            }
+            if cookie_path:
+                opts["cookiefile"] = str(cookie_path)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False) or {}
+            return {
+                "is_live": bool(info.get("is_live")),
+                "duration": int(info.get("duration") or 0),
+                "title": str(info.get("title") or "").strip(),
+            }
+        except Exception:
+            return {"is_live": True, "duration": 0, "title": ""}
+
     def _ytdl_live_download(self, url: str, dest_dir: Path, yt_dir: Path) -> Path:
         global cancelled
-        LIVE_CHUNK_MAX_SEC = 18000  # 5 hours per runner job (safely within 6h Actions limit)
+        LIVE_CHUNK_MAX_SEC = 18000  # 5 hours per runner job (leaves ~60m for finalization/upload)
         quality = self.job.get("ytQuality") or "best"
         container = self.job.get("ytContainer") or "mp4"
         is_audio = quality in YT_AUDIO_QUALITIES
@@ -3150,11 +3172,17 @@ class Mirror:
             fmt = ytdl_format_spec(quality, container)
 
         part_num = max(1, int(self.job.get("ytLivePart") or 1))
-        total_sec = int(self.job.get("ytLiveTotalSec") or 0)
-        rem_sec = int(self.job.get("ytLiveRemainingSec") or 0)
-        chunk_limit = min(LIVE_CHUNK_MAX_SEC, rem_sec) if total_sec > 0 and rem_sec > 0 else LIVE_CHUNK_MAX_SEC
-
         cookie_path = prepare_ytdl_cookiefile()
+        meta = self._ytdl_live_probe(url, cookie_path)
+        fetched_dur = int(meta.get("duration") or 0)
+        is_live_now = bool(meta.get("is_live"))
+
+        # Archived / ended >5h stream with known duration: slice exact 5h windows cleanly
+        use_section_slice = (not is_live_now) and (fetched_dur > LIVE_CHUNK_MAX_SEC)
+        slice_start = (part_num - 1) * LIVE_CHUNK_MAX_SEC
+        slice_end = min(fetched_dur, part_num * LIVE_CHUNK_MAX_SEC) if use_section_slice else 0
+        chunk_limit = LIVE_CHUNK_MAX_SEC
+
         cmd = [
             sys.executable, "-m", "yt_dlp",
             "-f", fmt,
@@ -3167,7 +3195,17 @@ class Mirror:
             cmd += ["-x", "--audio-format", quality]
         else:
             cmd += ["--merge-output-format", out_ext]
-        if self.job.get("ytLiveFrom") == "start":
+        def _hms(sec: int) -> str:
+            h, rem_s = divmod(max(0, int(sec)), 3600)
+            m, s = divmod(rem_s, 60)
+            return f"{h:02d}:{m:02d}:{s:02d}"
+
+        if use_section_slice:
+            cmd += [
+                "--download-sections", f"*{_hms(slice_start)}-{_hms(slice_end)}",
+                "--force-keyframes-at-cuts",
+            ]
+        elif self.job.get("ytLiveFrom") == "start":
             cmd.append("--live-from-start")
         if shutil.which("node"):
             cmd += ["--js-runtimes", "node"]
@@ -3175,7 +3213,7 @@ class Mirror:
             cmd += ["--cookies", str(cookie_path)]
         cmd.append(url)
 
-        base_title = self.job.get("detectedName") or "Live Stream"
+        base_title = self.custom_name or meta.get("title") or self.job.get("detectedName") or "Live Stream"
         engine_label = f"yt-dlp Live (P{part_num})"
         log_tail = []
         proc = subprocess.Popen(
@@ -3237,7 +3275,7 @@ class Mirror:
                 prev_t = now
 
                 low_disk = shutil.disk_usage("/").free < 4 * 1024**3
-                if elapsed >= chunk_limit or low_disk:
+                if (not use_section_slice and elapsed >= chunk_limit) or low_disk:
                     chunk_hit = True
                     self.tick(
                         base_title,
@@ -3254,8 +3292,12 @@ class Mirror:
                     break
 
                 pct = min(99.0, 100.0 * elapsed / max(1, chunk_limit))
-                eta = max(0.0, chunk_limit - elapsed)
-                status_lbl = f"Live Rec ({fmt_dur(int(elapsed))}/{fmt_dur(int(chunk_limit))})"
+                eta = max(0.0, chunk_limit - elapsed) if not use_section_slice else None
+                status_lbl = (
+                    f"Slice {part_num} ({_hms(slice_start)}-{_hms(slice_end)})"
+                    if use_section_slice
+                    else f"Live Rec P{part_num} ({_hms(int(elapsed))}/{_hms(chunk_limit)})"
+                )
                 self.tick(base_title, status_lbl, pct, cur_bytes, 0, spd, eta, engine_label)
                 time.sleep(1.0)
 
@@ -3312,14 +3354,15 @@ class Mirror:
             raise RuntimeError(friendly_ytdl_error(tail_txt) or f"Live stream recording produced no output: {tail_txt[:220]}")
 
         out_file = files[0]
+        more_slices = use_section_slice and (slice_end < fetched_dur)
+        needs_part_tag = (part_num > 1) or chunk_hit or more_slices
         custom = self.single_name()
-        multi_part = (total_sec == 0 or total_sec > LIVE_CHUNK_MAX_SEC)
         if custom:
             has_ext = "." in Path(custom).name and len(Path(custom).suffix) <= 10
             stem_name = Path(custom).stem if has_ext else custom
             ext_str = Path(custom).suffix if has_ext else out_file.suffix
-            new_name = f"{stem_name} [Part {part_num}]{ext_str}" if multi_part else f"{stem_name}{ext_str}"
-        elif multi_part and f"[Part {part_num}]" not in out_file.stem:
+            new_name = f"{stem_name} [Part {part_num}]{ext_str}" if needs_part_tag else f"{stem_name}{ext_str}"
+        elif needs_part_tag and f"[Part {part_num}]" not in out_file.stem:
             new_name = f"{out_file.stem} [Part {part_num}]{out_file.suffix}"
         else:
             new_name = out_file.name
@@ -3329,12 +3372,17 @@ class Mirror:
             out_file.rename(renamed)
             out_file = renamed
 
-        rem_after = max(0, rem_sec - int(elapsed)) if total_sec > 0 else 0
-        if chunk_hit and not cancelled and (total_sec == 0 or rem_after > 60):
-            self._pending_live_chain = {
-                "next_part": part_num + 1,
-                "remaining_sec": rem_after,
-            }
+        if not cancelled:
+            if chunk_hit or more_slices:
+                self._pending_live_chain = {
+                    "mode": "record",
+                    "next_part": part_num + 1,
+                }
+            elif part_num >= 2 and self.dest in ("gdrive", "gofile"):
+                self._pending_live_chain = {
+                    "mode": "combine",
+                    "next_part": part_num,
+                }
         return out_file
 
     def ytdl_download(self, url: str, dest_dir: Path):
@@ -4162,7 +4210,7 @@ class Mirror:
             try:
                 sec = int(float(rst)) - int(time.time())
                 if sec > 0:
-                    parts.append(f"resets in {fmt_dur(sec)}")
+                    parts.append(f"resets in {fmt_duration(sec)}")
             except Exception:
                 pass
         return f" ({', '.join(parts)})" if parts else ""
@@ -5645,6 +5693,100 @@ class Mirror:
             results.insert(0, up)
         return results
 
+    def run_live_combine(self) -> list:
+        parts = self.job.get("ytLiveParts") or []
+        if not parts:
+            raise RuntimeError("No recorded live parts provided for combining.")
+        total_sz = sum(int(p.get("size") or 0) for p in parts)
+        free_disk = shutil.disk_usage("/").free
+        if total_sz > 0 and free_disk < int(total_sz * 2.05) + 2 * 1024**3:
+            send_message(
+                self.chat_id,
+                f"<blockquote><b>Combine Skipped (Runner Disk Limit)</b>\n\n"
+                f"Total size (<code>{fmt_bytes(total_sz)}</code>) exceeds runner workspace capacity (<code>{fmt_bytes(free_disk)}</code> free).\n"
+                f"All <code>{len(parts)}</code> 5-hour parts remain safely saved individually.</blockquote>",
+                thread_id=self.thread_id,
+            )
+            return [
+                {
+                    "name": p.get("name", f"Part {i}"),
+                    "link": p.get("link", ""),
+                    "id": p.get("id", ""),
+                    "size": int(p.get("size") or 0),
+                    "status": "completed",
+                    "isDir": False,
+                    "shared": bool(self.share),
+                    "direct": "",
+                }
+                for i, p in enumerate(parts, 1)
+            ]
+
+        comb_dir = DL_DIR / "live_combine"
+        comb_dir.mkdir(parents=True, exist_ok=True)
+        local_parts = []
+        for idx_p, part in enumerate(parts, 1):
+            p_name = part.get("name") or f"part_{idx_p}.mp4"
+            p_ext = Path(p_name).suffix or ".mp4"
+            dl_name = f"part_{idx_p:03d}{p_ext}"
+            if self.dest == "gdrive" and part.get("id"):
+                meta = self.gdrive_meta({"id": part["id"]})
+                lp = self.gdrive_download_file({"id": part["id"]}, meta, comb_dir, dl_name)
+                local_parts.append(lp)
+            elif self.dest == "gofile" and part.get("link"):
+                sub = comb_dir / f"gf_{idx_p}"
+                res_p = self.gofile_download_item({"type": "gofile", "url": part["link"]}, sub)
+                if res_p.is_dir():
+                    cands = sorted(f for f in res_p.rglob("*") if f.is_file())
+                    if cands:
+                        local_parts.append(cands[0])
+                elif res_p.is_file():
+                    local_parts.append(res_p)
+            else:
+                raise RuntimeError(f"Unsupported combine source for part {idx_p}")
+
+        if not local_parts:
+            raise RuntimeError("Could not download any parts to combine.")
+
+        raw_first = parts[0].get("name") or self.job.get("detectedName") or "Combined_Stream.mp4"
+        clean_base = re.sub(r"\s*\[Part\s+\d+\]", "", Path(raw_first).stem, flags=re.I).strip() or "Combined_Stream"
+        out_ext = local_parts[0].suffix or ".mp4"
+        custom = self.single_name()
+        if custom:
+            has_ext = "." in Path(custom).name and len(Path(custom).suffix) <= 10
+            final_name = custom if has_ext else f"{custom}{out_ext}"
+        else:
+            final_name = f"{clean_base}{out_ext}"
+        final_name = re.sub(r'[/\\?%*:|"<>]', "_", final_name).strip() or f"Combined_{JOB_ID}{out_ext}"
+        out_path = OUT_DIR / final_name
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+        list_file = comb_dir / "concat.txt"
+        lines = []
+        for lp in local_parts:
+            escaped = str(lp).replace("'", "'\\''")
+            lines.append(f"file '{escaped}'")
+        list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        self.tick(final_name, f"Merging {len(local_parts)} Parts..", 50.0, 0, total_sz, 0, None, "FFmpeg Concat", force=True)
+        ff_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", "-fflags", "+genpts"]
+        if out_ext.lower() == ".mp4":
+            ff_cmd += ["-movflags", "+faststart"]
+        ff_cmd.append(str(out_path))
+        ff_res = subprocess.run(ff_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if ff_res.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+            raise RuntimeError(f"FFmpeg concat failed: {(ff_res.stderr or '')[-250:]}")
+
+        shutil.rmtree(comb_dir, ignore_errors=True)
+        up = self.upload(out_path)
+        if self.dest == "gdrive":
+            for part in parts:
+                if part.get("id"):
+                    try:
+                        self.drive("PATCH", f"files/{part['id']}", {"fields": "id"}, body={"trashed": True})
+                    except Exception:
+                        pass
+        return up if isinstance(up, list) else [up]
+
     def run(self) -> list:
         DL_DIR.mkdir(parents=True, exist_ok=True)
         OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -5659,6 +5801,9 @@ class Mirror:
         if self.access_token:
             self.start_token_server()
             self.write_rclone_conf()
+
+        if self.job.get("ytLiveCombine"):
+            return self.run_live_combine()
 
         need_bg_kg = (self.dest == "telegram") or any(
             it.get("type") in ("ytdl", "tg_media") or is_media_site_url(it.get("url") or "")
@@ -5966,9 +6111,23 @@ def main():
         m.report(results)
         pending_chain = getattr(m, "_pending_live_chain", None)
         if pending_chain and not cancelled:
-            ch = worker_call("/internal/chain_live", {"job_id": JOB_ID, **pending_chain})
+            uploaded_part = None
+            if isinstance(results, list):
+                for r in results:
+                    if isinstance(r, dict) and r.get("status") == "completed":
+                        uploaded_part = {
+                            "id": r.get("id", ""),
+                            "name": r.get("name", ""),
+                            "link": r.get("link", ""),
+                            "size": int(r.get("size") or 0),
+                        }
+                        break
+            payload = {"job_id": JOB_ID, **pending_chain}
+            if uploaded_part:
+                payload["uploaded_part"] = uploaded_part
+            ch = worker_call("/internal/chain_live", payload)
             if not ch.get("ok"):
-                print(f"[Live Chain Notice] Could not queue next part: {ch.get('error')}", file=sys.stderr, flush=True)
+                print(f"[Live Chain Notice] Could not queue next stage: {ch.get('error')}", file=sys.stderr, flush=True)
     except InterruptedError:
         m.stop_ticks()
         text = (
