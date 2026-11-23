@@ -3135,6 +3135,208 @@ class Mirror:
     def single_name(self):
         return self.custom_name if (self.custom_name and not self.batch) else None
 
+    def _ytdl_live_download(self, url: str, dest_dir: Path, yt_dir: Path) -> Path:
+        global cancelled
+        LIVE_CHUNK_MAX_SEC = 18000  # 5 hours per runner job (safely within 6h Actions limit)
+        quality = self.job.get("ytQuality") or "best"
+        container = self.job.get("ytContainer") or "mp4"
+        is_audio = quality in YT_AUDIO_QUALITIES
+        out_ext = quality if is_audio else (container if container in ("mp4", "mkv") else "mp4")
+        if is_audio:
+            fmt = "bestaudio/best"
+        elif quality == "best":
+            fmt = "bv*+ba/best"
+        else:
+            fmt = ytdl_format_spec(quality, container)
+
+        part_num = max(1, int(self.job.get("ytLivePart") or 1))
+        total_sec = int(self.job.get("ytLiveTotalSec") or 0)
+        rem_sec = int(self.job.get("ytLiveRemainingSec") or 0)
+        chunk_limit = min(LIVE_CHUNK_MAX_SEC, rem_sec) if total_sec > 0 and rem_sec > 0 else LIVE_CHUNK_MAX_SEC
+
+        cookie_path = prepare_ytdl_cookiefile()
+        cmd = [
+            sys.executable, "-m", "yt_dlp",
+            "-f", fmt,
+            "--ignore-config", "--no-playlist", "--newline", "--no-colors",
+            "--concurrent-fragments", "8",
+            "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30",
+            "-o", str(yt_dir / "%(title).120B [%(id)s].%(ext)s"),
+        ]
+        if is_audio:
+            cmd += ["-x", "--audio-format", quality]
+        else:
+            cmd += ["--merge-output-format", out_ext]
+        if self.job.get("ytLiveFrom") == "start":
+            cmd.append("--live-from-start")
+        if shutil.which("node"):
+            cmd += ["--js-runtimes", "node"]
+        if cookie_path:
+            cmd += ["--cookies", str(cookie_path)]
+        cmd.append(url)
+
+        base_title = self.job.get("detectedName") or "Live Stream"
+        engine_label = f"yt-dlp Live (P{part_num})"
+        log_tail = []
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            start_new_session=True,
+        )
+
+        def drain_output():
+            if not proc.stdout:
+                return
+            for raw_line in proc.stdout:
+                ln = raw_line.strip()
+                if not ln:
+                    continue
+                log_tail.append(ln)
+                if len(log_tail) > 30:
+                    del log_tail[0]
+
+        reader = threading.Thread(target=drain_output, daemon=True)
+        reader.start()
+
+        rec_start = time.time()
+        prev_bytes = 0
+        prev_t = rec_start
+        chunk_hit = False
+        elapsed = 0.0
+
+        def stop_pg(sig):
+            try:
+                os.killpg(proc.pid, sig)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                try:
+                    proc.send_signal(sig)
+                except Exception:
+                    pass
+
+        try:
+            while proc.poll() is None:
+                if cancelled:
+                    stop_pg(signal.SIGINT)
+                    try:
+                        proc.wait(timeout=10)
+                    except Exception:
+                        stop_pg(signal.SIGKILL)
+                    raise InterruptedError("Cancelled by user")
+
+                now = time.time()
+                elapsed = now - rec_start
+                cur_bytes = _ytdir_written_bytes(yt_dir)
+                dt = max(0.001, now - prev_t)
+                spd = max(0.0, (cur_bytes - prev_bytes) / dt)
+                prev_bytes = cur_bytes
+                prev_t = now
+
+                low_disk = shutil.disk_usage("/").free < 4 * 1024**3
+                if elapsed >= chunk_limit or low_disk:
+                    chunk_hit = True
+                    self.tick(
+                        base_title,
+                        "Finalizing Live Part..",
+                        99.0,
+                        cur_bytes,
+                        cur_bytes,
+                        0,
+                        None,
+                        engine_label,
+                        force=True,
+                    )
+                    stop_pg(signal.SIGINT)
+                    break
+
+                pct = min(99.0, 100.0 * elapsed / max(1, chunk_limit))
+                eta = max(0.0, chunk_limit - elapsed)
+                status_lbl = f"Live Rec ({fmt_dur(int(elapsed))}/{fmt_dur(int(chunk_limit))})"
+                self.tick(base_title, status_lbl, pct, cur_bytes, 0, spd, eta, engine_label)
+                time.sleep(1.0)
+
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=90)
+                except subprocess.TimeoutExpired:
+                    stop_pg(signal.SIGTERM)
+                    try:
+                        proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        stop_pg(signal.SIGKILL)
+                        proc.wait(timeout=5)
+        finally:
+            reader.join(timeout=2)
+            if cookie_path:
+                cookie_path.unlink(missing_ok=True)
+
+        if cancelled:
+            raise InterruptedError("Cancelled by user")
+
+        files = sorted(
+            [
+                p for p in yt_dir.iterdir()
+                if p.is_file()
+                and not p.name.endswith((".part", ".ytdl", ".temp"))
+                and p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp")
+            ],
+            key=lambda p: p.stat().st_size,
+            reverse=True,
+        )
+
+        if not files:
+            part_files = sorted(
+                [p for p in yt_dir.iterdir() if p.is_file() and p.name.endswith(".part") and p.stat().st_size > 0],
+                key=lambda p: p.stat().st_size,
+                reverse=True,
+            )
+            if part_files:
+                remux_target = yt_dir / f"live_part_{part_num}.{out_ext}"
+                ff_cmd = ["ffmpeg", "-y", "-err_detect", "ignore_err"]
+                for pf in part_files[:2]:
+                    ff_cmd += ["-i", str(pf)]
+                ff_cmd += ["-c", "copy"]
+                if out_ext == "mp4":
+                    ff_cmd += ["-movflags", "+faststart"]
+                ff_cmd.append(str(remux_target))
+                ff_res = subprocess.run(ff_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if ff_res.returncode == 0 and remux_target.exists() and remux_target.stat().st_size > 0:
+                    files = [remux_target]
+
+        if not files:
+            tail_txt = "\n".join(log_tail[-8:])
+            raise RuntimeError(friendly_ytdl_error(tail_txt) or f"Live stream recording produced no output: {tail_txt[:220]}")
+
+        out_file = files[0]
+        custom = self.single_name()
+        multi_part = (total_sec == 0 or total_sec > LIVE_CHUNK_MAX_SEC)
+        if custom:
+            has_ext = "." in Path(custom).name and len(Path(custom).suffix) <= 10
+            stem_name = Path(custom).stem if has_ext else custom
+            ext_str = Path(custom).suffix if has_ext else out_file.suffix
+            new_name = f"{stem_name} [Part {part_num}]{ext_str}" if multi_part else f"{stem_name}{ext_str}"
+        elif multi_part and f"[Part {part_num}]" not in out_file.stem:
+            new_name = f"{out_file.stem} [Part {part_num}]{out_file.suffix}"
+        else:
+            new_name = out_file.name
+
+        if new_name != out_file.name:
+            renamed = out_file.with_name(new_name)
+            out_file.rename(renamed)
+            out_file = renamed
+
+        rem_after = max(0, rem_sec - int(elapsed)) if total_sec > 0 else 0
+        if chunk_hit and not cancelled and (total_sec == 0 or rem_after > 60):
+            self._pending_live_chain = {
+                "next_part": part_num + 1,
+                "remaining_sec": rem_after,
+            }
+        return out_file
+
     def ytdl_download(self, url: str, dest_dir: Path):
         global cancelled
         self.tick(self.job.get("detectedName") or "Media", "Setting up yt-dlp..", 0.0, 0, 0, 0, None, "yt-dlp + FFmpeg", force=True)
@@ -3145,6 +3347,8 @@ class Mirror:
 
         yt_dir = dest_dir / f"yt_{self.idx}"
         yt_dir.mkdir(parents=True, exist_ok=True)
+        if self.job.get("ytLive") and not self.batch:
+            return self._ytdl_live_download(url, dest_dir, yt_dir)
 
         quality = self.job.get("ytQuality") or "best"
         container = self.job.get("ytContainer") or "mp4"
@@ -5760,6 +5964,11 @@ def main():
         results = m.run()
         m.stop_ticks()
         m.report(results)
+        pending_chain = getattr(m, "_pending_live_chain", None)
+        if pending_chain and not cancelled:
+            ch = worker_call("/internal/chain_live", {"job_id": JOB_ID, **pending_chain})
+            if not ch.get("ok"):
+                print(f"[Live Chain Notice] Could not queue next part: {ch.get('error')}", file=sys.stderr, flush=True)
     except InterruptedError:
         m.stop_ticks()
         text = (

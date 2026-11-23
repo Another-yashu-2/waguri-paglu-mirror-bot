@@ -1269,6 +1269,11 @@ function buildTaskMenuMessage(task) {
       extras += `\n✓ <b>Playlist:</b> All${task.ytPlaylistItems ? ` (<code>${escapeHtml(task.ytPlaylistItems)}</code>)` : ''}`;
     }
     if (task.ytTrim) extras += `\n✓ <b>Trim:</b> <code>${escapeHtml(task.ytTrim)}</code>`;
+    if (task.ytLive) {
+      const fromStr = task.ytLiveFrom === 'start' ? 'Stream Start' : 'Live Edge (Now)';
+      const durStr = Number(task.ytLiveHours) > 0 ? `${task.ytLiveHours}h (5h auto-parts)` : 'Until Ends (5h auto-parts)';
+      extras += `\n✓ <b>Live Stream:</b> <code>ON · ${fromStr} · ${durStr}</code>`;
+    }
   }
   if (task.customName) {
     extras += `\n✓ <b>Rename:</b> <code>${escapeHtml(task.customName)}</code>`;
@@ -1464,6 +1469,11 @@ function buildTaskMenuKeyboard(task) {
     } else if (task.mode === 'zip') {
       rows.push([{ text: passLabel, callback_data: `tm_pass:${tid}` }]);
     }
+    const liveDurLabel = Number(task.ytLiveHours) > 0 ? `${task.ytLiveHours}h` : '∞';
+    const liveBtnText = task.ytLive
+      ? `🔴 Live: ON (${task.ytLiveFrom === 'start' ? 'Start' : 'Now'} · ${liveDurLabel})`
+      : '🔴 Live Stream (24h+)';
+    rows.push([{ text: liveBtnText, callback_data: `tm_ytlive:${tid}`, style: task.ytLive ? 'success' : undefined }]);
   } else {
     rows.push([
       { text: extLabel, callback_data: `tm_ext:${tid}` },
@@ -1528,6 +1538,43 @@ function buildYtdlQualityMenu(task) {
       [btn('1080', '1080p'), btn('720', '720p'), btn('480', '480p')],
       [btn('360', '360p'), btn('mp3', 'MP3 Audio'), btn('m4a', 'M4A Audio')],
       [btn('opus', 'Opus Audio'), btn('flac', 'FLAC Audio')],
+      [{ text: '↩ Back', callback_data: `tm_back:${tid}`, style: 'primary' }]
+    ]
+  };
+  return { text, kb };
+}
+
+function buildYtdlLiveMenu(task) {
+  const tid = task.taskId;
+  const isOn = !!task.ytLive;
+  const fromMode = task.ytLiveFrom === 'start' ? 'start' : 'now';
+  const hours = Number.isFinite(Number(task.ytLiveHours)) ? Number(task.ytLiveHours) : 24;
+  const dBtn = (val, label) => ({
+    text: (isOn && hours === val) ? `✓ ${label}` : label,
+    callback_data: `tm_ytlive_dur:${tid}:${val}`,
+    style: (isOn && hours === val) ? 'success' : undefined
+  });
+  const durLabel = hours > 0 ? `${hours}h (auto-split 5h parts)` : 'Until Stream Ends (5h parts)';
+  const text =
+    `<blockquote><b>Live Stream Capture (24h+ Supported)</b></blockquote>\n\n` +
+    `Status  ·  <b>${isOn ? 'ON' : 'OFF'}</b>\n` +
+    `Start From  ·  <code>${fromMode === 'start' ? 'Stream Start (--live-from-start)' : 'Live Edge (Now)'}</code>\n` +
+    `Duration  ·  <code>${durLabel}</code>\n\n` +
+    `<i>Uses <code>bv*+ba/best</code> merged to MP4/MKV. Streams longer than 5 hours automatically finalize, upload each 5-hour part, and continue on the next runner seamlessly.</i>`;
+  const kb = {
+    inline_keyboard: [
+      [{
+        text: isOn ? '🔴 Live Capture: ON (Tap to Disable)' : '⚪ Live Capture: OFF (Tap to Enable)',
+        callback_data: `tm_ytlive_tog:${tid}`,
+        style: isOn ? 'success' : 'primary'
+      }],
+      [{
+        text: fromMode === 'start' ? '⏪ Start: From Beginning' : '▶️ Start: Live Edge (Now)',
+        callback_data: `tm_ytlive_from:${tid}`,
+        style: 'primary'
+      }],
+      [dBtn(2, '2h'), dBtn(5, '5h'), dBtn(12, '12h'), dBtn(24, '24h')],
+      [dBtn(36, '36h'), dBtn(48, '48h'), dBtn(0, '∞ Until Ends')],
       [{ text: '↩ Back', callback_data: `tm_back:${tid}`, style: 'primary' }]
     ]
   };
@@ -3889,6 +3936,9 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         ytPlaylist: isPlaylistUrl(ytdlUrl) ? 'all' : 'single',
         ytPlaylistItems: '',
         ytTrim: '',
+        ytLive: false,
+        ytLiveFrom: 'now',
+        ytLiveHours: 24,
         detectedName: detectedTitle,
         customName: '',
         fileSize: 0,
@@ -4097,6 +4147,9 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       ytPlaylist: 'single',
       ytPlaylistItems: '',
       ytTrim: '',
+      ytLive: false,
+      ytLiveFrom: 'now',
+      ytLiveHours: 24,
       detectedName: `Batch (${items.length} links)`,
       customName: '',
       fileSize: 0,
@@ -5525,6 +5578,43 @@ async function handleCallbackQuery(cb, env) {
       return;
     }
 
+    if (action === 'tm_ytlive') {
+      const { text, kb } = buildYtdlLiveMenu(task);
+      await editMessage(chatId, msgId, text, env, kb);
+      await answerCb(cb.id, 'Live Stream Options', false, env);
+      return;
+    }
+
+    if (action === 'tm_ytlive_tog') {
+      task.ytLive = !task.ytLive;
+      if (task.ytLive && task.ytLiveHours === undefined) task.ytLiveHours = 24;
+      await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+      const { text, kb } = buildYtdlLiveMenu(task);
+      await editMessage(chatId, msgId, text, env, kb);
+      await answerCb(cb.id, `Live Capture: ${task.ytLive ? 'ON' : 'OFF'}`, false, env);
+      return;
+    }
+
+    if (action === 'tm_ytlive_from') {
+      task.ytLive = true;
+      task.ytLiveFrom = task.ytLiveFrom === 'start' ? 'now' : 'start';
+      await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+      const { text, kb } = buildYtdlLiveMenu(task);
+      await editMessage(chatId, msgId, text, env, kb);
+      await answerCb(cb.id, `Start: ${task.ytLiveFrom === 'start' ? 'Stream Start' : 'Live Edge (Now)'}`, false, env);
+      return;
+    }
+
+    if (action === 'tm_ytlive_dur' && ['0', '2', '5', '12', '24', '36', '48'].includes(arg)) {
+      task.ytLive = true;
+      task.ytLiveHours = parseInt(arg, 10);
+      await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+      const { text, kb } = buildYtdlLiveMenu(task);
+      await editMessage(chatId, msgId, text, env, kb);
+      await answerCb(cb.id, task.ytLiveHours > 0 ? `Live Duration: ${task.ytLiveHours}h` : 'Live Duration: Until Ends', false, env);
+      return;
+    }
+
     if (action === 'tm_ext') {
       task.mode = task.mode === 'extract' ? 'normal' : 'extract';
       await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
@@ -6344,6 +6434,12 @@ async function launchMirrorTask(task, env) {
     ytPlaylist: task.ytPlaylist || 'single',
     ytPlaylistItems: task.ytPlaylistItems || '',
     ytTrim: task.ytTrim || '',
+    ytLive: !!task.ytLive,
+    ytLiveFrom: task.ytLiveFrom === 'start' ? 'start' : 'now',
+    ytLiveHours: Number.isFinite(Number(task.ytLiveHours)) ? Number(task.ytLiveHours) : 24,
+    ytLivePart: 1,
+    ytLiveTotalSec: (Number(task.ytLiveHours) || 0) > 0 ? Number(task.ytLiveHours) * 3600 : 0,
+    ytLiveRemainingSec: (Number(task.ytLiveHours) || 0) > 0 ? Number(task.ytLiveHours) * 3600 : 0,
     status: 'booting',
     cancelled: false,
     createdAt: Date.now()
@@ -6721,6 +6817,71 @@ async function handleInternalRunner(request, path, env) {
       }
     }
     return jsonResponse({ ok: true });
+  }
+
+  if (path === '/internal/chain_live') {
+    if (job.cancelled || job.status === 'cancelled' || job.status === 'failed') {
+      return jsonResponse({ ok: false, error: 'Task cancelled or stopped' }, 409);
+    }
+    const nextPart = Math.max(2, parseInt(body.next_part || 2, 10) || 2);
+    const remainingSec = Math.max(0, parseInt(body.remaining_sec || 0, 10) || 0);
+    const nextJobId = crypto.randomUUID().replace(/-/g, '').slice(0, 12);
+    const actionsUrl = getActionsUrl(env) || 'https://github.com';
+    const baseTitle = job.customName || job.detectedName || 'Live Stream';
+    const partText =
+      `<blockquote>📄 <b>Name :</b> <code>${escapeHtml(baseTitle)} [Part ${nextPart}]</code></blockquote>\n\n` +
+      `┌ Status : <a href="${actionsUrl}">Booting Live Part ${nextPart}..</a>\n` +
+      `├ Mode : <code>#ytdlp #Live24h</code>\n` +
+      `└ ⛔ /cancel_${nextJobId}\n\n` +
+      `<i>Continuing automatically from live edge…</i>`;
+
+    const sent = await sendMessage(
+      job.chatId,
+      partText,
+      env,
+      {
+        inline_keyboard: [[
+          { text: '🔄 Refresh', callback_data: `st_ref:${nextJobId}`, style: 'primary' },
+          { text: '🔽 Close', callback_data: `st_close:${nextJobId}`, style: 'danger' }
+        ]]
+      },
+      null,
+      job.threadId || null
+    ).catch(() => null);
+
+    const nextMsgId = sent?.result?.message_id || null;
+    const nextJob = {
+      ...job,
+      jobId: nextJobId,
+      runId: '',
+      messageId: nextMsgId,
+      ytLive: true,
+      ytLiveFrom: 'now',
+      ytLivePart: nextPart,
+      ytLiveRemainingSec: remainingSec,
+      lastCardHtml: '',
+      statsRecorded: false,
+      status: 'booting',
+      cancelled: false,
+      createdAt: Date.now()
+    };
+    await getStore(env).put(`job:${nextJobId}`, JSON.stringify(nextJob), { expirationTtl: 25200 });
+    await addActiveJobForUser(job.userId, nextJobId, env);
+
+    const dispatched = await triggerGithubWorkflow(nextJobId, env);
+    if (!dispatched) {
+      await removeActiveJobForUser(job.userId, nextJobId, env);
+      if (nextMsgId) {
+        await editMessage(
+          job.chatId,
+          nextMsgId,
+          `<blockquote><b>Live Chain Error</b>\n\nCould not dispatch Part ${nextPart}.</blockquote>`,
+          env
+        );
+      }
+      return jsonResponse({ ok: false, error: 'Could not dispatch next live part' }, 502);
+    }
+    return jsonResponse({ ok: true, next_job_id: nextJobId });
   }
 
   return jsonResponse({ ok: false, error: 'Unknown path' }, 404);
