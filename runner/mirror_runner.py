@@ -42,6 +42,7 @@ from pathlib import Path
 WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
 JOB_SECRET = os.environ.get("JOB_SECRET", "")
 JOB_ID = os.environ.get("JOB_ID", "")
+JOB_MODE = (os.environ.get("JOB_MODE") or "mirror").strip()
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API_ID = (os.environ.get("TELEGRAM_API_ID") or "").strip()
 TELEGRAM_API_HASH = (os.environ.get("TELEGRAM_API_HASH") or "").strip()
@@ -197,6 +198,78 @@ def send_message(chat_id, text: str, reply_markup: dict = None, thread_id=None):
     if thread_id:
         payload["message_thread_id"] = int(thread_id)
     return tg_call("sendMessage", payload)
+
+
+def upload_photo_multipart(
+    chat_id,
+    img_bytes: bytes,
+    filename: str = "thumb.jpg",
+    caption: str = "",
+    reply_markup: dict = None,
+    reply_to_msg_id=None,
+    thread_id=None,
+):
+    """Upload raw image bytes to Telegram sendPhoto via multipart/form-data."""
+    if not BOT_TOKEN or not img_bytes:
+        return {}
+    fields = {"chat_id": str(chat_id)}
+    if caption:
+        fields["caption"] = caption[:1024]
+        fields["parse_mode"] = "HTML"
+    if reply_to_msg_id:
+        fields["reply_to_message_id"] = str(reply_to_msg_id)
+    elif thread_id:
+        fields["message_thread_id"] = str(thread_id)
+
+    def _send(markup_obj):
+        boundary = f"----MirrorThumb{uuid.uuid4().hex}"
+        chunks = []
+        fmap = dict(fields)
+        if markup_obj:
+            fmap["reply_markup"] = json.dumps(markup_obj)
+        for k, v in fmap.items():
+            chunks.append(
+                (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n").encode("utf-8")
+            )
+        safe_fn = re.sub(r"[^A-Za-z0-9._-]", "_", filename or "thumb.jpg")
+        ctype = "image/png" if safe_fn.lower().endswith(".png") else ("image/webp" if safe_fn.lower().endswith(".webp") else "image/jpeg")
+        chunks.append(
+            (
+                f"--{boundary}\r\n"
+                f"Content-Disposition: form-data; name=\"photo\"; filename=\"{safe_fn}\"\r\n"
+                f"Content-Type: {ctype}\r\n\r\n"
+            ).encode("utf-8")
+        )
+        chunks.append(img_bytes)
+        chunks.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+        body = b"".join(chunks)
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "User-Agent": "MirrorRunner/3.0"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                return json.loads(e.read().decode("utf-8"))
+            except Exception:
+                return {"ok": False, "error": str(e)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    res = _send(reply_markup)
+    if not res.get("ok") and reply_markup:
+        kb = reply_markup.get("inline_keyboard")
+        if kb and any("style" in btn for row in kb for btn in row):
+            stripped = {
+                **reply_markup,
+                "inline_keyboard": [[{k: v for k, v in btn.items() if k != "style"} for btn in row] for row in kb],
+            }
+            res = _send(stripped)
+    return res
 
 
 def fmt_bytes(num: float) -> str:
@@ -1392,16 +1465,30 @@ def _is_youtube_url(url: str) -> bool:
     return host in ("youtu.be", "youtube.com", "youtube-nocookie.com") or host.endswith((".youtube.com", ".youtube-nocookie.com"))
 
 
-def ytdl_format_spec(quality: str, container: str) -> str:
+YT_ALLOWED_TIERS = (2160, 1440, 1080, 720, 480, 240)
+_TIER_WIDTH_FALLBACK = {3840: 2160, 2560: 1440, 1920: 1080, 1280: 720, 854: 480, 848: 480, 426: 240}
+
+
+def ytdl_format_spec(quality: str, container: str, format_id: str = "", has_audio: bool = False) -> str:
     if quality in YT_AUDIO_QUALITIES:
         return "ba/b"
-    if quality in ("2160", "1440", "1080", "720", "480", "360"):
+    if quality in ("2160", "1440", "1080", "720", "480", "360", "240"):
         if container == "mp4":
-            return f"bv*[height<={quality}][ext=mp4]+ba[ext=m4a]/bv*[height<={quality}]+ba/b[height<={quality}]/b"
-        return f"bv*[height<={quality}]+ba/b[height<={quality}]/b"
-    if container == "mp4":
-        return "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b"
-    return "bv*+ba/b"
+            base = f"bv*[height<={quality}][ext=mp4]+ba[ext=m4a]/bv*[height<={quality}]+ba/b[height<={quality}]/b"
+        else:
+            base = f"bv*[height<={quality}]+ba/b[height<={quality}]/b"
+    elif container == "mp4":
+        base = "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b"
+    else:
+        base = "bv*+ba/b"
+    fid = (format_id or "").strip()
+    if fid:
+        if has_audio:
+            return f"{fid}/{base}"
+        if container == "mp4":
+            return f"{fid}+ba[ext=m4a]/{fid}+ba/{base}"
+        return f"{fid}+ba/{base}"
+    return base
 
 
 def friendly_ytdl_error(msg: str) -> str:
@@ -1528,6 +1615,401 @@ def ensure_disk_space(min_free_bytes: int):
     ]
     subprocess.run(["sudo", "rm", "-rf", *cleanup_paths], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["sudo", "docker", "image", "prune", "-af"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+_RUNNER_TOOLS_LOCK = threading.Lock()
+_RUNNER_TOOLS_READY = threading.Event()
+
+
+def ensure_ytdl_probe_pkg(upgrade: bool = False):
+    """Install only yt-dlp[default] fast when probing formats (defers ffmpeg/rclone/aria2 to background)."""
+    with _YTDL_LOCK:
+        _prepare_pkg_paths()
+        if not upgrade:
+            try:
+                import yt_dlp  # noqa: F401
+                return
+            except ImportError:
+                pass
+        _pip_install_target(["yt-dlp[default]"], _PKG_TARGET)
+        _prepare_pkg_paths()
+        if "yt_dlp" in sys.modules:
+            importlib.reload(sys.modules["yt_dlp"])
+        import yt_dlp  # noqa: F401
+
+
+def ensure_full_runner_tools(need_kurigram: bool = False):
+    """Install aria2, rclone, ffmpeg, p7zip, mutagen, and optionally Kurigram while waiting on user selection."""
+    with _RUNNER_TOOLS_LOCK:
+        if _RUNNER_TOOLS_READY.is_set():
+            return
+        errs = []
+
+        def install_sys_tools():
+            try:
+                need_apt = [pkg for cmd, pkg in (("aria2c", "aria2"), ("7z", "p7zip-full"), ("ffmpeg", "ffmpeg")) if not shutil.which(cmd)]
+                if need_apt:
+                    subprocess.run(["sudo", "apt-get", "update", "-qq"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(
+                        ["sudo", "apt-get", "install", "-y", "-qq", *need_apt, "unzip", "tar", "curl", "jq"],
+                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    )
+                if not shutil.which("rclone"):
+                    rc_zip = WORK_DIR / "rclone.zip"
+                    rc_dir = WORK_DIR / "rclone_bin"
+                    WORK_DIR.mkdir(parents=True, exist_ok=True)
+                    shutil.rmtree(rc_dir, ignore_errors=True)
+                    rc_dl = subprocess.run(
+                        ["curl", "-fsSL", "--retry", "2", "https://downloads.rclone.org/rclone-current-linux-amd64.zip", "-o", str(rc_zip)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    if rc_dl.returncode == 0 and rc_zip.exists():
+                        subprocess.run(["unzip", "-q", "-j", str(rc_zip), "*/rclone", "-d", str(rc_dir)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        rc_bin = rc_dir / "rclone"
+                        if rc_bin.exists():
+                            subprocess.run(["sudo", "install", "-m", "0755", str(rc_bin), "/usr/local/bin/rclone"], check=False)
+                        rc_zip.unlink(missing_ok=True)
+                        shutil.rmtree(rc_dir, ignore_errors=True)
+                    if not shutil.which("rclone"):
+                        subprocess.run(["sudo", "apt-get", "install", "-y", "-qq", "rclone"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                errs.append(e)
+
+        def install_py_extras():
+            try:
+                with _YTDL_LOCK:
+                    _prepare_pkg_paths()
+                    try:
+                        import mutagen  # noqa: F401
+                    except ImportError:
+                        _pip_install_target(["yt-dlp[default]", "mutagen"], _PKG_TARGET)
+            except Exception as e:
+                errs.append(e)
+
+        threads = [
+            threading.Thread(target=install_sys_tools, daemon=True),
+            threading.Thread(target=install_py_extras, daemon=True),
+        ]
+        if need_kurigram and BOT_TOKEN and TELEGRAM_API_ID and TELEGRAM_API_HASH:
+            threads.append(threading.Thread(target=ensure_kurigram_tools, daemon=True))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if not errs:
+            _RUNNER_TOOLS_READY.set()
+
+
+def _tier_label(tier: int) -> str:
+    if tier == 2160:
+        return "4K"
+    if tier == 1440:
+        return "2K"
+    return f"{tier}p"
+
+
+def _map_video_tier(width, height):
+    """Map raw width/height (landscape, portrait, or cinema-cropped) to allowed target tiers."""
+    try:
+        w = int(width or 0)
+        h = int(height or 0)
+    except (TypeError, ValueError):
+        return None
+    if h <= 0 and w <= 0:
+        return None
+    if h > w > 0:
+        if w in YT_ALLOWED_TIERS:
+            return w
+        if h in YT_ALLOWED_TIERS:
+            return h
+        return None
+    if h in YT_ALLOWED_TIERS:
+        return h
+    if w in _TIER_WIDTH_FALLBACK:
+        return _TIER_WIDTH_FALLBACK[w]
+    return None
+
+
+def _norm_vcodec(vcodec: str) -> str:
+    v = (vcodec or "").strip().lower()
+    if not v or v == "none":
+        return ""
+    if v.startswith(("avc", "h264")):
+        return "H264"
+    if v.startswith(("vp9", "vp09")):
+        return "VP9"
+    if v.startswith(("av01", "av1")):
+        return "AV1"
+    if v.startswith(("hev", "hvc", "h265", "hevc")):
+        return "HEVC"
+    return re.sub(r"[^a-zA-Z0-9]", "", v.split(".")[0]).upper()[:5]
+
+
+def _pick_mid_thumbnail(info: dict) -> str:
+    thumbs = info.get("thumbnails") or []
+    cands = []
+    for t in thumbs:
+        if not isinstance(t, dict):
+            continue
+        url = str(t.get("url") or "").strip()
+        if not url.startswith("http"):
+            continue
+        tid = str(t.get("id") or "").lower()
+        low_u = url.lower()
+        if tid.startswith("sb") or "storyboard" in tid or "mhtml" in low_u or "/sb/" in low_u:
+            continue
+        w = int(t.get("width") or 0)
+        h = int(t.get("height") or 0)
+        if 0 < w < 200 and 0 < h < 120:
+            continue
+        cands.append((h or (w * 9 // 16 if w else 0), w, url))
+    if cands:
+        sized = [c for c in cands if c[0] > 0]
+        if sized:
+            sized.sort(key=lambda x: x[0])
+            # Prefer mid-quality (~360p-540p height: mqdefault/hqdefault/sddefault)
+            mid = next((c for c in sized if 320 <= c[0] <= 600), None)
+            if not mid:
+                mid = min(sized, key=lambda c: abs(c[0] - 420))
+            return mid[2]
+        return cands[len(cands) // 2][2]
+    fallback = str(info.get("thumbnail") or "").strip()
+    return fallback if fallback.startswith("http") else ""
+
+
+def _fmt_size_bytes_for_probe(fmt: dict, duration: int):
+    exact = fmt.get("filesize")
+    if exact and int(exact) > 0:
+        return int(exact), False
+    approx = fmt.get("filesize_approx")
+    if approx and int(approx) > 0:
+        return int(approx), True
+    tbr = float(fmt.get("tbr") or fmt.get("vbr") or fmt.get("abr") or 0)
+    if tbr > 0 and duration > 0:
+        return int((tbr * 1000.0 / 8.0) * duration), True
+    return 0, True
+
+
+def _short_probe_size(size_bytes: int, approx: bool) -> str:
+    if not size_bytes or size_bytes <= 0:
+        return "?"
+    prefix = "~" if approx else ""
+    if size_bytes >= 1024 ** 3:
+        return f"{prefix}{size_bytes / (1024 ** 3):.2f}GB"
+    if size_bytes >= 1024 ** 2:
+        val = size_bytes / (1024 ** 2)
+        return f"{prefix}{val:.0f}MB" if val >= 100 else f"{prefix}{val:.1f}MB"
+    if size_bytes >= 1024:
+        return f"{prefix}{size_bytes / 1024:.0f}KB"
+    return f"{prefix}{size_bytes}B"
+
+
+def probe_ytdl_metadata(url: str, is_playlist_hint: bool = False) -> dict:
+    """Probe exact title, 2-line desc, mid thumbnail, and distinct variants in allowed resolution tiers."""
+    import yt_dlp
+
+    cookie_path = prepare_ytdl_cookiefile()
+    try:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "ignore_config": True,
+            "socket_timeout": 20,
+            "playlist_items": "1",
+            "ignoreerrors": True,
+        }
+        if not is_playlist_hint:
+            opts["noplaylist"] = True
+        if shutil.which("node"):
+            opts["js_runtimes"] = {"node": {}}
+        if cookie_path:
+            opts["cookiefile"] = str(cookie_path)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False) or {}
+    finally:
+        if cookie_path:
+            cookie_path.unlink(missing_ok=True)
+
+    is_playlist = False
+    playlist_title = ""
+    playlist_count = 0
+    target = info
+    if info.get("_type") == "playlist" or isinstance(info.get("entries"), list):
+        entries = [e for e in (info.get("entries") or []) if isinstance(e, dict)]
+        playlist_title = str(info.get("title") or "").strip()
+        playlist_count = int(info.get("playlist_count") or len(entries) or 0)
+        if entries:
+            target = entries[0]
+            is_playlist = playlist_count != 1
+
+    title = (playlist_title if is_playlist and playlist_title else "") or str(target.get("title") or "").strip()
+    uploader = str(target.get("uploader") or target.get("channel") or info.get("uploader") or info.get("channel") or "").strip()
+    duration = int(target.get("duration") or 0)
+    is_live = bool(target.get("is_live"))
+
+    raw_desc = str(target.get("description") or info.get("description") or "").strip()
+    desc_lines = []
+    for raw_ln in raw_desc.splitlines():
+        cleaned = re.sub(r"\s+", " ", raw_ln).strip()
+        if cleaned:
+            if len(cleaned) > 85:
+                cleaned = cleaned[:84] + "…"
+            desc_lines.append(cleaned)
+            if len(desc_lines) >= 2:
+                break
+    desc_text = "\n".join(desc_lines)
+    thumb_url = _pick_mid_thumbnail(target) or _pick_mid_thumbnail(info)
+
+    formats = [f for f in (target.get("formats") or []) if isinstance(f, dict)]
+    best_audio_any = None
+    best_audio_m4a = None
+    for f in formats:
+        vc = str(f.get("vcodec") or "none").lower()
+        ac = str(f.get("acodec") or "none").lower()
+        if vc != "none" or ac == "none":
+            continue
+        abr = float(f.get("abr") or f.get("tbr") or 0)
+        sz, sz_approx = _fmt_size_bytes_for_probe(f, duration)
+        cand = (abr, sz, sz_approx, str(f.get("ext") or ""))
+        if best_audio_any is None or cand[0] > best_audio_any[0]:
+            best_audio_any = cand
+        if str(f.get("ext") or "").lower() in ("m4a", "mp4"):
+            if best_audio_m4a is None or cand[0] > best_audio_m4a[0]:
+                best_audio_m4a = cand
+
+    grouped = {}
+    for f in formats:
+        vc = str(f.get("vcodec") or "none").lower()
+        ac = str(f.get("acodec") or "none").lower()
+        ext = str(f.get("ext") or "").lower()
+        fmt_id = str(f.get("format_id") or "").strip()
+        note = str(f.get("format_note") or "").lower()
+        if not fmt_id or vc == "none" or ext == "mhtml" or "storyboard" in note:
+            continue
+        tier = _map_video_tier(f.get("width"), f.get("height"))
+        if tier not in YT_ALLOWED_TIERS:
+            continue
+
+        codec = _norm_vcodec(vc)
+        fps_num = int(round(float(f.get("fps") or 0)))
+        fps_bucket = fps_num if fps_num >= 48 else (30 if fps_num > 0 else 0)
+        dyn = str(f.get("dynamic_range") or "SDR").upper()
+        hdr_tag = dyn if dyn not in ("SDR", "NONE", "") else ""
+
+        v_sz, v_approx = _fmt_size_bytes_for_probe(f, duration)
+        has_audio = ac != "none"
+        total_sz = v_sz
+        approx = v_approx
+        if not has_audio:
+            aud = best_audio_m4a if (codec == "H264" and best_audio_m4a) else best_audio_any
+            if aud and aud[1] > 0:
+                total_sz = (v_sz + aud[1]) if v_sz > 0 else 0
+                approx = approx or aud[2]
+            elif v_sz > 0:
+                approx = True
+
+        proto = str(f.get("protocol") or "").lower()
+        is_hls = "m3u8" in proto or proto.startswith("hls")
+        tbr = float(f.get("tbr") or f.get("vbr") or 0)
+        score = (
+            1 if (total_sz > 0 and not approx) else 0,
+            1 if total_sz > 0 else 0,
+            1 if not is_hls else 0,
+            1 if not has_audio else 0,
+            tbr,
+        )
+        key = (tier, codec, fps_bucket, hdr_tag)
+        prev = grouped.get(key)
+        if prev is None or score > prev["score"]:
+            grouped[key] = {
+                "score": score,
+                "tier": tier,
+                "formatId": fmt_id,
+                "hasAudio": has_audio,
+                "codec": codec,
+                "fps": fps_num,
+                "fpsBucket": fps_bucket,
+                "hdr": hdr_tag,
+                "sizeBytes": total_sz,
+                "approx": approx,
+                "tbr": tbr,
+            }
+
+    # Sort descending: tier desc, fps desc, bitrate desc
+    items = sorted(grouped.values(), key=lambda x: (-x["tier"], -x["fps"], -x["tbr"]))
+    tier_counts = {}
+    for it in items:
+        tier_counts[it["tier"]] = tier_counts.get(it["tier"], 0) + 1
+
+    variants = []
+    for it in items:
+        base_res = _tier_label(it["tier"])
+        if it["fps"] >= 48:
+            res_part = f"{base_res}{it['fps']}" if it["tier"] < 1440 else f"{base_res} {it['fps']}fps"
+        else:
+            res_part = base_res
+        parts = [res_part]
+        if it["hdr"]:
+            parts.append(it["hdr"])
+        if it["codec"] and (tier_counts[it["tier"]] > 1 or it["codec"] not in ("H264", "")):
+            parts.append(it["codec"])
+        sz_str = _short_probe_size(it["sizeBytes"], it["approx"])
+        parts.append(sz_str)
+        variants.append({
+            "tier": it["tier"],
+            "formatId": it["formatId"],
+            "hasAudio": it["hasAudio"],
+            "codec": it["codec"],
+            "fps": it["fps"],
+            "hdr": it["hdr"],
+            "sizeBytes": it["sizeBytes"],
+            "approx": it["approx"],
+            "btnLabel": " · ".join(parts),
+        })
+
+    # Best video overall (highest tier/bitrate/codec) for Best Video size display
+    best_size = 0
+    best_approx = True
+    if variants:
+        best_v = variants[0]
+        best_size = int(best_v["sizeBytes"] or 0)
+        best_approx = bool(best_v["approx"])
+    else:
+        non_allowed = []
+        for f in formats:
+            vc = str(f.get("vcodec") or "none").lower()
+            ac = str(f.get("acodec") or "none").lower()
+            if vc == "none":
+                continue
+            v_sz, v_approx = _fmt_size_bytes_for_probe(f, duration)
+            tot = v_sz + (best_audio_any[1] if (ac == "none" and best_audio_any and v_sz > 0) else 0)
+            non_allowed.append((int(f.get("height") or 0), float(f.get("tbr") or 0), tot, v_approx))
+        if non_allowed:
+            non_allowed.sort(reverse=True)
+            best_size = int(non_allowed[0][2] or 0)
+            best_approx = bool(non_allowed[0][3])
+
+    src_aud_sz = best_audio_any[1] if best_audio_any else 0
+    mp3_320_bytes = int((320 * 1000 / 8) * duration) if duration > 0 else src_aud_sz
+    flac_bytes = int(92000 * duration) if duration > 0 else (src_aud_sz * 3 if src_aud_sz else 0)
+
+    return {
+        "title": title,
+        "uploader": uploader,
+        "description": desc_text,
+        "duration": duration,
+        "isLive": is_live,
+        "thumbnailUrl": thumb_url,
+        "isPlaylist": is_playlist,
+        "playlistCount": playlist_count,
+        "bestSize": best_size,
+        "bestApprox": best_approx,
+        "audioOptions": {
+            "flac": {"sizeBytes": flac_bytes, "approx": True, "label": f"FLAC · {_short_probe_size(flac_bytes, True)}" if flac_bytes else "FLAC (Lossless)"},
+            "mp3": {"sizeBytes": mp3_320_bytes, "approx": True, "label": f"320kbps MP3 · {_short_probe_size(mp3_320_bytes, True)}" if mp3_320_bytes else "Normal (320kbps)"},
+        },
+        "variants": variants,
+    }
 
 
 def ensure_ytdl_tools():
@@ -3166,14 +3648,16 @@ class Mirror:
         SLICE_MAX_SEC = 18000  # 5 hours per runner job
         quality = self.job.get("ytQuality") or "best"
         container = self.job.get("ytContainer") or "mp4"
+        fmt_id = (self.job.get("ytFormatId") or "").strip()
+        fmt_has_audio = bool(self.job.get("ytFormatHasAudio"))
         is_audio = quality in YT_AUDIO_QUALITIES
         out_ext = quality if is_audio else (container if container in ("mp4", "mkv") else "mp4")
         if is_audio:
             fmt = "bestaudio/best"
-        elif quality == "best":
+        elif quality == "best" and not fmt_id:
             fmt = "bv*+ba/best"
         else:
-            fmt = ytdl_format_spec(quality, container)
+            fmt = ytdl_format_spec(quality, container, format_id=fmt_id, has_audio=fmt_has_audio)
 
         part_num = max(1, int(self.job.get("ytLivePart") or 1))
         fetched_dur = int(meta.get("duration") or 0)
@@ -3198,6 +3682,8 @@ class Mirror:
         ]
         if is_audio:
             cmd += ["-x", "--audio-format", quality]
+            if quality == "mp3":
+                cmd += ["--audio-quality", "320K"]
         else:
             cmd += ["--merge-output-format", out_ext]
         if shutil.which("node"):
@@ -3330,6 +3816,8 @@ class Mirror:
 
         quality = self.job.get("ytQuality") or "best"
         container = self.job.get("ytContainer") or "mp4"
+        fmt_id = (self.job.get("ytFormatId") or "").strip()
+        fmt_has_audio = bool(self.job.get("ytFormatHasAudio"))
         is_audio = quality in YT_AUDIO_QUALITIES
         use_subs = bool(self.job.get("ytSubs")) and not is_audio
         sub_lang = (self.job.get("ytSubLang") or "en").strip() or "en"
@@ -3344,7 +3832,7 @@ class Mirror:
             postprocessors.append({
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": quality,
-                "preferredquality": "0",
+                "preferredquality": "320" if quality == "mp3" else "0",
             })
         if use_sb:
             cats = ["sponsor", "selfpromo", "interaction"]
@@ -3424,7 +3912,7 @@ class Mirror:
 
         def build_ydl_opts(use_aria: bool, use_dashy: bool) -> dict:
             opts = {
-                "format": ytdl_format_spec(quality, container),
+                "format": ytdl_format_spec(quality, container, format_id=fmt_id, has_audio=fmt_has_audio),
                 "outtmpl": str(yt_dir / "%(title).150B [%(id)s].%(ext)s"),
                 "restrictfilenames": False,
                 "noplaylist": (pl_mode != "all"),
@@ -6011,6 +6499,87 @@ class Mirror:
             finish_status(self.chat_id, self.message_id, text, kb, thread_id=self.thread_id)
 
 
+PROBE_WAIT_TIMEOUT_SEC = 600
+
+
+def _download_bytes_quiet(url: str, timeout: int = 12) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(5 * 1024 * 1024)
+
+
+def run_interactive_probe_session(init_job: dict):
+    """Fast-probe yt-dlp metadata/formats/thumbnail, install tools in background, and wait for user Start."""
+    global cancelled
+    target_url = str(init_job.get("fileUrl") or "").strip()
+    is_pl_hint = (init_job.get("ytPlaylist") or "") == "all"
+
+    ensure_ytdl_probe_pkg(upgrade=False)
+    try:
+        probe = probe_ytdl_metadata(target_url, is_playlist_hint=is_pl_hint)
+    except Exception:
+        # Refresh cached yt-dlp once if extractor failed (e.g. site signature update)
+        ensure_ytdl_probe_pkg(upgrade=True)
+        probe = probe_ytdl_metadata(target_url, is_playlist_hint=is_pl_hint)
+
+    res = worker_call("/internal/probe_result", {
+        "job_id": JOB_ID,
+        "ok": True,
+        "probe": probe,
+    })
+
+    if res.get("need_thumb_upload") and probe.get("thumbnailUrl"):
+        uploaded_msg_id = None
+        try:
+            img_bytes = _download_bytes_quiet(probe["thumbnailUrl"])
+            up_res = upload_photo_multipart(
+                init_job.get("chatId"),
+                img_bytes,
+                filename="thumb.jpg",
+                caption=res.get("caption") or "",
+                reply_markup=res.get("reply_markup"),
+                reply_to_msg_id=init_job.get("replyToMsgId"),
+                thread_id=init_job.get("threadId"),
+            )
+            if up_res.get("ok") and up_res.get("result", {}).get("message_id"):
+                uploaded_msg_id = up_res["result"]["message_id"]
+        except Exception:
+            pass
+        res = worker_call("/internal/probe_result", {
+            "job_id": JOB_ID,
+            "ok": True,
+            "uploaded_msg_id": uploaded_msg_id or "",
+            "thumb_upload_failed": not bool(uploaded_msg_id),
+        })
+
+    if not res.get("ok") or res.get("cancelled"):
+        return None
+
+    # Immediately start setting up aria2c, rclone, ffmpeg, mutagen & kurigram while user picks options
+    setup_thread = threading.Thread(
+        target=ensure_full_runner_tools,
+        kwargs={"need_kurigram": True},
+        daemon=True,
+    )
+    setup_thread.start()
+
+    wait_start = time.time()
+    while time.time() - wait_start < PROBE_WAIT_TIMEOUT_SEC:
+        if cancelled:
+            return None
+        w_res = worker_call("/internal/probe-wait", {"job_id": JOB_ID, "run_id": GITHUB_RUN_ID})
+        st = w_res.get("status")
+        if st == "cancelled":
+            return None
+        if st == "started" and isinstance(w_res.get("job"), dict):
+            setup_thread.join()
+            return w_res["job"]
+        time.sleep(1.5)
+
+    worker_call("/internal/probe_timeout", {"job_id": JOB_ID})
+    return None
+
+
 def main():
     if not WORKER_URL or not JOB_SECRET or not JOB_ID:
         print("Missing WORKER_URL, JOB_SECRET, or JOB_ID", flush=True)
@@ -6028,6 +6597,20 @@ def main():
         sys.exit(1)
 
     job = init_res["job"]
+    if JOB_MODE == "ytdl_probe" or job.get("status") == "probing":
+        try:
+            started_job = run_interactive_probe_session(job)
+        except Exception as pe:
+            worker_call("/internal/probe_result", {
+                "job_id": JOB_ID,
+                "ok": False,
+                "error": friendly_ytdl_error(str(pe))[:300],
+            })
+            started_job = None
+        if not started_job:
+            return
+        job = started_job
+
     access_token = job.get("accessToken") or ""
     mask_secret(access_token)
     mask_secret(job.get("fileUrl", ""))

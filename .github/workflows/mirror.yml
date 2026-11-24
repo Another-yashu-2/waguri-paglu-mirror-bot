@@ -6,6 +6,10 @@ on:
       job_id:
         description: 'Task Job ID'
         required: true
+      job_mode:
+        description: 'Execution Mode (mirror or ytdl_probe)'
+        required: false
+        default: 'mirror'
 
 jobs:
   mirror:
@@ -15,7 +19,15 @@ jobs:
       - name: Checkout Runner Scripts
         uses: actions/checkout@v4
 
+      - name: Cache yt-dlp Runtime Packages
+        if: inputs.job_mode == 'ytdl_probe'
+        uses: actions/cache@v4
+        with:
+          path: /tmp/ytdl_pkgs
+          key: ytdl-pkgs-${{ runner.os }}-v1
+
       - name: Install Transfer & Archive Tools
+        if: inputs.job_mode != 'ytdl_probe'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2 p7zip-full unzip tar curl jq
@@ -30,6 +42,7 @@ jobs:
       - name: Execute Mirror Job
         env:
           JOB_ID: ${{ github.event.inputs.job_id }}
+          JOB_MODE: ${{ inputs.job_mode || 'mirror' }}
           WORKER_URL: https://telegram-gdrive-bot.yashdaive.workers.dev
           JOB_SECRET: ${{ secrets.JOB_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

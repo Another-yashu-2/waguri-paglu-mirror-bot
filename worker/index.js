@@ -238,14 +238,15 @@ const YT_QUALITY_LABELS = {
   best: 'Best Video',
   '2160': '4K (2160p)',
   '1440': '2K (1440p)',
-  '1080': '1080p HD',
-  '720': '720p HD',
-  '480': '480p SD',
+  '1080': '1080p',
+  '720': '720p',
+  '480': '480p',
+  '240': '240p',
   '360': '360p',
-  mp3: 'Audio MP3',
+  mp3: 'Normal (320kbps MP3)',
+  flac: 'FLAC (Lossless)',
   m4a: 'Audio M4A',
-  opus: 'Audio Opus',
-  flac: 'Audio FLAC'
+  opus: 'Audio Opus'
 };
 const YT_AUDIO_QUALITIES = new Set(['mp3', 'm4a', 'opus', 'flac']);
 const YT_CONTAINERS = ['mp4', 'mkv', 'auto'];
@@ -260,6 +261,38 @@ const MEDIA_DOMAINS = new Set([
 
 function ytQualityLabel(q) {
   return YT_QUALITY_LABELS[q] || 'Best Video';
+}
+
+function fmtDurationCompact(seconds) {
+  const s = Math.max(0, parseInt(seconds || 0, 10) || 0);
+  if (!s) return '';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}h ${m}m ${sec}s`;
+  if (m > 0) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+
+function shortProbeSize(sizeBytes, approx = false) {
+  if (!sizeBytes || sizeBytes <= 0) return '';
+  const pre = approx ? '~' : '';
+  if (sizeBytes >= 1024 ** 3) return `${pre}${(sizeBytes / (1024 ** 3)).toFixed(2)}GB`;
+  if (sizeBytes >= 1024 ** 2) {
+    const mb = sizeBytes / (1024 ** 2);
+    return `${pre}${mb >= 100 ? mb.toFixed(0) : mb.toFixed(1)}MB`;
+  }
+  if (sizeBytes >= 1024) return `${pre}${(sizeBytes / 1024).toFixed(0)}KB`;
+  return `${pre}${sizeBytes}B`;
+}
+
+function fitTelegramCaption(htmlText, limit = 1024) {
+  const src = String(htmlText || '');
+  if (src.length <= limit) return src;
+  // Trim plain text cleanly and close any open tags to preserve valid Telegram HTML
+  const plain = src.replace(/<[^>]+>/g, '');
+  const sliceLen = Math.max(40, limit - 24);
+  return escapeHtml(plain.slice(0, sliceLen)) + '…';
 }
 
 function ytContainerLabel(c) {
@@ -1221,9 +1254,25 @@ function buildTaskMenuMessage(task) {
       extras += `\n✓ <b>Pixeldrain:</b> <code>${pdCount} link(s)</code>`;
     }
   } else if (task.isYtdl) {
-    extras += `\n✓ <b>Media:</b> <code>${escapeHtml(truncate(task.detectedName || 'Media Link', 56))}</code>`;
-    if (task.mediaAuthor) {
-      extras += `\n✓ <b>Channel:</b> ${escapeHtml(task.mediaAuthor)}`;
+    extras += `\n✓ <b>Title:</b> <code>${escapeHtml(truncate(task.detectedName || 'Media Link', 64))}</code>`;
+    const metaParts = [];
+    if (task.mediaAuthor) metaParts.push(escapeHtml(truncate(task.mediaAuthor, 28)));
+    if (task.mediaIsLive) {
+      metaParts.push('<code>LIVE</code>');
+    } else if (task.mediaDuration > 0) {
+      metaParts.push(`<code>${fmtDurationCompact(task.mediaDuration)}</code>`);
+    }
+    if (metaParts.length) {
+      extras += `\n✓ <b>Channel:</b> ${metaParts.join(' · ')}`;
+    }
+    if (task.mediaDuration > 18000 && !task.mediaIsLive) {
+      extras += `\n⚡ <b>Long Stream:</b> <code>&gt;5h · Auto 5h-slice + merge</code>`;
+    }
+    if (task.mediaPlaylistCount > 1) {
+      extras += `\n✓ <b>Playlist:</b> <code>${task.mediaPlaylistCount} items</code>`;
+    }
+    if (task.mediaDesc) {
+      extras += `\n📝 <i>${escapeHtml(truncate(task.mediaDesc, 150))}</i>`;
     }
   } else if (task.isTgMedia) {
     extras += `\n✓ <b>File:</b> <code>${escapeHtml(truncate(task.detectedName || 'Telegram Media', 56))}</code>`;
@@ -1261,8 +1310,16 @@ function buildTaskMenuMessage(task) {
   if (task.isYtdl) {
     const q = task.ytQuality || 'best';
     const isAud = YT_AUDIO_QUALITIES.has(q);
-    extras += `\n✓ <b>Quality:</b> <code>${ytQualityLabel(q)}${isAud ? '' : ` · ${ytContainerLabel(task.ytContainer || 'mp4')}`}</code>`;
-    if (task.ytSubs) extras += `\n✓ <b>Subtitles:</b> <code>${escapeHtml(task.ytSubLang || 'en')}</code>`;
+    let qDisp = ytQualityLabel(q);
+    if (task.ytFormatId && task.ytFormatLabel) {
+      qDisp = task.ytFormatLabel;
+    } else if (q === 'best' && task.ytBestSize > 0) {
+      qDisp = `Best Video (${shortProbeSize(task.ytBestSize, task.ytBestApprox !== false)})`;
+    } else if ((q === 'flac' || q === 'mp3') && task.ytAudioOptions?.[q]?.label) {
+      qDisp = task.ytAudioOptions[q].label;
+    }
+    extras += `\n✓ <b>Quality:</b> <code>${escapeHtml(qDisp)}${isAud ? '' : ` · ${ytContainerLabel(task.ytContainer || 'mp4')}`}</code>`;
+    if (task.ytSubs && !isAud) extras += `\n✓ <b>Subtitles:</b> <code>${escapeHtml(task.ytSubLang || 'en')}</code>`;
     if (task.ytMeta === false) extras += `\n✓ <b>Metadata:</b> Off`;
     if (task.ytSponsorBlock) extras += `\n✓ <b>SponsorBlock:</b> Remove segments`;
     if (task.ytPlaylist === 'all') {
@@ -1335,7 +1392,7 @@ function buildTaskMenuMessage(task) {
   return (
     `📌 <b>Choose option for your task?</b>\n\n` +
     `${destLine}${extras}${warnBlock}\n\n` +
-    `⏰ <b>Timeout:</b> <code>2m40s</code>`
+    `⏰ <b>Timeout:</b> <code>${task.warmRunner ? '10m' : '2m40s'}</code>`
   );
 }
 
@@ -1421,7 +1478,17 @@ function buildTaskMenuKeyboard(task) {
   if (task.isYtdl) {
     const q = task.ytQuality || 'best';
     const isAud = YT_AUDIO_QUALITIES.has(q);
-    const qualRow = [{ text: `🎬 Quality: ${ytQualityLabel(q)}`, callback_data: `tm_ytqual:${tid}`, style: 'primary' }];
+    let qBtnLabel = ytQualityLabel(q);
+    if (task.ytFormatId && task.ytFormatLabel) {
+      qBtnLabel = task.ytFormatLabel;
+    } else if (q === 'best' && task.ytBestSize > 0) {
+      qBtnLabel = `Best (${shortProbeSize(task.ytBestSize, task.ytBestApprox !== false)})`;
+    } else if (q === 'mp3') {
+      qBtnLabel = task.ytAudioOptions?.mp3?.label || '320kbps MP3';
+    } else if (q === 'flac') {
+      qBtnLabel = task.ytAudioOptions?.flac?.label || 'FLAC Lossless';
+    }
+    const qualRow = [{ text: `🎞 Quality: ${truncate(qBtnLabel, 24)}`, callback_data: `tm_ytqual:${tid}`, style: 'primary' }];
     if (!isAud) {
       qualRow.push({ text: `Format: ${ytContainerLabel(task.ytContainer || 'mp4')}`, callback_data: `tm_ytcont:${tid}` });
     }
@@ -1513,25 +1580,75 @@ function buildTaskMenuKeyboard(task) {
 function buildYtdlQualityMenu(task) {
   const tid = task.taskId;
   const cur = task.ytQuality || 'best';
-  const btn = (val, label) => ({
-    text: cur === val ? `✓ ${label}` : label,
-    callback_data: `tm_ytqset:${tid}:${val}`,
-    style: cur === val ? 'success' : undefined
-  });
+  const curFmtId = String(task.ytFormatId || '');
+  const variants = Array.isArray(task.ytVariants) ? task.ytVariants : [];
+  const audioOpts = task.ytAudioOptions || {};
+
+  const bestSz = task.ytBestSize > 0 ? ` · ${shortProbeSize(task.ytBestSize, task.ytBestApprox !== false)}` : '';
+  const bestSelected = !curFmtId && cur === 'best';
+  const rows = [
+    [{
+      text: `${bestSelected ? '✓ ' : ''}Best Video${bestSz}`,
+      callback_data: `tm_ytqset:${tid}:best`,
+      style: bestSelected ? 'success' : 'primary'
+    }]
+  ];
+
+  if (variants.length > 0) {
+    for (let i = 0; i < variants.length; i += 2) {
+      const pair = variants.slice(i, i + 2).map((v, offset) => {
+        const idx = i + offset;
+        const selected = curFmtId && curFmtId === String(v.formatId || '');
+        const lbl = truncate(v.btnLabel || `${v.tier}p`, 30);
+        return {
+          text: selected ? `✓ ${lbl}` : lbl,
+          callback_data: `tm_ytv:${tid}:${idx}`,
+          style: selected ? 'success' : undefined
+        };
+      });
+      rows.push(pair);
+    }
+  } else {
+    const presetBtn = (val, label) => {
+      const selected = !curFmtId && cur === val;
+      return {
+        text: selected ? `✓ ${label}` : label,
+        callback_data: `tm_ytqset:${tid}:${val}`,
+        style: selected ? 'success' : undefined
+      };
+    };
+    rows.push([presetBtn('2160', '4K (2160p)'), presetBtn('1440', '2K (1440p)')]);
+    rows.push([presetBtn('1080', '1080p'), presetBtn('720', '720p')]);
+    rows.push([presetBtn('480', '480p'), presetBtn('240', '240p')]);
+  }
+
+  const flacLbl = truncate(audioOpts.flac?.label || 'FLAC (Lossless)', 28);
+  const mp3Lbl = truncate(audioOpts.mp3?.label || 'Normal (320kbps MP3)', 28);
+  const flacSel = cur === 'flac';
+  const mp3Sel = cur === 'mp3';
+  rows.push([
+    {
+      text: flacSel ? `✓ 🎵 ${flacLbl}` : `🎵 ${flacLbl}`,
+      callback_data: `tm_ytqset:${tid}:flac`,
+      style: flacSel ? 'success' : undefined
+    },
+    {
+      text: mp3Sel ? `✓ 🎵 ${mp3Lbl}` : `🎵 ${mp3Lbl}`,
+      callback_data: `tm_ytqset:${tid}:mp3`,
+      style: mp3Sel ? 'success' : undefined
+    }
+  ]);
+
+  rows.push([{ text: '↩ Back', callback_data: `tm_back:${tid}`, style: 'primary' }]);
+
   const text =
     `<blockquote><b>Media Quality &amp; Format</b></blockquote>\n\n` +
-    `Select video resolution or audio extraction preset.\n` +
-    `<i>If an exact resolution is unavailable, the closest lower quality is used automatically.</i>`;
-  const kb = {
-    inline_keyboard: [
-      [btn('best', 'Best Video'), btn('2160', '4K (2160p)'), btn('1440', '2K (1440p)')],
-      [btn('1080', '1080p'), btn('720', '720p'), btn('480', '480p')],
-      [btn('360', '360p'), btn('mp3', 'MP3 Audio'), btn('m4a', 'M4A Audio')],
-      [btn('opus', 'Opus Audio'), btn('flac', 'FLAC Audio')],
-      [{ text: '↩ Back', callback_data: `tm_back:${tid}`, style: 'primary' }]
-    ]
-  };
-  return { text, kb };
+    (variants.length > 0
+      ? `Live formats fetched (<b>4K · 2K · 1080p · 720p · 480p · 240p</b> + Audio).\n` +
+        `<i>Tap a variant below or keep <b>Best Video</b> selected.</i>`
+      : `Select video resolution or audio extraction preset.\n` +
+        `<i>Supported tiers: 4K, 2K, 1080p, 720p, 480p, 240p + Audio.</i>`);
+  return { text, kb: { inline_keyboard: rows } };
 }
 
 function buildConflictMenu(task) {
@@ -3787,7 +3904,14 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       replyToMsgId,
       threadId
     );
-    checkingMsgId = checkingMsg?.result?.message_id;
+      checkingMsgId = checkingMsg?.result?.message_id;
+  } else if (allMediaInitial && !isBatchInitial) {
+    await editMessage(
+      chatId,
+      checkingMsgId,
+      `<blockquote><b>Inspecting Media</b>\n\n<i>Fetching title, thumbnail, qualities &amp; preparing runner...</i></blockquote>`,
+      env
+    ).catch(() => {});
   }
 
   const userRole = await getUserRoleTag(userId, isChannel, env);
@@ -3858,8 +3982,8 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
     }
 
     if (ytdlUrl) {
-      const oembed = await fetchMediaOEmbed(ytdlUrl);
-      const detectedTitle = oembed?.title || guessNameFromUrl(ytdlUrl) || 'Media';
+      const wantInteractive = profile.buttonMode !== false || defaultDest === 'ghrelease';
+      const defaultQ = profile.ytQuality || 'best';
       task = {
         taskId,
         userId: String(userId),
@@ -3873,14 +3997,27 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         threadId,
         replyToMsgId,
         menuMsgId: checkingMsgId,
+        menuIsPhoto: false,
         fileUrl: ytdlUrl,
-        items: [{ type: 'ytdl', url: ytdlUrl, name: detectedTitle }],
+        items: [{ type: 'ytdl', url: ytdlUrl, name: guessNameFromUrl(ytdlUrl) || 'Media' }],
         batch: false,
         isDrive: false,
         isFolder: false,
         isYtdl: true,
-        mediaAuthor: oembed?.author || '',
-        ytQuality: profile.ytQuality || 'best',
+        mediaAuthor: '',
+        mediaDesc: '',
+        mediaDuration: 0,
+        mediaIsLive: false,
+        mediaThumbUrl: '',
+        mediaPlaylistCount: 0,
+        ytQuality: defaultQ,
+        ytFormatId: '',
+        ytFormatHasAudio: false,
+        ytFormatLabel: '',
+        ytVariants: [],
+        ytBestSize: 0,
+        ytBestApprox: true,
+        ytAudioOptions: {},
         ytContainer: profile.ytContainer || 'mp4',
         ytSubs: false,
         ytSubLang: 'en',
@@ -3889,7 +4026,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         ytPlaylist: isPlaylistUrl(ytdlUrl) ? 'all' : 'single',
         ytPlaylistItems: '',
         ytTrim: '',
-        detectedName: detectedTitle,
+        detectedName: guessNameFromUrl(ytdlUrl) || 'Media',
         customName: '',
         fileSize: 0,
         contentType: 'video/mp4',
@@ -3916,8 +4053,61 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         share: false,
         conflict: profile.conflict || 'rename',
         duplicateExists: false,
+        warmRunner: false,
+        probeStatus: '',
         createdAt: Date.now()
       };
+
+      if (wantInteractive) {
+        if (checkingMsgId) {
+          await editMessage(
+            chatId,
+            checkingMsgId,
+            `<blockquote><b>Inspecting Media</b>\n\n<i>Fetching title, thumbnail, live qualities &amp; warming runner (~6s)...</i></blockquote>`,
+            env,
+            { inline_keyboard: [[{ text: '⛔ Cancel', callback_data: `probe_cancel:${taskId}`, style: 'danger' }]] }
+          ).catch(() => {});
+        }
+        const probeJob = {
+          jobId: taskId,
+          userId: String(userId),
+          userRole,
+          credUserId: mCtx.credUserId,
+          username,
+          chatId,
+          chatType,
+          isChannel,
+          threadId,
+          replyToMsgId,
+          messageId: checkingMsgId,
+          fileUrl: ytdlUrl,
+          items: task.items,
+          dest: task.dest,
+          isYtdl: true,
+          ytPlaylist: task.ytPlaylist,
+          isInteractiveProbe: true,
+          status: 'probing',
+          cancelled: false,
+          lastHeartbeatAt: Date.now(),
+          createdAt: Date.now()
+        };
+        await getStore(env).put(`task:${taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
+        await getStore(env).put(`job:${taskId}`, JSON.stringify(probeJob), { expirationTtl: 3600 });
+        const dispatched = await triggerGithubWorkflow(taskId, env, 'ytdl_probe');
+        if (dispatched) {
+          task.warmRunner = true;
+          task.probeStatus = 'probing';
+          await getStore(env).put(`task:${taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
+          return;
+        }
+      }
+
+      const oembed = await fetchMediaOEmbed(ytdlUrl);
+      const detectedTitle = oembed?.title || task.detectedName || 'Media';
+      task.detectedName = detectedTitle;
+      task.items = [{ type: 'ytdl', url: ytdlUrl, name: detectedTitle }];
+      task.mediaAuthor = oembed?.author || '';
+      task.probeStatus = 'fallback';
     } else {
       const verification = resolved.verification;
       const isDrive = resolved.kind === 'gdrive';
@@ -5413,6 +5603,27 @@ async function handleCallbackQuery(cb, env) {
     return;
   }
 
+  if (data.startsWith('probe_cancel:')) {
+    const tid = data.split(':')[1];
+    const tRaw = await getStore(env).get(`task:${tid}`);
+    const jRaw = await getStore(env).get(`job:${tid}`);
+    const rec = tRaw ? JSON.parse(tRaw) : (jRaw ? JSON.parse(jRaw) : null);
+    if (rec && !(await canControlRecord(rec, userId, env))) {
+      await answerCb(cb.id, 'You can only cancel your own task.', true, env);
+      return;
+    }
+    if (jRaw) {
+      const job = JSON.parse(jRaw);
+      job.cancelled = true;
+      job.status = 'cancelled';
+      await getStore(env).put(`job:${tid}`, JSON.stringify(job), { expirationTtl: 600 });
+    }
+    if (tRaw) await getStore(env).delete(`task:${tid}`);
+    await editMessage(chatId, msgId, `<blockquote><b>Task Cancelled</b></blockquote>`, env);
+    await answerCb(cb.id, 'Cancelled', false, env);
+    return;
+  }
+
   if (data.startsWith('tm_')) {
     const parts = data.split(':');
     const action = parts[0];
@@ -5430,10 +5641,18 @@ async function handleCallbackQuery(cb, env) {
       return;
     }
     task.menuMsgId = msgId;
+    if (cb.message?.photo) task.menuIsPhoto = true;
 
     if (action === 'tm_cancel') {
       await clearMatchingPrompt(chatId, userId, env, p => p.taskId === tid || p.returnTaskId === tid || p.menuMsgId === msgId);
       await getStore(env).delete(`task:${tid}`);
+      const jRaw = await getStore(env).get(`job:${tid}`);
+      if (jRaw) {
+        const job = JSON.parse(jRaw);
+        job.cancelled = true;
+        job.status = 'cancelled';
+        await getStore(env).put(`job:${tid}`, JSON.stringify(job), { expirationTtl: 600 });
+      }
       if (!task.isChannel) {
         await bumpUserStats(task.userId || userId, { cancelled: 1 }, {}, env);
       }
@@ -5476,8 +5695,35 @@ async function handleCallbackQuery(cb, env) {
       return;
     }
 
+    if (action === 'tm_ytv') {
+      const idx = parseInt(arg, 10);
+      const variants = Array.isArray(task.ytVariants) ? task.ytVariants : [];
+      const chosen = (!Number.isNaN(idx) && idx >= 0 && idx < variants.length) ? variants[idx] : null;
+      if (!chosen) {
+        await answerCb(cb.id, 'Variant unavailable — please pick again.', true, env);
+        return;
+      }
+      task.ytQuality = String(chosen.tier || 'best');
+      task.ytFormatId = String(chosen.formatId || '');
+      task.ytFormatHasAudio = !!chosen.hasAudio;
+      task.ytFormatLabel = String(chosen.btnLabel || `${chosen.tier}p`);
+      task.fileSize = parseInt(chosen.sizeBytes || 0, 10) || 0;
+      await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
+      await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
+      await answerCb(cb.id, `Quality: ${task.ytFormatLabel}`, false, env);
+      return;
+    }
+
     if (action === 'tm_ytqset' && YT_QUALITY_LABELS[arg]) {
       task.ytQuality = arg;
+      task.ytFormatId = '';
+      task.ytFormatHasAudio = false;
+      task.ytFormatLabel = '';
+      if (arg === 'best') {
+        task.fileSize = parseInt(task.ytBestSize || 0, 10) || 0;
+      } else if (arg === 'flac' || arg === 'mp3') {
+        task.fileSize = parseInt(task.ytAudioOptions?.[arg]?.sizeBytes || 0, 10) || 0;
+      }
       await getStore(env).put(`task:${tid}`, JSON.stringify(task), { expirationTtl: 7200 });
       await editMessage(chatId, msgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
       await answerCb(cb.id, `Quality: ${ytQualityLabel(arg)}`, false, env);
@@ -6089,9 +6335,9 @@ async function handleCallbackQuery(cb, env) {
         env,
         {
           inline_keyboard: [
-            [qBtn('best', 'Best'), qBtn('2160', '4K'), qBtn('1440', '2K')],
+            [qBtn('best', 'Best Video'), qBtn('2160', '4K'), qBtn('1440', '2K')],
             [qBtn('1080', '1080p'), qBtn('720', '720p'), qBtn('480', '480p')],
-            [qBtn('mp3', 'MP3'), qBtn('m4a', 'M4A'), qBtn('opus', 'Opus')],
+            [qBtn('240', '240p'), qBtn('flac', 'FLAC'), qBtn('mp3', '320kbps MP3')],
             [cBtn('mp4', 'MP4'), cBtn('mkv', 'MKV'), cBtn('auto', 'Auto')],
             [{ text: '↩ Back', callback_data: 'cfg_back', style: 'primary' }]
           ]
@@ -6267,6 +6513,16 @@ async function launchMirrorTask(task, env) {
     ? `\n\n<blockquote>⚠️ <b>Copyright Warning:</b> Do not leech copyrighted content — it could get the group and bot both flagged or banned.${task.chatType === 'private' ? ' DM files auto-delete in 30m.' : ''}</blockquote>`
     : '';
 
+  const existingJobRaw = task.warmRunner ? await getStore(env).get(`job:${taskId}`) : null;
+  const existingJob = existingJobRaw ? JSON.parse(existingJobRaw) : null;
+  const reuseWarmRunner = Boolean(
+    existingJob &&
+    existingJob.isInteractiveProbe &&
+    existingJob.status === 'waiting_user' &&
+    !existingJob.cancelled &&
+    (Date.now() - Number(existingJob.lastHeartbeatAt || 0) < 45000)
+  );
+
   const bootText =
     `${fallbackNotice}` +
     `<blockquote>📄 <b>Name :</b> <code>${escapeHtml(displayTitle)}</code></blockquote>\n\n` +
@@ -6283,16 +6539,28 @@ async function launchMirrorTask(task, env) {
     `├ 🟢 Cpu [□□□□□□□□□□] 0.0%\n` +
     `├ 🟢 Ram [□□□□□□□□□□] 0.0%\n` +
     `├ 🟢 Free [■□□□□□□□□□] 115.00GB\n` +
-    `└ 🕒 Allocating runner (~10s)..</code></pre>${copyrightLine}`;
+    `└ 🕒 ${reuseWarmRunner ? 'Starting warm runner (~1s)..' : 'Allocating runner (~10s)..'}</code></pre>${copyrightLine}`;
 
-  await editMessage(chatId, menuMsgId, bootText, env, {
+  const statusKb = {
     inline_keyboard: [
       [
         { text: '🔄 Refresh', callback_data: `st_ref:${taskId}`, style: 'primary' },
         { text: '🔽 Close', callback_data: `st_close:${taskId}`, style: 'danger' }
       ]
     ]
-  });
+  };
+
+  let statusMsgId = menuMsgId;
+  if (task.menuIsPhoto) {
+    // Thumbnail is shown only until the mirror starts; swap to a full-text status card now.
+    if (menuMsgId) {
+      await deleteMessage(chatId, menuMsgId, env).catch(() => {});
+    }
+    const sentStatus = await sendMessage(chatId, bootText, env, statusKb, task.replyToMsgId || null, task.threadId || null);
+    statusMsgId = sentStatus?.result?.message_id || menuMsgId;
+  } else {
+    await editMessage(chatId, menuMsgId, bootText, env, statusKb);
+  }
 
   const jobData = {
     jobId: taskId,
@@ -6306,7 +6574,7 @@ async function launchMirrorTask(task, env) {
     isSharedGcTemp: !!task.isSharedGcTemp,
     threadId: task.threadId || null,
     replyToMsgId: task.replyToMsgId || null,
-    messageId: menuMsgId,
+    messageId: statusMsgId,
     repoUrl: getRepoUrl(env),
     tgDecision: '',
     fileUrl: task.fileUrl,
@@ -6336,6 +6604,8 @@ async function launchMirrorTask(task, env) {
     conflict: task.conflict || 'rename',
     isYtdl: !!task.isYtdl,
     ytQuality: task.ytQuality || 'best',
+    ytFormatId: task.ytFormatId || '',
+    ytFormatHasAudio: !!task.ytFormatHasAudio,
     ytContainer: task.ytContainer || 'mp4',
     ytSubs: !!task.ytSubs,
     ytSubLang: task.ytSubLang || 'en',
@@ -6347,23 +6617,28 @@ async function launchMirrorTask(task, env) {
     ytLivePart: 1,
     ytLiveParts: [],
     ytLiveCombine: false,
+    runId: reuseWarmRunner ? (existingJob.runId || '') : '',
+    isInteractiveProbe: reuseWarmRunner,
     status: 'booting',
     cancelled: false,
     createdAt: Date.now()
   };
 
+  await getStore(env).delete(`task:${taskId}`);
   await getStore(env).put(`job:${taskId}`, JSON.stringify(jobData), { expirationTtl: 25200 });
   await addActiveJobForUser(userId, taskId, env);
 
-  const dispatched = await triggerGithubWorkflow(taskId, env);
-  if (!dispatched) {
-    await removeActiveJobForUser(userId, taskId, env);
-    await editMessage(
-      chatId,
-      menuMsgId,
-      `<blockquote><b>Dispatch Error</b>\n\nCould not trigger GitHub Actions runner.</blockquote>`,
-      env
-    );
+  if (!reuseWarmRunner) {
+    const dispatched = await triggerGithubWorkflow(taskId, env);
+    if (!dispatched) {
+      await removeActiveJobForUser(userId, taskId, env);
+      await editMessage(
+        chatId,
+        statusMsgId,
+        `<blockquote><b>Dispatch Error</b>\n\nCould not trigger GitHub Actions runner.</blockquote>`,
+        env
+      );
+    }
   }
 }
 
@@ -6536,7 +6811,7 @@ async function executeDirectDriveCopy(task, item, accessToken, env) {
   }
 }
 
-async function triggerGithubWorkflow(jobId, env) {
+async function triggerGithubWorkflow(jobId, env, jobMode = 'mirror') {
   const apiUrl = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions/workflows/${env.GITHUB_WORKFLOW || 'mirror.yml'}/dispatches`;
   const res = await fetch(apiUrl, {
     method: 'POST',
@@ -6547,7 +6822,7 @@ async function triggerGithubWorkflow(jobId, env) {
     },
     body: JSON.stringify({
       ref: 'main',
-      inputs: { job_id: jobId }
+      inputs: { job_id: jobId, job_mode: jobMode }
     })
   });
   return res.ok;
@@ -6573,10 +6848,18 @@ async function handleInternalRunner(request, path, env) {
   const credUid = String(job.credUserId || job.userId);
 
   if (path === '/internal/job') {
+    const isProbing = job.status === 'probing' && job.isInteractiveProbe;
     if (body.run_id) {
       job.runId = String(body.run_id);
-      job.status = 'running';
-      await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 25200 });
+      if (!isProbing) {
+        job.status = 'running';
+      } else {
+        job.lastHeartbeatAt = Date.now();
+      }
+      await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: isProbing ? 3600 : 25200 });
+    }
+    if (isProbing) {
+      return jsonResponse({ ok: true, job });
     }
     const needsDrive = !['gofile', 'telegram', 'ghrelease'].includes(job.dest);
     const tokenInfo = needsDrive ? await getValidTokenInfo(credUid, env, false) : null;
@@ -6600,6 +6883,191 @@ async function handleInternalRunner(request, path, env) {
         tokenExpiry: tokenInfo?.tokenExpiry || null
       }
     });
+  }
+
+  if (path === '/internal/probe_result') {
+    const tRaw = await getStore(env).get(`task:${jobId}`);
+    if (!tRaw || job.cancelled || job.status === 'cancelled') {
+      return jsonResponse({ ok: false, cancelled: true });
+    }
+    const task = JSON.parse(tRaw);
+
+    if (body.uploaded_msg_id) {
+      const oldMsgId = task.menuMsgId;
+      const newMsgId = body.uploaded_msg_id;
+      task.menuMsgId = newMsgId;
+      task.menuIsPhoto = true;
+      task.probeStatus = 'ready';
+      task.warmRunner = true;
+      job.messageId = newMsgId;
+      job.status = 'waiting_user';
+      job.lastHeartbeatAt = Date.now();
+      await getStore(env).put(`task:${jobId}`, JSON.stringify(task), { expirationTtl: 7200 });
+      await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 3600 });
+      if (oldMsgId && String(oldMsgId) !== String(newMsgId)) {
+        await deleteMessage(task.chatId, oldMsgId, env).catch(() => {});
+      }
+      await trackChatMessages(task.chatId, [newMsgId], env).catch(() => {});
+      return jsonResponse({ ok: true, state: 'waiting' });
+    }
+
+    if (body.thumb_upload_failed) {
+      const menuText = buildTaskMenuMessage(task);
+      const menuKb = buildTaskMenuKeyboard(task);
+      task.menuIsPhoto = false;
+      task.probeStatus = 'ready';
+      task.warmRunner = true;
+      job.status = 'waiting_user';
+      job.lastHeartbeatAt = Date.now();
+      await editMessage(task.chatId, task.menuMsgId, menuText, env, menuKb);
+      await getStore(env).put(`task:${jobId}`, JSON.stringify(task), { expirationTtl: 7200 });
+      await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 3600 });
+      return jsonResponse({ ok: true, state: 'waiting' });
+    }
+
+    if (!body.ok) {
+      const oembed = await fetchMediaOEmbed(task.fileUrl).catch(() => null);
+      task.detectedName = oembed?.title || task.detectedName || 'Media';
+      task.mediaAuthor = oembed?.author || task.mediaAuthor || '';
+      task.items = [{ type: 'ytdl', url: task.fileUrl, name: task.detectedName }];
+      task.probeStatus = 'fallback';
+      task.warmRunner = false;
+      job.status = 'cancelled';
+      job.cancelled = true;
+      await editMessage(task.chatId, task.menuMsgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task));
+      await getStore(env).put(`task:${jobId}`, JSON.stringify(task), { expirationTtl: 7200 });
+      await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 600 });
+      return jsonResponse({ ok: false, cancelled: true });
+    }
+
+    const probe = body.probe || {};
+    if (probe.title) {
+      task.detectedName = probe.title;
+      task.items = [{ type: 'ytdl', url: task.fileUrl, name: probe.title }];
+    }
+    if (probe.uploader) task.mediaAuthor = probe.uploader;
+    if (probe.description) task.mediaDesc = probe.description;
+    if (probe.duration) task.mediaDuration = parseInt(probe.duration, 10) || 0;
+    task.mediaIsLive = !!probe.isLive;
+    if (probe.thumbnailUrl) task.mediaThumbUrl = probe.thumbnailUrl;
+    if (probe.isPlaylist && (probe.playlistCount || 0) > 1) {
+      task.ytPlaylist = 'all';
+      task.mediaPlaylistCount = parseInt(probe.playlistCount, 10) || 0;
+    }
+    task.ytVariants = Array.isArray(probe.variants) ? probe.variants : [];
+    task.ytBestSize = parseInt(probe.bestSize || 0, 10) || 0;
+    task.ytBestApprox = probe.bestApprox !== false;
+    task.ytAudioOptions = probe.audioOptions && typeof probe.audioOptions === 'object' ? probe.audioOptions : {};
+    if ((task.ytQuality || 'best') === 'best' && !task.ytFormatId) {
+      task.fileSize = task.ytBestSize || 0;
+    }
+    task.probeStatus = 'ready';
+    task.warmRunner = true;
+
+    const menuText = buildTaskMenuMessage(task);
+    const menuKb = buildTaskMenuKeyboard(task);
+
+    if (task.mediaThumbUrl) {
+      const caption = fitTelegramCaption(menuText, 1024);
+      const photoRes = await sendPhoto(
+        task.chatId,
+        task.mediaThumbUrl,
+        caption,
+        env,
+        menuKb,
+        task.replyToMsgId || null,
+        task.threadId || null
+      ).catch(() => null);
+
+      if (photoRes?.ok && photoRes.result?.message_id) {
+        const oldMsgId = task.menuMsgId;
+        const newMsgId = photoRes.result.message_id;
+        task.menuMsgId = newMsgId;
+        task.menuIsPhoto = true;
+        job.messageId = newMsgId;
+        job.status = 'waiting_user';
+        job.lastHeartbeatAt = Date.now();
+        await getStore(env).put(`task:${jobId}`, JSON.stringify(task), { expirationTtl: 7200 });
+        await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 3600 });
+        if (oldMsgId && String(oldMsgId) !== String(newMsgId)) {
+          await deleteMessage(task.chatId, oldMsgId, env).catch(() => {});
+        }
+        return jsonResponse({ ok: true, state: 'waiting' });
+      }
+
+      // Ask runner to upload thumbnail bytes directly when Telegram rejects remote URL
+      job.status = 'waiting_user';
+      job.lastHeartbeatAt = Date.now();
+      await getStore(env).put(`task:${jobId}`, JSON.stringify(task), { expirationTtl: 7200 });
+      await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 3600 });
+      return jsonResponse({ ok: true, need_thumb_upload: true, caption, reply_markup: menuKb });
+    }
+
+    task.menuIsPhoto = false;
+    job.status = 'waiting_user';
+    job.lastHeartbeatAt = Date.now();
+    await editMessage(task.chatId, task.menuMsgId, menuText, env, menuKb);
+    await getStore(env).put(`task:${jobId}`, JSON.stringify(task), { expirationTtl: 7200 });
+    await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 3600 });
+    return jsonResponse({ ok: true, state: 'waiting' });
+  }
+
+  if (path === '/internal/probe-wait') {
+    if (job.cancelled || job.status === 'cancelled') {
+      return jsonResponse({ ok: true, status: 'cancelled' });
+    }
+    if (job.status === 'booting' || job.status === 'running') {
+      if (body.run_id) job.runId = String(body.run_id);
+      job.status = 'running';
+      await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 25200 });
+      const needsDrive = !['gofile', 'telegram', 'ghrelease'].includes(job.dest);
+      const tokenInfo = needsDrive ? await getValidTokenInfo(credUid, env, false) : null;
+      if (needsDrive && !tokenInfo) {
+        return jsonResponse({ ok: false, status: 'cancelled', error: 'Could not mint Google access token for user' });
+      }
+      let ghPat = '';
+      if (job.dest === 'ghrelease') {
+        const ghProfile = await getUserProfile(job.userId, env);
+        if (!ghProfile?.ghPat) {
+          return jsonResponse({ ok: false, status: 'cancelled', error: 'User GitHub PAT missing.' });
+        }
+        ghPat = ghProfile.ghPat;
+      }
+      return jsonResponse({
+        ok: true,
+        status: 'started',
+        job: {
+          ...job,
+          ghPat,
+          accessToken: tokenInfo?.accessToken || '',
+          tokenExpiry: tokenInfo?.tokenExpiry || null
+        }
+      });
+    }
+    // Persist heartbeat periodically (~every 15s) to reduce KV write churn
+    if (Date.now() - Number(job.lastHeartbeatAt || 0) >= 15000) {
+      job.lastHeartbeatAt = Date.now();
+      await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 3600 });
+    }
+    return jsonResponse({ ok: true, status: 'waiting' });
+  }
+
+  if (path === '/internal/probe_timeout') {
+    if (job.status === 'waiting_user' || job.status === 'probing') {
+      const tRaw = await getStore(env).get(`task:${jobId}`);
+      const task = tRaw ? JSON.parse(tRaw) : null;
+      if (task) {
+        task.warmRunner = false;
+        task.probeStatus = 'timeout';
+        await getStore(env).put(`task:${jobId}`, JSON.stringify(task), { expirationTtl: 1800 });
+        if (task.menuMsgId && task.chatId) {
+          await editMessage(task.chatId, task.menuMsgId, buildTaskMenuMessage(task), env, buildTaskMenuKeyboard(task)).catch(() => {});
+        }
+      }
+      job.status = 'timed_out';
+      await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 600 });
+    }
+    return jsonResponse({ ok: true });
   }
 
   if (path === '/internal/refresh') {
@@ -8780,6 +9248,9 @@ async function postTelegramMessage(method, payload, env) {
   if (method === 'sendMessage' && data?.ok && data.result?.message_id && payload.chat_id) {
     await trackChatMessages(payload.chat_id, [data.result.message_id], env);
   }
+  if (method === 'sendPhoto' && data?.ok && data.result?.message_id && payload.chat_id) {
+    await trackChatMessages(payload.chat_id, [data.result.message_id], env);
+  }
   return data;
 }
 
@@ -8796,6 +9267,30 @@ async function sendMessage(chatId, text, env, replyMarkup = null, replyToMsgId =
   return await postTelegramMessage('sendMessage', payload, env);
 }
 
+async function sendPhoto(chatId, photoUrl, caption, env, replyMarkup = null, replyToMsgId = null, threadId = null) {
+  const payload = {
+    chat_id: chatId,
+    photo: photoUrl,
+    caption: fitTelegramCaption(caption, 1024),
+    parse_mode: 'HTML'
+  };
+  if (replyMarkup) payload.reply_markup = replyMarkup;
+  if (replyToMsgId) payload.reply_to_message_id = replyToMsgId;
+  if (threadId && !replyToMsgId) payload.message_thread_id = threadId;
+  return await postTelegramMessage('sendPhoto', payload, env);
+}
+
+async function editMessageCaption(chatId, messageId, caption, env, replyMarkup = null) {
+  const payload = {
+    chat_id: chatId,
+    message_id: messageId,
+    caption: fitTelegramCaption(caption, 1024),
+    parse_mode: 'HTML'
+  };
+  if (replyMarkup) payload.reply_markup = replyMarkup;
+  return await postTelegramMessage('editMessageCaption', payload, env);
+}
+
 async function editMessage(chatId, messageId, text, env, replyMarkup = null) {
   const payload = {
     chat_id: chatId,
@@ -8805,7 +9300,11 @@ async function editMessage(chatId, messageId, text, env, replyMarkup = null) {
     disable_web_page_preview: true
   };
   if (replyMarkup) payload.reply_markup = replyMarkup;
-  return await postTelegramMessage('editMessageText', payload, env);
+  const res = await postTelegramMessage('editMessageText', payload, env);
+  if (!res?.ok && String(res?.description || '').includes('there is no text in the message to edit')) {
+    return await editMessageCaption(chatId, messageId, text, env, replyMarkup);
+  }
+  return res;
 }
 
 async function editOrSendMessage(chatId, editMsgId, text, env, replyMarkup = null, replyToMsgId = null, threadId = null) {
