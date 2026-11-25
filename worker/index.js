@@ -6969,6 +6969,14 @@ async function handleInternalRunner(request, path, env) {
 
     if (task.mediaThumbUrl) {
       const caption = fitTelegramCaption(menuText, 1024);
+      if (probe.thumbPrepared) {
+        // Runner already normalized/cropped the image to exact 16:9 fill; upload those bytes directly
+        job.status = 'waiting_user';
+        job.lastHeartbeatAt = Date.now();
+        await getStore(env).put(`task:${jobId}`, JSON.stringify(task), { expirationTtl: 7200 });
+        await getStore(env).put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 3600 });
+        return jsonResponse({ ok: true, need_thumb_upload: true, caption, reply_markup: menuKb });
+      }
       const photoRes = await sendPhoto(
         task.chatId,
         task.mediaThumbUrl,

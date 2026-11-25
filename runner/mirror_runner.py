@@ -1745,14 +1745,24 @@ def _norm_vcodec(vcodec: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]", "", v.split(".")[0]).upper()[:5]
 
 
-def _pick_mid_thumbnail(info: dict) -> str:
+def _is_yt_letterboxed_thumb_url(url: str) -> bool:
+    low = (url or "").lower().split("?", 1)[0]
+    return any(
+        tag in low
+        for tag in ("/hqdefault.", "/sddefault.", "/default.", "/0.jpg", "/1.jpg", "/2.jpg", "/3.jpg", "/0.webp", "/1.webp", "/2.webp", "/3.webp")
+    )
+
+
+def _rank_mid_thumbnails(info: dict) -> list[str]:
+    """Rank thumbnail URLs preferring clean 16:9 mid-to-HD JPEGs without 4:3 letterbox bars."""
     thumbs = info.get("thumbnails") or []
-    cands = []
-    for t in thumbs:
+    ranked = []
+    seen = set()
+    for idx, t in enumerate(thumbs):
         if not isinstance(t, dict):
             continue
         url = str(t.get("url") or "").strip()
-        if not url.startswith("http"):
+        if not url.startswith("http") or url in seen:
             continue
         tid = str(t.get("id") or "").lower()
         low_u = url.lower()
@@ -1762,19 +1772,140 @@ def _pick_mid_thumbnail(info: dict) -> str:
         h = int(t.get("height") or 0)
         if 0 < w < 200 and 0 < h < 120:
             continue
-        cands.append((h or (w * 9 // 16 if w else 0), w, url))
-    if cands:
-        sized = [c for c in cands if c[0] > 0]
-        if sized:
-            sized.sort(key=lambda x: x[0])
-            # Prefer mid-quality (~360p-540p height: mqdefault/hqdefault/sddefault)
-            mid = next((c for c in sized if 320 <= c[0] <= 600), None)
-            if not mid:
-                mid = min(sized, key=lambda c: abs(c[0] - 420))
-            return mid[2]
-        return cands[len(cands) // 2][2]
+        seen.add(url)
+        known_169 = (w > 0 and h > 0 and abs((w / h) - (16.0 / 9.0)) <= 0.08)
+        yt_169_hint = any(tag in low_u.split("?", 1)[0] for tag in ("/hq720.", "/maxresdefault.", "/mqdefault."))
+        is_169 = (known_169 or (yt_169_hint and (w == 0 or h == 0))) and not _is_yt_letterboxed_thumb_url(url)
+        eff_h = h or (w * 9 // 16 if w else (720 if ("hq720" in low_u or "maxres" in low_u) else (360 if "hqdefault" in low_u else 0)))
+        is_webp = ".webp" in low_u.split("?", 1)[0]
+        # Rank tuple (smaller is better): 16:9 first, decent width >= 640, closest height to 540, non-webp first
+        tier_rank = 0 if is_169 else 1
+        small_pen = 0 if (w == 0 or w >= 640) else 1
+        dist = abs((eff_h or 540) - 540)
+        ranked.append((tier_rank, small_pen, dist, 1 if is_webp else 0, -w, idx, url))
+
+    if ranked:
+        ranked.sort()
+        return [item[-1] for item in ranked]
+
     fallback = str(info.get("thumbnail") or "").strip()
-    return fallback if fallback.startswith("http") else ""
+    return [fallback] if fallback.startswith("http") else []
+
+
+def _pick_mid_thumbnail(info: dict) -> str:
+    ranked = _rank_mid_thumbnails(info)
+    return ranked[0] if ranked else ""
+
+
+def _parse_image_dims(img_bytes: bytes) -> tuple[int, int]:
+    """Read pixel dimensions from JPEG/PNG/WebP headers without external deps, or fall back to ffprobe."""
+    if not img_bytes or len(img_bytes) < 24:
+        return (0, 0)
+    # PNG
+    if img_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return (int.from_bytes(img_bytes[16:20], "big"), int.from_bytes(img_bytes[20:24], "big"))
+    # JPEG SOF0/SOF1/SOF2
+    if img_bytes[:2] == b"\xff\xd8":
+        i = 2
+        n = len(img_bytes)
+        while i + 9 < n:
+            if img_bytes[i] != 0xFF:
+                i += 1
+                continue
+            while i < n and img_bytes[i] == 0xFF:
+                i += 1
+            if i >= n:
+                break
+            marker = img_bytes[i]
+            i += 1
+            if marker in (0xD8, 0xD9, 0x01) or (0xD0 <= marker <= 0xD7):
+                continue
+            if i + 2 > n:
+                break
+            seg_len = int.from_bytes(img_bytes[i:i + 2], "big")
+            if seg_len < 2 or i + seg_len > n:
+                break
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF) and seg_len >= 7:
+                sh = int.from_bytes(img_bytes[i + 3:i + 5], "big")
+                sw = int.from_bytes(img_bytes[i + 5:i + 7], "big")
+                return (sw, sh)
+            i += seg_len
+    if shutil.which("ffprobe"):
+        tmp_path = None
+        try:
+            WORK_DIR.mkdir(parents=True, exist_ok=True)
+            tmp_path = WORK_DIR / f".probe_img_{uuid.uuid4().hex[:8]}"
+            tmp_path.write_bytes(img_bytes)
+            out = subprocess.check_output(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", str(tmp_path)],
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+            ).decode("utf-8", errors="replace").strip()
+            if "x" in out:
+                ws, hs = out.splitlines()[0].split("x", 1)
+                return (int(ws), int(hs))
+        except Exception:
+            pass
+        finally:
+            if tmp_path:
+                tmp_path.unlink(missing_ok=True)
+    return (0, 0)
+
+
+def _target_16_9_dims(src_w: int, src_h: int) -> tuple[int, int]:
+    """Pick clean exact 16:9 integer dimensions (multiple of 32x18) between 640x360 and 1280x720."""
+    for tw in (1280, 1120, 960, 800, 640):
+        if src_w >= tw or tw == 640:
+            if src_w >= 960 and src_h >= 540:
+                return (1280, 720)
+            return (tw, (tw * 9) // 16)
+    return (640, 360)
+
+
+def _normalize_thumb_16_9(img_bytes: bytes) -> tuple[bytes, int, int]:
+    """Enforce exact 16:9 JPEG thumbnail using scale-to-fill + center crop when source is another ratio."""
+    if not img_bytes:
+        return (b"", 0, 0)
+    w, h = _parse_image_dims(img_bytes)
+    is_jpeg = img_bytes[:2] == b"\xff\xd8"
+    is_exact_16_9 = (w > 0 and h > 0 and w * 9 == h * 16)
+    is_near_16_9 = (w > 0 and h > 0 and abs((w / h) - (16.0 / 9.0)) <= 0.02)
+
+    if is_jpeg and is_exact_16_9 and 320 <= w <= 1280:
+        return (img_bytes, w, h)
+
+    tw, th = _target_16_9_dims(w or 1280, h or 720)
+    if shutil.which("ffmpeg"):
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        src_p = WORK_DIR / f".thumb_in_{uuid.uuid4().hex[:8]}"
+        dst_p = WORK_DIR / f".thumb_out_{uuid.uuid4().hex[:8]}.jpg"
+        try:
+            src_p.write_bytes(img_bytes)
+            vf = (
+                f"scale={tw}:{th}:force_original_aspect_ratio=increase:flags=lanczos,"
+                f"crop={tw}:{th}:(iw-{tw})/2:(ih-{th})/2,setsar=1"
+            )
+            res = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(src_p), "-frames:v", "1", "-vf", vf, "-q:v", "2", str(dst_p)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=12,
+            )
+            if res.returncode == 0 and dst_p.is_file() and dst_p.stat().st_size > 0:
+                out_bytes = dst_p.read_bytes()
+                ow, oh = _parse_image_dims(out_bytes)
+                if ow > 0 and oh > 0 and ow * 9 == oh * 16:
+                    return (out_bytes, ow, oh)
+        except Exception:
+            pass
+        finally:
+            src_p.unlink(missing_ok=True)
+            dst_p.unlink(missing_ok=True)
+
+    # Strict 16:9 guarantee: never return a non-16:9 image uncropped
+    if is_near_16_9:
+        return (img_bytes, w, h)
+    return (b"", 0, 0)
 
 
 def _fmt_size_bytes_for_probe(fmt: dict, duration: int):
@@ -1858,7 +1989,12 @@ def probe_ytdl_metadata(url: str, is_playlist_hint: bool = False) -> dict:
             if len(desc_lines) >= 2:
                 break
     desc_text = "\n".join(desc_lines)
-    thumb_url = _pick_mid_thumbnail(target) or _pick_mid_thumbnail(info)
+    thumb_candidates = _rank_mid_thumbnails(target)
+    if target is not info:
+        for u in _rank_mid_thumbnails(info):
+            if u not in thumb_candidates:
+                thumb_candidates.append(u)
+    thumb_url = thumb_candidates[0] if thumb_candidates else ""
 
     formats = [f for f in (target.get("formats") or []) if isinstance(f, dict)]
     best_audio_any = None
@@ -2000,6 +2136,7 @@ def probe_ytdl_metadata(url: str, is_playlist_hint: bool = False) -> dict:
         "duration": duration,
         "isLive": is_live,
         "thumbnailUrl": thumb_url,
+        "thumbCandidates": thumb_candidates[:4],
         "isPlaylist": is_playlist,
         "playlistCount": playlist_count,
         "bestSize": best_size,
@@ -6522,27 +6659,54 @@ def run_interactive_probe_session(init_job: dict):
         ensure_ytdl_probe_pkg(upgrade=True)
         probe = probe_ytdl_metadata(target_url, is_playlist_hint=is_pl_hint)
 
+    norm_thumb_bytes = b""
+    thumb_urls = list(probe.get("thumbCandidates") or [])
+    if probe.get("thumbnailUrl") and probe["thumbnailUrl"] not in thumb_urls:
+        thumb_urls.insert(0, probe["thumbnailUrl"])
+    for t_url in thumb_urls:
+        if not t_url:
+            continue
+        try:
+            raw_img = _download_bytes_quiet(t_url)
+            norm_bytes, _, _ = _normalize_thumb_16_9(raw_img)
+            if norm_bytes:
+                norm_thumb_bytes = norm_bytes
+                probe["thumbnailUrl"] = t_url
+                probe["thumbPrepared"] = True
+                break
+        except Exception:
+            continue
+    if thumb_urls and not norm_thumb_bytes:
+        # Never allow a non-16:9 remote URL to slip through uncropped
+        probe["thumbnailUrl"] = ""
+        probe["thumbPrepared"] = False
+    probe.pop("thumbCandidates", None)
+
     res = worker_call("/internal/probe_result", {
         "job_id": JOB_ID,
         "ok": True,
         "probe": probe,
     })
 
-    if res.get("need_thumb_upload") and probe.get("thumbnailUrl"):
+    if res.get("need_thumb_upload") and (norm_thumb_bytes or probe.get("thumbnailUrl")):
         uploaded_msg_id = None
         try:
-            img_bytes = _download_bytes_quiet(probe["thumbnailUrl"])
-            up_res = upload_photo_multipart(
-                init_job.get("chatId"),
-                img_bytes,
-                filename="thumb.jpg",
-                caption=res.get("caption") or "",
-                reply_markup=res.get("reply_markup"),
-                reply_to_msg_id=init_job.get("replyToMsgId"),
-                thread_id=init_job.get("threadId"),
-            )
-            if up_res.get("ok") and up_res.get("result", {}).get("message_id"):
-                uploaded_msg_id = up_res["result"]["message_id"]
+            img_bytes = norm_thumb_bytes
+            if not img_bytes and probe.get("thumbnailUrl"):
+                raw_img = _download_bytes_quiet(probe["thumbnailUrl"])
+                img_bytes, _, _ = _normalize_thumb_16_9(raw_img)
+            if img_bytes:
+                up_res = upload_photo_multipart(
+                    init_job.get("chatId"),
+                    img_bytes,
+                    filename="thumb.jpg",
+                    caption=res.get("caption") or "",
+                    reply_markup=res.get("reply_markup"),
+                    reply_to_msg_id=init_job.get("replyToMsgId"),
+                    thread_id=init_job.get("threadId"),
+                )
+                if up_res.get("ok") and up_res.get("result", {}).get("message_id"):
+                    uploaded_msg_id = up_res["result"]["message_id"]
         except Exception:
             pass
         res = worker_call("/internal/probe_result", {
