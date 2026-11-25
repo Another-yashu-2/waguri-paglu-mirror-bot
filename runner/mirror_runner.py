@@ -1754,7 +1754,7 @@ def _is_yt_letterboxed_thumb_url(url: str) -> bool:
 
 
 def _rank_mid_thumbnails(info: dict) -> list[str]:
-    """Rank thumbnail URLs preferring clean 16:9 mid-to-HD JPEGs without 4:3 letterbox bars."""
+    """Rank thumbnail URLs preferring the highest-resolution clean 16:9 JPEGs without 4:3 letterbox bars."""
     thumbs = info.get("thumbnails") or []
     ranked = []
     seen = set()
@@ -1776,13 +1776,13 @@ def _rank_mid_thumbnails(info: dict) -> list[str]:
         known_169 = (w > 0 and h > 0 and abs((w / h) - (16.0 / 9.0)) <= 0.08)
         yt_169_hint = any(tag in low_u.split("?", 1)[0] for tag in ("/hq720.", "/maxresdefault.", "/mqdefault."))
         is_169 = (known_169 or (yt_169_hint and (w == 0 or h == 0))) and not _is_yt_letterboxed_thumb_url(url)
-        eff_h = h or (w * 9 // 16 if w else (720 if ("hq720" in low_u or "maxres" in low_u) else (360 if "hqdefault" in low_u else 0)))
+        eff_h = h or (w * 9 // 16 if w else (720 if ("hq720" in low_u or "maxres" in low_u) else (180 if "mqdefault" in low_u else (360 if "hqdefault" in low_u else 0))))
+        eff_w = w or (eff_h * 16 // 9 if eff_h else 0)
         is_webp = ".webp" in low_u.split("?", 1)[0]
-        # Rank tuple (smaller is better): 16:9 first, decent width >= 640, closest height to 540, non-webp first
+        pref = int(t.get("preference") or 0)
+        # Rank tuple (smaller is better): native 16:9 first, highest resolution first, non-webp first, yt-dlp preference
         tier_rank = 0 if is_169 else 1
-        small_pen = 0 if (w == 0 or w >= 640) else 1
-        dist = abs((eff_h or 540) - 540)
-        ranked.append((tier_rank, small_pen, dist, 1 if is_webp else 0, -w, idx, url))
+        ranked.append((tier_rank, -(eff_h * eff_w), -eff_h, -eff_w, 1 if is_webp else 0, -pref, idx, url))
 
     if ranked:
         ranked.sort()
@@ -1853,11 +1853,13 @@ def _parse_image_dims(img_bytes: bytes) -> tuple[int, int]:
 
 
 def _target_16_9_dims(src_w: int, src_h: int) -> tuple[int, int]:
-    """Pick clean exact 16:9 integer dimensions (multiple of 32x18) between 640x360 and 1280x720."""
-    for tw in (1280, 1120, 960, 800, 640):
-        if src_w >= tw or tw == 640:
-            if src_w >= 960 and src_h >= 540:
-                return (1280, 720)
+    """Pick highest clean exact 16:9 integer dimensions (multiple of 32x18) up to 1920x1080."""
+    for tw in (1920, 1600, 1280, 1120, 960, 800, 640):
+        th = (tw * 9) // 16
+        if src_w >= tw and src_h >= th:
+            return (tw, th)
+    for tw in (1920, 1600, 1280, 1120, 960, 800, 640):
+        if src_w >= tw:
             return (tw, (tw * 9) // 16)
     return (640, 360)
 
@@ -1871,7 +1873,7 @@ def _normalize_thumb_16_9(img_bytes: bytes) -> tuple[bytes, int, int]:
     is_exact_16_9 = (w > 0 and h > 0 and w * 9 == h * 16)
     is_near_16_9 = (w > 0 and h > 0 and abs((w / h) - (16.0 / 9.0)) <= 0.02)
 
-    if is_jpeg and is_exact_16_9 and 320 <= w <= 1280:
+    if is_jpeg and is_exact_16_9 and 320 <= w <= 2560:
         return (img_bytes, w, h)
 
     tw, th = _target_16_9_dims(w or 1280, h or 720)
@@ -6642,7 +6644,7 @@ PROBE_WAIT_TIMEOUT_SEC = 600
 def _download_bytes_quiet(url: str, timeout: int = 12) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_UA})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read(5 * 1024 * 1024)
+        return resp.read(10 * 1024 * 1024)
 
 
 def run_interactive_probe_session(init_job: dict):
