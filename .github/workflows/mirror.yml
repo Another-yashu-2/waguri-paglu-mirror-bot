@@ -30,7 +30,7 @@ jobs:
         if: inputs.job_mode != 'ytdl_probe'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 p7zip-full unzip tar curl jq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq aria2 ffmpeg p7zip-full unzip tar curl jq
           if curl -fsSL --retry 2 "https://downloads.rclone.org/rclone-current-linux-amd64.zip" -o /tmp/rclone.zip; then
             unzip -q -j /tmp/rclone.zip "*/rclone" -d /tmp/rclone_bin
             sudo install -m 0755 /tmp/rclone_bin/rclone /usr/local/bin/rclone

@@ -1638,22 +1638,47 @@ def ensure_ytdl_probe_pkg(upgrade: bool = False):
         import yt_dlp  # noqa: F401
 
 
+def _clear_ytdlp_ffmpeg_cache():
+    """Clear yt-dlp's class-level FFmpeg probe cache after installing ffmpeg at runtime."""
+    try:
+        mod = sys.modules.get("yt_dlp.postprocessor.ffmpeg")
+        if mod is not None:
+            pp_cls = getattr(mod, "FFmpegPostProcessor", None)
+            if pp_cls is not None:
+                v_cache = getattr(pp_cls, "_version_cache", None)
+                if isinstance(v_cache, dict):
+                    v_cache.clear()
+                    v_cache[None] = None
+                f_cache = getattr(pp_cls, "_features_cache", None)
+                if isinstance(f_cache, dict):
+                    f_cache.clear()
+    except Exception:
+        pass
+
+
 def ensure_full_runner_tools(need_kurigram: bool = False):
     """Install aria2, rclone, ffmpeg, p7zip, mutagen, and optionally Kurigram while waiting on user selection."""
     with _RUNNER_TOOLS_LOCK:
-        if _RUNNER_TOOLS_READY.is_set():
+        if _RUNNER_TOOLS_READY.is_set() and shutil.which("ffmpeg") and shutil.which("ffprobe"):
             return
         errs = []
 
         def install_sys_tools():
             try:
-                need_apt = [pkg for cmd, pkg in (("aria2c", "aria2"), ("7z", "p7zip-full"), ("ffmpeg", "ffmpeg")) if not shutil.which(cmd)]
+                need_apt = []
+                if not shutil.which("aria2c"):
+                    need_apt.append("aria2")
+                if not shutil.which("7z"):
+                    need_apt.append("p7zip-full")
+                if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+                    need_apt.append("ffmpeg")
                 if need_apt:
                     subprocess.run(["sudo", "apt-get", "update", "-qq"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     subprocess.run(
-                        ["sudo", "apt-get", "install", "-y", "-qq", *need_apt, "unzip", "tar", "curl", "jq"],
-                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        ["sudo", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "-qq", *need_apt, "unzip", "tar", "curl", "jq"],
+                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                     )
+                    _clear_ytdlp_ffmpeg_cache()
                 if not shutil.which("rclone"):
                     rc_zip = WORK_DIR / "rclone.zip"
                     rc_dir = WORK_DIR / "rclone_bin"
@@ -1671,7 +1696,10 @@ def ensure_full_runner_tools(need_kurigram: bool = False):
                         rc_zip.unlink(missing_ok=True)
                         shutil.rmtree(rc_dir, ignore_errors=True)
                     if not shutil.which("rclone"):
-                        subprocess.run(["sudo", "apt-get", "install", "-y", "-qq", "rclone"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        subprocess.run(
+                            ["sudo", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "-qq", "rclone"],
+                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
             except Exception as e:
                 errs.append(e)
 
@@ -1696,7 +1724,8 @@ def ensure_full_runner_tools(need_kurigram: bool = False):
             t.start()
         for t in threads:
             t.join()
-        if not errs:
+        _clear_ytdlp_ffmpeg_cache()
+        if not errs and shutil.which("ffmpeg") and shutil.which("ffprobe"):
             _RUNNER_TOOLS_READY.set()
 
 
@@ -1950,6 +1979,8 @@ def probe_ytdl_metadata(url: str, is_playlist_hint: bool = False) -> dict:
             "socket_timeout": 20,
             "playlist_items": "1",
             "ignoreerrors": True,
+            "ignore_no_formats_error": True,
+            "format": "b/bv/ba",
         }
         if not is_playlist_hint:
             opts["noplaylist"] = True
@@ -2161,8 +2192,9 @@ def ensure_ytdl_tools():
         except ImportError:
             need_pip = True
 
-        need_ffmpeg = not shutil.which("ffmpeg")
+        need_ffmpeg = not (shutil.which("ffmpeg") and shutil.which("ffprobe"))
         if not need_pip and not need_ffmpeg:
+            _clear_ytdlp_ffmpeg_cache()
             return
 
         errs = []
@@ -2176,7 +2208,10 @@ def ensure_ytdl_tools():
         def do_ffmpeg():
             try:
                 subprocess.run(["sudo", "apt-get", "update", "-qq"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                subprocess.run(["sudo", "apt-get", "install", "-y", "-qq", "ffmpeg"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                subprocess.run(
+                    ["sudo", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "-qq", "ffmpeg"],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                )
             except Exception as e:
                 errs.append(e)
 
@@ -2189,6 +2224,7 @@ def ensure_ytdl_tools():
             t.start()
         for t in threads:
             t.join()
+        _clear_ytdlp_ffmpeg_cache()
         if errs:
             raise errs[0]
         _prepare_pkg_paths()
@@ -3827,6 +3863,9 @@ class Mirror:
             cmd += ["--merge-output-format", out_ext]
         if shutil.which("node"):
             cmd += ["--js-runtimes", "node"]
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if ffmpeg_bin:
+            cmd += ["--ffmpeg-location", ffmpeg_bin]
         if cookie_path:
             cmd += ["--cookies", str(cookie_path)]
         cmd.append(url)
@@ -3923,12 +3962,25 @@ class Mirror:
             out_file = renamed
 
         if not cancelled:
+            effective_dest = self.dest
+            if self.job.get("ytAutoDestBySize"):
+                effective_dest = "gofile" if out_file.stat().st_size >= TG_BOT_MAX_BYTES else "telegram"
+                if not self.batch and effective_dest != self.dest:
+                    self.dest = effective_dest
+                    self.job["dest"] = effective_dest
+                    self.folder_id = ""
+                    self.folder_name = "Gofile (Guest)" if effective_dest == "gofile" else "Telegram (Leech)"
+                    self.job["folderName"] = self.folder_name
+                    self.share = (effective_dest == "gofile")
+            prev_parts = self.job.get("ytLiveParts") or []
             if more_slices:
                 self._pending_live_chain = {
                     "mode": "record",
                     "next_part": part_num + 1,
                 }
-            elif part_num >= 2 and self.dest in ("gdrive", "gofile"):
+            elif part_num >= 2 and effective_dest in ("gdrive", "gofile") and (
+                effective_dest == "gdrive" or all(isinstance(p, dict) and p.get("link") for p in prev_parts)
+            ):
                 self._pending_live_chain = {
                     "mode": "combine",
                     "next_part": part_num,
@@ -4091,6 +4143,9 @@ class Mirror:
                 }
             if shutil.which("node"):
                 opts["js_runtimes"] = {"node": {}}
+            ffmpeg_bin = shutil.which("ffmpeg")
+            if ffmpeg_bin:
+                opts["ffmpeg_location"] = ffmpeg_bin
             if not is_audio and container in ("mp4", "mkv"):
                 opts["merge_output_format"] = container
             if use_subs:
@@ -6166,7 +6221,23 @@ class Mirror:
                 thread_id=self.thread_id,
             )
 
-    def process_and_upload(self, local: Path) -> dict:
+    @staticmethod
+    def _exceeds_tg_limit(target: Path) -> bool:
+        if target.is_file():
+            return target.stat().st_size >= TG_BOT_MAX_BYTES
+        if target.is_dir():
+            files = [
+                p for p in target.rglob("*")
+                if p.is_file() and not p.name.endswith((".aria2", ".ytdl", ".part")) and p.stat().st_size > 0
+            ]
+            if not files:
+                return False
+            return (sum(p.stat().st_size for p in files) >= TG_BOT_MAX_BYTES) or any(
+                p.stat().st_size >= TG_BOT_MAX_BYTES for p in files
+            )
+        return False
+
+    def process_and_upload(self, local: Path, auto_ytdl: bool = False):
         size = path_size(local)
         mode = self.mode
         if mode in ("extract", "zip"):
@@ -6193,6 +6264,32 @@ class Mirror:
                 else:
                     local.unlink(missing_ok=True)
                 target = zipped
+
+        if self.job.get("ytAutoDestBySize") and auto_ytdl:
+            chosen = "gofile" if self._exceeds_tg_limit(target) else "telegram"
+            if not self.batch:
+                self.dest = chosen
+                self.job["dest"] = chosen
+                if chosen == "gofile":
+                    self.folder_id = ""
+                    self.folder_name = "Gofile (Guest)"
+                    self.share = True
+                    self.job["folderName"] = self.folder_name
+                    self.tick(target.name, "Gofile Upload (≥ 2 GB)..", 0.0, 0, path_size(target), 0, None, "Gofile API", force=True)
+                else:
+                    self.leech_as_doc = False
+                    self.folder_name = "Telegram (Leech)"
+                    self.job["folderName"] = self.folder_name
+                return self.upload(target)
+            if not hasattr(self, "_auto_batch_dests"):
+                self._auto_batch_dests = []
+            self._auto_batch_dests.append(chosen)
+            if chosen == "gofile":
+                self.tick(target.name, "Gofile Upload (≥ 2 GB)..", 0.0, 0, path_size(target), 0, None, "Gofile API", force=True)
+                return self.upload_gofile(target)
+            self.leech_as_doc = False
+            return self.upload_telegram(target)
+
         return self.upload(target)
 
     def process_item(self, item: dict, item_dir: Path) -> dict:
@@ -6215,7 +6312,7 @@ class Mirror:
                 if mime != FOLDER_MIME and (self.mode == "normal" or mime.startswith("application/vnd.google-apps.")):
                     return self.gdrive_copy_file(item, meta, name)
         local = self.acquire_local(item, item_dir)
-        res = self.process_and_upload(local)
+        res = self.process_and_upload(local, auto_ytdl=(item.get("type") == "ytdl"))
         if isinstance(res, list):
             return res[0] if len(res) == 1 else {"_multi": res}
         return res
@@ -6251,6 +6348,8 @@ class Mirror:
         return results
 
     def run_live_combine(self) -> list:
+        if not shutil.which("ffmpeg"):
+            ensure_ytdl_tools()
         parts = self.job.get("ytLiveParts") or []
         if not parts:
             raise RuntimeError("No recorded live parts provided for combining.")
@@ -6376,6 +6475,7 @@ class Mirror:
         if self.batch and self.mode == "zip":
             return self.run_batch_zip()
 
+        self._auto_batch_dests = []
         results = []
         for i, item in enumerate(self.items):
             self.idx = i
@@ -6398,6 +6498,13 @@ class Mirror:
                 shutil.rmtree(item_dir, ignore_errors=True)
                 for p in list(OUT_DIR.iterdir()) if OUT_DIR.exists() else []:
                     shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink(missing_ok=True)
+        if self.batch and self._auto_batch_dests and all(d == "gofile" for d in self._auto_batch_dests):
+            self.dest = "gofile"
+            self.folder_id = ""
+            self.folder_name = "Gofile (Guest)"
+            self.share = True
+            self.job["dest"] = "gofile"
+            self.job["folderName"] = "Gofile (Guest)"
         return results
 
     # ---------------- Final report ----------------
@@ -6622,6 +6729,7 @@ class Mirror:
             worker_call("/internal/complete", {
                 "job_id": JOB_ID,
                 "status": overall,
+                "actual_dest": self.dest,
                 "items": results,
                 "msg_id": self.message_id,
                 "leech_msg_ids": leech_msg_ids,
@@ -6630,6 +6738,7 @@ class Mirror:
             worker_call("/internal/complete", {
                 "job_id": JOB_ID,
                 "status": overall,
+                "actual_dest": self.dest,
                 "items": results,
                 "msg_id": self.message_id,
                 "mirror_html": text,
@@ -6801,7 +6910,7 @@ def main():
                             "size": int(r.get("size") or 0),
                         }
                         break
-            payload = {"job_id": JOB_ID, **pending_chain}
+            payload = {"job_id": JOB_ID, "actual_dest": m.dest, **pending_chain}
             if uploaded_part:
                 payload["uploaded_part"] = uploaded_part
             ch = worker_call("/internal/chain_live", payload)

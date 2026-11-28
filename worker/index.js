@@ -312,6 +312,23 @@ function isMediaSiteUrl(rawUrl) {
   return false;
 }
 
+function isYoutubeRegularUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    const host = u.hostname.toLowerCase().replace(/^www\./, '').replace(/\.+$/, '');
+    const isYtHost =
+      host === 'youtu.be' ||
+      host === 'youtube.com' ||
+      host === 'youtube-nocookie.com' ||
+      host.endsWith('.youtube.com') ||
+      host.endsWith('.youtube-nocookie.com');
+    if (!isYtHost) return false;
+    return !/^\/shorts(\/|$)/i.test(u.pathname || '');
+  } catch (_) {
+    return false;
+  }
+}
+
 function isPlaylistUrl(rawUrl) {
   try {
     const u = new URL(rawUrl);
@@ -3884,6 +3901,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
   const hasPixeldrain = urls.some(u => isPixeldrainUrl(u));
   const isBatchInitial = urls.length > 1;
   const allMediaInitial = forceYtdl || urls.every(u => isMediaSiteUrl(u));
+  const autoNonLongInitial = !forceLeech && !isBatchInitial && allMediaInitial && !isYoutubeRegularUrl(urls[0]);
   let checkingMsgId = editExistingMsgId;
   if (!checkingMsgId) {
     const checkingMsg = await sendMessage(
@@ -3896,9 +3914,11 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
             ? `<blockquote><b>Inspecting Pixeldrain...</b>\n\n<i>Reading file/list metadata from the Pixeldrain API...</i></blockquote>`
             : isBatchInitial
               ? `<blockquote><b>Preparing Batch</b>\n\n<i>Queued ${urls.length} links...</i></blockquote>`
-              : allMediaInitial
-                ? `<blockquote><b>Inspecting Media</b>\n\n<i>Fetching title and preparing yt-dlp options...</i></blockquote>`
-                : `<blockquote><b>Inspecting Link</b>\n\n<i>Verifying stream headers and file size...</i></blockquote>`,
+              : autoNonLongInitial
+                ? `<blockquote><b>Inspecting Media</b>\n\n<i>Starting automatic download (Leech &lt; 2 GB / Gofile ≥ 2 GB)...</i></blockquote>`
+                : allMediaInitial
+                  ? `<blockquote><b>Inspecting Media</b>\n\n<i>Fetching title and preparing yt-dlp options...</i></blockquote>`
+                  : `<blockquote><b>Inspecting Link</b>\n\n<i>Verifying stream headers and file size...</i></blockquote>`,
       env,
       null,
       replyToMsgId,
@@ -3909,7 +3929,9 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
     await editMessage(
       chatId,
       checkingMsgId,
-      `<blockquote><b>Inspecting Media</b>\n\n<i>Fetching title, thumbnail, qualities &amp; preparing runner...</i></blockquote>`,
+      autoNonLongInitial
+        ? `<blockquote><b>Inspecting Media</b>\n\n<i>Starting automatic download (Leech &lt; 2 GB / Gofile ≥ 2 GB)...</i></blockquote>`
+        : `<blockquote><b>Inspecting Media</b>\n\n<i>Fetching title, thumbnail, qualities &amp; preparing runner...</i></blockquote>`,
       env
     ).catch(() => {});
   }
@@ -3982,8 +4004,11 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
     }
 
     if (ytdlUrl) {
-      const wantInteractive = profile.buttonMode !== false || defaultDest === 'ghrelease';
-      const defaultQ = profile.ytQuality || 'best';
+      const isYtLong = isYoutubeRegularUrl(ytdlUrl);
+      const autoYtdlNonLong = !forceLeech && !isYtLong;
+      const wantInteractive = !autoYtdlNonLong && (profile.buttonMode !== false || defaultDest === 'ghrelease');
+      const defaultQ = autoYtdlNonLong ? 'best' : (profile.ytQuality || 'best');
+      const defaultCont = autoYtdlNonLong ? 'mp4' : (profile.ytContainer || 'mp4');
       task = {
         taskId,
         userId: String(userId),
@@ -4004,6 +4029,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         isDrive: false,
         isFolder: false,
         isYtdl: true,
+        ytAutoDestBySize: autoYtdlNonLong,
         mediaAuthor: '',
         mediaDesc: '',
         mediaDuration: 0,
@@ -4018,7 +4044,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         ytBestSize: 0,
         ytBestApprox: true,
         ytAudioOptions: {},
-        ytContainer: profile.ytContainer || 'mp4',
+        ytContainer: defaultCont,
         ytSubs: false,
         ytSubLang: 'en',
         ytMeta: true,
@@ -4032,7 +4058,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         contentType: 'video/mp4',
         acceptRanges: true,
         dest: 'telegram',
-        leechAsDoc: !!profile.leechAsDoc,
+        leechAsDoc: autoYtdlNonLong ? false : !!profile.leechAsDoc,
         hasDrive,
         hasGithub: !!mCtx.hasGithub,
         ghUser: mCtx.ghUser || '',
@@ -4057,6 +4083,18 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
         probeStatus: '',
         createdAt: Date.now()
       };
+
+      if (autoYtdlNonLong) {
+        const oembed = await fetchMediaOEmbed(ytdlUrl).catch(() => null);
+        if (oembed?.title) {
+          task.detectedName = oembed.title;
+          task.items = [{ type: 'ytdl', url: ytdlUrl, name: oembed.title }];
+          task.mediaAuthor = oembed.author || '';
+        }
+        await getStore(env).put(`task:${taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
+        await launchMirrorTask(task, env);
+        return;
+      }
 
       if (wantInteractive) {
         if (checkingMsgId) {
@@ -4253,6 +4291,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
 
     const batchHasYtdl = items.some(i => i.type === 'ytdl');
     const batchAllYtdl = forceYtdl || items.every(i => i.type === 'ytdl');
+    const batchAutoNonLong = !forceLeech && batchAllYtdl && items.every(i => !isYoutubeRegularUrl(i.url));
     const batchDest = batchAllYtdl ? 'telegram' : defaultDest;
     task = {
       taskId,
@@ -4273,13 +4312,14 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       isDrive: items.every(i => i.type === 'gdrive'),
       isFolder: false,
       isYtdl: batchHasYtdl,
+      ytAutoDestBySize: batchAutoNonLong,
       isGofileSource: items.some(i => i.type === 'gofile'),
       gofileChildrenCount: 0,
       isPixeldrainSource: items.some(i => i.type === 'pixeldrain'),
       pdKind: '',
       pdChildrenCount: 0,
-      ytQuality: profile.ytQuality || 'best',
-      ytContainer: profile.ytContainer || 'mp4',
+      ytQuality: batchAutoNonLong ? 'best' : (profile.ytQuality || 'best'),
+      ytContainer: batchAutoNonLong ? 'mp4' : (profile.ytContainer || 'mp4'),
       ytSubs: false,
       ytSubLang: 'en',
       ytMeta: true,
@@ -4293,7 +4333,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
       contentType: 'application/octet-stream',
       acceptRanges: false,
       dest: batchDest,
-      leechAsDoc: !!profile.leechAsDoc,
+      leechAsDoc: batchAutoNonLong ? false : !!profile.leechAsDoc,
       hasDrive,
       hasGithub: !!mCtx.hasGithub,
       ghUser: mCtx.ghUser || '',
@@ -4320,7 +4360,7 @@ async function startTaskFromUrls(chatId, userId, username, replyToMsgId, urls, e
 
   await getStore(env).put(`task:${taskId}`, JSON.stringify(task), { expirationTtl: 7200 });
 
-  if (profile.buttonMode === false && defaultDest !== 'ghrelease') {
+  if (task.ytAutoDestBySize || (profile.buttonMode === false && defaultDest !== 'ghrelease')) {
     await launchMirrorTask(task, env);
     return;
   }
@@ -6501,7 +6541,9 @@ async function launchMirrorTask(task, env) {
   const destLines = isGhRelease
     ? `├ Dest : GitHub Release (<code>${escapeHtml(task.ghRepo)}</code>)\n├ Tag : <code>${escapeHtml(ghTagFinal)}</code>\n`
     : isLeech
-      ? `├ Dest : Telegram (Leech)\n├ Part Limit : <code>2.00 GB (Auto Split)</code>\n`
+      ? (task.ytAutoDestBySize
+          ? `├ Dest : Auto (Telegram &lt; 2 GB / Gofile ≥ 2 GB)\n├ Mode : <code>Media (Auto)</code>\n`
+          : `├ Dest : Telegram (Leech)\n├ Part Limit : <code>2.00 GB (Auto Split)</code>\n`)
       : isGofile
         ? `├ Dest : Gofile (Fresh Guest)\n├ Quota : <code>100GB DL / 10d idle</code>\n`
         : `├ Folder : ${escapeHtml(task.isSharedGcTemp ? 'GC Shared (5-Day Temp)' : task.folderName)}\n├ Drive Free : <code>${freeDriveStr}</code>\n`;
@@ -6603,6 +6645,7 @@ async function launchMirrorTask(task, env) {
     share: (isLeech || isGhRelease) ? false : (task.isSharedGcTemp ? true : !!task.share),
     conflict: task.conflict || 'rename',
     isYtdl: !!task.isYtdl,
+    ytAutoDestBySize: !!task.ytAutoDestBySize,
     ytQuality: task.ytQuality || 'best',
     ytFormatId: task.ytFormatId || '',
     ytFormatHasAudio: !!task.ytFormatHasAudio,
@@ -7102,6 +7145,16 @@ async function handleInternalRunner(request, path, env) {
   }
 
   if (path === '/internal/complete') {
+    if (['gdrive', 'gofile', 'telegram', 'ghrelease'].includes(body.actual_dest)) {
+      job.dest = body.actual_dest;
+      if (body.actual_dest === 'gofile') {
+        job.folderId = '';
+        job.folderName = 'Gofile (Guest)';
+      } else if (body.actual_dest === 'telegram') {
+        job.folderId = '';
+        job.folderName = 'Telegram (Leech)';
+      }
+    }
     job.status = body.status || 'completed';
     if (body.error) {
       job.error = String(body.error).slice(0, 500);
@@ -7243,8 +7296,15 @@ async function handleInternalRunner(request, path, env) {
     ).catch(() => null);
 
     const nextMsgId = sent?.result?.message_id || null;
+    const chainDest = ['gdrive', 'gofile', 'telegram', 'ghrelease'].includes(body.actual_dest)
+      ? body.actual_dest
+      : job.dest;
     const nextJob = {
       ...job,
+      dest: chainDest,
+      folderId: chainDest === 'gofile' || chainDest === 'telegram' ? '' : job.folderId,
+      folderName: chainDest === 'gofile' ? 'Gofile (Guest)' : (chainDest === 'telegram' ? 'Telegram (Leech)' : job.folderName),
+      share: chainDest === 'gofile' ? true : job.share,
       jobId: nextJobId,
       runId: '',
       messageId: nextMsgId,
